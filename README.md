@@ -56,6 +56,16 @@ termre uses a modal interface similar to Neovim: view mode and command mode (`:`
 
 Optional JSON config at `$XDG_CONFIG_HOME/termre/config.json` (fallback `~/.config/termre/config.json`); an empty one is created on first run. See [docs/config.md](./docs/config.md). An existing fancy-cat config and reading state are picked up automatically.
 
+## Install
+
+```sh
+brew tap golonzovsky/tap
+brew trust golonzovsky/tap   # Homebrew requires trusting third-party taps
+brew install termre          # installs the `re` binary
+```
+
+Binaries are published for macOS arm64 and Linux x86_64 on the [releases page](https://github.com/golonzovsky/termre/releases). Optional: `brew install fzf` for the fuzzy recent-books picker (`re` with no arguments falls back to a numbered prompt without it).
+
 ## Build
 
 Requirements: Zig `0.16.0`, a terminal with the Kitty image protocol (Ghostty, Kitty, WezTerm, …), and on macOS the Xcode command-line tools.
