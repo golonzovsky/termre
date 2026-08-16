@@ -15,8 +15,8 @@ jobs:
         include:
           - os: macos-15
             target: macos-arm64
-          - os: ubuntu-latest
-            target: linux-x86_64
+          # linux blocked on vendor/fzwatch's inotify watcher predating the
+          # zig 0.16 std.posix rework; re-add once ported
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
