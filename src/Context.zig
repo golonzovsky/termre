@@ -1314,7 +1314,7 @@ pub const Context = struct {
     pub fn openCurrentPageInEditor(self: *Self) !void {
         const page = self.document_handler.getCurrentPageNumber();
         const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/fancy-cat-{d}-page{d}", .{ pid, page + 1 });
+        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-page{d}", .{ pid, page + 1 });
         defer self.allocator.free(dir);
         const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/page{d}.md", .{ dir, page + 1 }, 0);
         defer self.allocator.free(path);
@@ -1404,7 +1404,7 @@ pub const Context = struct {
         const page = self.document_handler.getCurrentPageNumber();
         const range = self.currentChapterRange(page);
         const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/fancy-cat-{d}-chap-{d}-{d}", .{ pid, range.start + 1, range.end });
+        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-chap-{d}-{d}", .{ pid, range.start + 1, range.end });
         defer self.allocator.free(dir);
         const name = try std.fmt.allocPrint(self.allocator, "chap-{d}-{d}.md", .{ range.start + 1, range.end });
         defer self.allocator.free(name);
@@ -1417,7 +1417,7 @@ pub const Context = struct {
         if (entries.len == 0) return;
 
         const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/fancy-cat-{d}-toc", .{pid});
+        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-toc", .{pid});
         defer self.allocator.free(dir);
         const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/toc.md", .{dir}, 0);
         defer self.allocator.free(path);

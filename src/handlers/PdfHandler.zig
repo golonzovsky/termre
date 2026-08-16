@@ -464,7 +464,7 @@ fn renderAttempt(
         self.png_seq +%= 1;
         const path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/tty-graphics-protocol-fancycat-{d}-{d}.png",
+            "{s}/tty-graphics-protocol-termre-{d}-{d}.png",
             .{ dir, self.session_tag, self.png_seq },
         );
         errdefer self.allocator.free(path);

@@ -24,8 +24,8 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     const home = env.get("HOME") orelse return self;
 
     if (env.get("XDG_STATE_HOME")) |x| {
-        self.path = std.fmt.allocPrint(allocator, "{s}/fancy-cat/history", .{x}) catch return self;
-    } else self.path = std.fmt.allocPrint(allocator, "{s}/.local/state/fancy-cat/history", .{home}) catch return self;
+        self.path = std.fmt.allocPrint(allocator, "{s}/termre/history", .{x}) catch return self;
+    } else self.path = std.fmt.allocPrint(allocator, "{s}/.local/state/termre/history", .{home}) catch return self;
 
     const cwd = std.Io.Dir.cwd();
     const content = cwd.readFileAlloc(io, self.path, allocator, .limited(1024 * 1024)) catch return self;

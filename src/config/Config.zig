@@ -224,12 +224,24 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
     var path: []u8 = "";
     if (env.get("XDG_CONFIG_HOME")) |x| {
-        path = std.fmt.allocPrint(allocator, "{s}/fancy-cat/config.json", .{x}) catch return self;
-    } else path = std.fmt.allocPrint(allocator, "{s}/.config/fancy-cat/config.json", .{home}) catch return self;
+        path = std.fmt.allocPrint(allocator, "{s}/termre/config.json", .{x}) catch return self;
+    } else path = std.fmt.allocPrint(allocator, "{s}/.config/termre/config.json", .{home}) catch return self;
     defer allocator.free(path);
 
     const cwd = std.Io.Dir.cwd();
-    const content: ?[]u8 = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch null;
+    var content: ?[]u8 = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch null;
+    if (content == null) {
+        // Pre-rename fallback: read an existing fancy-cat config once; writes
+        // (the auto-created empty file) go to the termre path.
+        const legacy: ?[]u8 = if (env.get("XDG_CONFIG_HOME")) |x|
+            std.fmt.allocPrint(allocator, "{s}/fancy-cat/config.json", .{x}) catch null
+        else
+            std.fmt.allocPrint(allocator, "{s}/.config/fancy-cat/config.json", .{home}) catch null;
+        if (legacy) |lp| {
+            defer allocator.free(lp);
+            content = cwd.readFileAlloc(io, lp, allocator, .limited(1024 * 1024)) catch null;
+        }
+    }
     if (content == null) {
         if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch {};
         const file = cwd.createFile(io, path, .{}) catch return self;

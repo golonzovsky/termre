@@ -58,8 +58,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
     self.file_path = statePath(allocator, env) orelse return self;
 
-    const cwd = std.Io.Dir.cwd();
-    const content = cwd.readFileAlloc(io, self.file_path, allocator, .limited(1024 * 1024)) catch return self;
+    const content = readStateFile(allocator, io, env, self.file_path) orelse return self;
     defer allocator.free(content);
 
     self.all = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return self;
@@ -78,10 +77,30 @@ pub fn deinit(self: *Self) void {
 
 fn statePath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
     if (env.get("XDG_STATE_HOME")) |x| {
+        return std.fmt.allocPrint(allocator, "{s}/termre/positions.json", .{x}) catch null;
+    }
+    const home = env.get("HOME") orelse return null;
+    return std.fmt.allocPrint(allocator, "{s}/.local/state/termre/positions.json", .{home}) catch null;
+}
+
+// Pre-rename location; read-only fallback so existing books keep their state.
+fn legacyStatePath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
+    if (env.get("XDG_STATE_HOME")) |x| {
         return std.fmt.allocPrint(allocator, "{s}/fancy-cat/positions.json", .{x}) catch null;
     }
     const home = env.get("HOME") orelse return null;
     return std.fmt.allocPrint(allocator, "{s}/.local/state/fancy-cat/positions.json", .{home}) catch null;
+}
+
+// Contents of the state file, trying the current path then the legacy one.
+fn readStateFile(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, primary: []const u8) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.readFileAlloc(io, primary, allocator, .limited(1024 * 1024))) |content| {
+        return content;
+    } else |_| {}
+    const legacy = legacyStatePath(allocator, env) orelse return null;
+    defer allocator.free(legacy);
+    return cwd.readFileAlloc(io, legacy, allocator, .limited(1024 * 1024)) catch null;
 }
 
 pub const RecentEntry = struct {
@@ -94,7 +113,7 @@ pub const RecentEntry = struct {
 pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []RecentEntry {
     const path = statePath(allocator, env) orelse return &.{};
     defer allocator.free(path);
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch return &.{};
+    const content = readStateFile(allocator, io, env, path) orelse return &.{};
     defer allocator.free(content);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return &.{};
     defer parsed.deinit();

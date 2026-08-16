@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const exe = b.addExecutable(.{
-        .name = "fancy-cat",
+        .name = "re",
         .root_module = exe_mod,
     });
     exe.headerpad_max_install_names = true;

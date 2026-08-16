@@ -12,7 +12,7 @@ pub const panic = vaxis.panic_handler;
 // For now metadata is only used in main.zig, but can move it to types.zig if needed eleswhere
 // This wont be necessary once https://github.com/ziglang/zig/pull/22907 is merged
 
-const PackageName = enum { fancy_cat };
+const PackageName = enum { termre };
 
 const DependencyType = struct {
     url: []const u8,
@@ -113,13 +113,13 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_writer.interface;
 
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v"))) {
-        try stdout.print("fancy-cat version {s}\n", .{metadata.version});
+        try stdout.print("termre version {s}\n", .{metadata.version});
         try stdout.flush();
         return;
     }
 
     if (args.len > 3 or (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))) {
-        try stderr.writeAll("Usage: fancy-cat <path-to-pdf> <optional-page-number>\n       fancy-cat            (pick from recently opened)\n");
+        try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n       re                   (pick from recently opened)\n");
         try stderr.flush();
         return;
     }
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
         const arena = init.arena.allocator();
         const recents = Positions.listRecent(arena, init.io, init.environ_map);
         if (recents.len == 0) {
-            try stderr.writeAll("Usage: fancy-cat <path-to-pdf> <optional-page-number>\n");
+            try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n");
             try stderr.flush();
             return;
         }

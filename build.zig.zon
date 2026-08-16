@@ -1,7 +1,7 @@
 .{
-    .name = .fancy_cat,
+    .name = .termre,
     .version = "0.5.0",
-    .fingerprint = 0x866b011980aee471, // Changing this has security and trust implications.
+    .fingerprint = 0xd14ba88ec3e4101e, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vaxis = .{
