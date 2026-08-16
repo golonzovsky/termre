@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: macos-arm64
+          - os: ubuntu-latest
+            target: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build --release=small
+
+      - name: Package
+        run: |
+          tar -C zig-out/bin -czf re-${{ github.ref_name }}-${{ matrix.target }}.tar.gz re
+          shasum -a 256 re-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
+            > re-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            re-*.tar.gz
+            re-*.tar.gz.sha256
