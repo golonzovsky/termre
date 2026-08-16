@@ -19,10 +19,14 @@ const DependencyType = struct {
     hash: []const u8,
 };
 
+const PathDependencyType = struct {
+    path: []const u8,
+};
+
 const DependenciesType = struct {
     vaxis: DependencyType,
     fastb64z: DependencyType,
-    fzwatch: DependencyType,
+    fzwatch: PathDependencyType,
 };
 
 const MetadataType = struct {

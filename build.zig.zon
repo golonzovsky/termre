@@ -12,15 +12,14 @@
             .url = "https://github.com/freref/fastb64z/archive/3defc5d33162670c28e42af073cf9bc003017da6.tar.gz",
             .hash = "fastb64z-1.0.0-x5LyQZ2gAAAYQrdQBKuqfNOY0beaxhunrksEtUOmIjhq",
         },
-        .fzwatch = .{
-            .url = "https://github.com/freref/fzwatch/archive/eab2fde9ab2a8fd721d4af67e78308fb6b522a16.tar.gz",
-            .hash = "fzwatch-0.2.2-6qM2ONQzAACLaMFX3DGopE-Y6etVZNn8kDh_4LhmWAMp",
-        },
+        // Vendored: upstream fzwatch's build script predates Zig 0.16; this
+        // copy carries the API fixes (see vendor/fzwatch, MIT).
+        .fzwatch = .{ .path = "vendor/fzwatch" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "compat",
         "src",
+        "vendor",
     },
 }
