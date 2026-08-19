@@ -462,6 +462,12 @@ fn renderAttempt(
     self.rendered_w = @intCast(width);
     self.last_viewport_w = window_width;
 
+    return self.exportPixmap(pix, width, height, rb.ox, rb.oy);
+}
+
+// Hands a finished pixmap to the configured transfer: shm raw RGB, PNG temp
+// file, or in-memory PNG. Caller holds render_mutex.
+fn exportPixmap(self: *Self, pix: [*c]c.fz_pixmap, width: usize, height: usize, ox: f32, oy: f32) !types.EncodedImage {
     // Raw RGB in shared memory skips PNG encode and decode entirely; the
     // PNG paths compress 10-40x for text pages, which matters for the
     // temp-file and especially the streamed SSH fallback.
@@ -476,8 +482,8 @@ fn renderAttempt(
                 .kind = .shm_rgb,
                 .width = @as(u16, @intCast(width)),
                 .height = @as(u16, @intCast(height)),
-                .origin_x = rb.ox,
-                .origin_y = rb.oy,
+                .origin_x = ox,
+                .origin_y = oy,
             };
         }
         // shm failed (exhausted or unsupported): fall through to streamed PNG.
@@ -502,8 +508,8 @@ fn renderAttempt(
                 .kind = .png_path,
                 .width = @as(u16, @intCast(width)),
                 .height = @as(u16, @intCast(height)),
-                .origin_x = rb.ox,
-                .origin_y = rb.oy,
+                .origin_x = ox,
+                .origin_y = oy,
             };
         }
     }
@@ -519,9 +525,47 @@ fn renderAttempt(
         .kind = .png_bytes,
         .width = @as(u16, @intCast(width)),
         .height = @as(u16, @intCast(height)),
-        .origin_x = rb.ox,
-        .origin_y = rb.oy,
+        .origin_x = ox,
+        .origin_y = oy,
     };
+}
+
+// Renders a page scaled to fit max_w/max_h pixels, without touching the
+// reading zoom or viewport state — for the grid-mode thumbnails.
+pub fn renderThumb(self: *Self, page_number: u16, max_w: u32, max_h: u32) !types.EncodedImage {
+    self.render_mutex.lockUncancelable(self.io);
+    defer self.render_mutex.unlock(self.io);
+
+    if (self.doc == null or page_number >= self.total_pages) return error.PageLoadFailed;
+    const page = c.fz_load_page_z(self.ctx, self.doc, @as(c_int, @intCast(page_number))) orelse
+        return error.PageLoadFailed;
+    defer c.fz_drop_page(self.ctx, page);
+
+    const rb = self.pageRenderBound(page);
+    const w_pdf = @max(1.0, rb.bound.x1 - rb.bound.x0);
+    const h_pdf = @max(1.0, rb.bound.y1 - rb.bound.y0);
+    const zoom = @min(@as(f32, @floatFromInt(max_w)) / w_pdf, @as(f32, @floatFromInt(max_h)) / h_pdf);
+
+    const full_w = @max(1.0, zoom * w_pdf);
+    const full_h = @max(1.0, zoom * h_pdf);
+    const bbox = c.fz_make_irect(0, 0, @intFromFloat(full_w), @intFromFloat(full_h));
+    const pix = c.fz_new_pixmap_with_bbox(self.ctx, c.fz_device_rgb(self.ctx), bbox, null, 0);
+    defer c.fz_drop_pixmap(self.ctx, pix);
+    c.fz_clear_pixmap_with_value(self.ctx, pix, 0xFF);
+
+    const shift_pdf: f32 = if (page_number % 2 == 1)
+        @as(f32, @floatFromInt(self.odd_shift_x))
+    else
+        0;
+    const ctm = c.fz_pre_translate(c.fz_scale(zoom, zoom), -rb.ox + shift_pdf, -rb.oy);
+    self.runPageInto(page, ctm, pix);
+    if (self.config.general.colorize) {
+        c.fz_tint_pixmap(self.ctx, pix, self.config.general.black, self.config.general.white);
+    }
+
+    const width = @as(usize, @intCast(@abs(bbox.x1)));
+    const height = @as(usize, @intCast(@abs(bbox.y1)));
+    return self.exportPixmap(pix, width, height, rb.ox, rb.oy);
 }
 
 pub fn toggleCropToContent(self: *Self) void {

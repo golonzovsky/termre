@@ -51,6 +51,10 @@ non-obvious ones:
   Ctrl/Alt+wheel zoom while cropping; on odd pages the cyan `┆` line is the
   `oddx` offset — pages render unshifted while cropping, and dragging `┆` moves
   the crop border over the still page to show where the aligned window will cut
+- `g` page grid (thumbnail overview): `h`/`j`/`k`/`l` move the selection with
+  smooth scrolling, wheel pans the grid (selection and page stay put), `i`/`o`
+  resize thumbnails, `z` invert, `t` auto-crop, `Enter` or click jumps,
+  `g`/`Esc` closes
 - `t` auto-crop, `d` spread, `T` table of contents, `M` marks, `;` link hints,
   `m<a-z>`/`'<a-z>` set/jump mark, `Ctrl+O`/`Tab` jump back/forward,
   `e`/`E` page/chapter in `$EDITOR`

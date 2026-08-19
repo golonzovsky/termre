@@ -10,6 +10,7 @@ const SearchMode = @import("modes/SearchMode.zig");
 const SearchListMode = @import("modes/SearchListMode.zig");
 const HighlightsMode = @import("modes/HighlightsMode.zig");
 const CropMode = @import("modes/CropMode.zig");
+const GridMode = @import("modes/GridMode.zig");
 const fzwatch = @import("fzwatch");
 const Config = @import("config/Config.zig");
 const PdfHandler = @import("handlers/PdfHandler.zig");
@@ -29,8 +30,8 @@ pub const Event = union(enum) {
     prerender_ready,
 };
 
-pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop };
-pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode };
+pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid };
+pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode, grid: GridMode };
 pub const ReloadIndicatorState = enum { idle, reload, watching };
 
 pub const VisiblePage = struct {
@@ -491,7 +492,7 @@ pub const Context = struct {
         }
     }
 
-    fn renderFrame(self: *Self) !void {
+    pub fn renderFrame(self: *Self) !void {
         try self.draw();
         var buffered = self.tty.writer();
         try self.vx.render(buffered);
@@ -581,7 +582,10 @@ pub const Context = struct {
             .reload_done => {
                 self.current_reload_indicator_state = .watching;
             },
-            .prerender_ready => self.integratePrerendered(),
+            .prerender_ready => {
+                self.integratePrerendered();
+                self.integrateThumbs();
+            },
         }
     }
 
@@ -638,6 +642,40 @@ pub const Context = struct {
             }
         }
         return cached;
+    }
+
+    // Delivers finished background thumbs to grid mode (or discards them).
+    fn integrateThumbs(self: *Self) void {
+        for (self.prerenderer.claimThumbs()) |maybe| {
+            const r = maybe orelse continue;
+            defer {
+                self.allocator.free(r.image.data);
+                self.allocator.destroy(r);
+            }
+            if (self.current_mode != .grid or !self.current_mode.grid.wantsThumb(r.page, r.max_w)) {
+                self.deleteEncoded(r.image);
+                continue;
+            }
+            const img = self.transmitEncoded(r.image) catch {
+                self.deleteEncoded(r.image);
+                continue;
+            };
+            self.current_mode.grid.putThumb(r.page, img);
+        }
+    }
+
+    pub fn requestThumbs(self: *Self, pages: [Prerenderer.thumb_slots]?u16, w: u32, h: u32) bool {
+        return self.prerenderer.requestThumbs(pages, w, h);
+    }
+
+    // Renders and transmits a page thumbnail without touching reading state.
+    pub fn thumbImage(self: *Self, page: u16, max_w: u32, max_h: u32) !vaxis.Image {
+        const enc = try self.document_handler.renderThumb(page, max_w, max_h);
+        defer self.allocator.free(enc.data);
+        return self.transmitEncoded(enc) catch |err| {
+            self.deleteEncoded(enc);
+            return err;
+        };
     }
 
     // Sends a render to the terminal. Locally only a name crosses the tty:

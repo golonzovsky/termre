@@ -36,6 +36,7 @@ const bindings = .{
     .{ "jump_mark", startJumpMark },
     .{ "toc_mode", enterToc },
     .{ "marks_mode", enterMarks },
+    .{ "grid_mode", enterGrid },
     .{ "jump_back", Context.jumpBack },
     .{ "jump_forward", Context.jumpForward },
     .{ "open_in_editor", openPageInEditor },
@@ -231,6 +232,10 @@ fn enterToc(ctx: *Context) void {
 
 fn enterMarks(ctx: *Context) void {
     ctx.changeMode(.marks);
+}
+
+fn enterGrid(ctx: *Context) void {
+    ctx.changeMode(.grid);
 }
 
 fn showHelp(ctx: *Context) void {
