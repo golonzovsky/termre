@@ -87,6 +87,9 @@ pub const General = struct {
     timeout: f32 = 5.0,
     // resolution
     detect_dpi: bool = true,
+    // Raw-RGB shared-memory image transfer (kitty t=s); disable for terminals
+    // without shm support to fall back to PNG temp files.
+    shm_transfer: bool = true,
     dpi: f32 = 96.0,
     // whole number (possibly 0)
     history: u32 = 1000,

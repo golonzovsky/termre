@@ -195,12 +195,17 @@ pub const Context = struct {
 
         const outline = document_handler.loadOutline(allocator) catch &.{};
 
-        // Local terminals get kitty t=t temp-file image transfer (the path
-        // travels over the tty, not the pixels). Over SSH the terminal can't
-        // see our filesystem, so fall back to streaming PNG bytes.
+        // Local terminals get shared-memory raw-RGB transfer (kitty t=s: no
+        // PNG encode/decode, only the shm name crosses the tty), or t=t PNG
+        // temp files when disabled in config. Over SSH the terminal can't see
+        // our memory or filesystem, so fall back to streaming PNG bytes.
         if (env.get("SSH_TTY") == null and env.get("SSH_CONNECTION") == null) {
-            const tmp = std.mem.trimEnd(u8, env.get("TMPDIR") orelse "/tmp", "/");
-            document_handler.setPngDir(tmp);
+            if (config.general.shm_transfer) {
+                document_handler.setTransfer(.shm, null);
+            } else {
+                const tmp = std.mem.trimEnd(u8, env.get("TMPDIR") orelse "/tmp", "/");
+                document_handler.setTransfer(.temp_file, tmp);
+            }
         }
 
         // The clipboard allocator must be set: without it, vaxis's parser
@@ -618,7 +623,7 @@ pub const Context = struct {
         defer self.allocator.free(encoded_image.data);
 
         const image = self.transmitEncoded(encoded_image) catch |err| {
-            self.deleteEncodedFile(encoded_image);
+            self.deleteEncoded(encoded_image);
             return err;
         };
 
@@ -635,12 +640,22 @@ pub const Context = struct {
         return cached;
     }
 
-    // Sends a render to the terminal. Locally the PNG sits in a temp file and
-    // only its path crosses the tty (kitty t=t; the terminal deletes the file
-    // after reading); the SSH fallback streams the PNG bytes base64-chunked.
+    // Sends a render to the terminal. Locally only a name crosses the tty:
+    // a shared-memory object of raw RGB (kitty t=s; the terminal unlinks it)
+    // or a PNG temp-file path (t=t; the terminal deletes it). The SSH
+    // fallback streams the PNG bytes base64-chunked.
     fn transmitEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
-        if (enc.is_path) {
-            return self.vx.transmitLocalImagePath(
+        switch (enc.kind) {
+            .shm_rgb => return self.vx.transmitLocalImagePath(
+                self.allocator,
+                self.tty.writer(),
+                enc.data,
+                enc.width,
+                enc.height,
+                .shared_mem,
+                .rgb,
+            ),
+            .png_path => return self.vx.transmitLocalImagePath(
                 self.allocator,
                 self.tty.writer(),
                 enc.data,
@@ -648,19 +663,28 @@ pub const Context = struct {
                 enc.height,
                 .temp_file,
                 .png,
-            );
+            ),
+            .png_bytes => {
+                const b64 = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(enc.data.len));
+                defer self.allocator.free(b64);
+                const encoded = std.base64.standard.Encoder.encode(b64, enc.data);
+                return self.vx.transmitPreEncodedImage(self.tty.writer(), encoded, enc.width, enc.height, .png);
+            },
         }
-        const b64 = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(enc.data.len));
-        defer self.allocator.free(b64);
-        const encoded = std.base64.standard.Encoder.encode(b64, enc.data);
-        return self.vx.transmitPreEncodedImage(self.tty.writer(), encoded, enc.width, enc.height, .png);
     }
 
     // For renders discarded without being transmitted — the terminal will
-    // never read (and so never delete) their temp file.
-    fn deleteEncodedFile(self: *Self, enc: PdfHandler.types.EncodedImage) void {
-        if (!enc.is_path) return;
-        std.Io.Dir.cwd().deleteFile(self.io, enc.data) catch {};
+    // never read (and so never clean up) their backing file or shm object.
+    pub fn deleteEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) void {
+        switch (enc.kind) {
+            .png_path => std.Io.Dir.cwd().deleteFile(self.io, enc.data) catch {},
+            .shm_rgb => {
+                var name_buf: [64]u8 = undefined;
+                const name = std.fmt.bufPrintZ(&name_buf, "{s}", .{enc.data}) catch return;
+                _ = std.c.shm_unlink(name.ptr);
+            },
+            .png_bytes => {},
+        }
     }
 
     // Empties the render cache and queues the displaced terminal-side images
@@ -682,11 +706,11 @@ pub const Context = struct {
                 !std.meta.eql(r.key, self.cacheKeyFor(r.key.page)) or
                 self.cache.contains(r.key))
             {
-                self.deleteEncodedFile(r.image);
+                self.deleteEncoded(r.image);
                 continue;
             }
             const image = self.transmitEncoded(r.image) catch {
-                self.deleteEncodedFile(r.image);
+                self.deleteEncoded(r.image);
                 continue;
             };
             const evicted = self.cache.put(r.key, .{

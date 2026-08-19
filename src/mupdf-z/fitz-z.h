@@ -81,3 +81,8 @@ int fz_extract_pages_z(
 int fz_export_cropped_z(fz_context *ctx, const char *src_path, const char *dst_path,
                         float left, float right, float top, float bottom, int odd_shift_x,
                         int keep_id);
+
+// Copies the pixmap's RGB rows (stride compacted) into a fresh POSIX shared
+// memory object `name` for kitty t=s transfer; the terminal unlinks it after
+// reading. Returns 1 on success.
+int fz_pixmap_to_shm_z(fz_context *ctx, fz_pixmap *pix, const char *name);

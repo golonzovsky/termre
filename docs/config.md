@@ -63,6 +63,7 @@ Because termre provides sensible defaults, you only need to specify the options 
     "retry_delay": 0.2,
     "timeout": 5.0,
     "detect_dpi": true,
+    "shm_transfer": true,
     "dpi": 96.0,
     "history": 1000
   },
@@ -210,6 +211,7 @@ The `General` section includes various display and timing settings.
 | `zoom_min` | Float | Minimum zoom level allowed |
 | `scroll_step` | Float (pixels) | Distance the viewport moves per scroll keystroke |
 | `detect_dpi` | Boolean | Enables pixel-density detection so that 100% zoom = actual size |
+| `shm_transfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support |
 | `dpi` | Float | Pixel density to use if `detect_dpi` is false, or fallback if detection fails |
 | `retry_delay` | Float (seconds) | Delay before retrying to load a document or render a page |
 | `timeout` | Float (seconds) | Maximum time to keep retrying before giving up on loading a document or rendering a page |

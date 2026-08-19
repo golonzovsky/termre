@@ -594,3 +594,34 @@ int fz_export_cropped_z(fz_context *ctx, const char *src_path, const char *dst_p
   fz_catch(ctx) { ok = 0; }
   return ok;
 }
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int fz_pixmap_to_shm_z(fz_context *ctx, fz_pixmap *pix, const char *name) {
+  int w = fz_pixmap_width(ctx, pix);
+  int h = fz_pixmap_height(ctx, pix);
+  int stride = fz_pixmap_stride(ctx, pix);
+  unsigned char *samples = fz_pixmap_samples(ctx, pix);
+  if (w <= 0 || h <= 0 || !samples || fz_pixmap_components(ctx, pix) != 3) return 0;
+  size_t row = (size_t)w * 3;
+  size_t size = row * (size_t)h;
+  int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) return 0;
+  if (ftruncate(fd, (off_t)size) != 0) {
+    close(fd);
+    shm_unlink(name);
+    return 0;
+  }
+  unsigned char *dst = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (dst == MAP_FAILED) {
+    shm_unlink(name);
+    return 0;
+  }
+  for (int y = 0; y < h; y++)
+    memcpy(dst + (size_t)y * row, samples + (size_t)y * (size_t)stride, row);
+  munmap(dst, size);
+  return 1;
+}

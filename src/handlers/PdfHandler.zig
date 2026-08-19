@@ -53,8 +53,10 @@ last_viewport_w: u32,
 search_highlights: []const SearchHit,
 selection_quads: []const SearchHit,
 highlight_quads: []const SearchHit,
-// When set, renders are written as PNG temp files in this directory (kitty
-// t=t transmission); when null, renders return in-memory PNG bytes.
+// How renders reach the terminal: shm = raw RGB in a POSIX shared-memory
+// object (no PNG encode/decode at all), temp_file = PNG in png_dir (kitty
+// t=t), stream = in-memory PNG bytes (the SSH fallback).
+transfer: types.Transfer,
 png_dir: ?[]const u8,
 png_seq: u32,
 session_tag: u32,
@@ -131,6 +133,7 @@ pub fn init(
         .search_highlights = &.{},
         .selection_quads = &.{},
         .highlight_quads = &.{},
+        .transfer = .stream,
         .png_dir = null,
         .png_seq = 0,
         .session_tag = @truncate(@as(u64, @bitCast(time.nowRealSeconds()))),
@@ -139,8 +142,9 @@ pub fn init(
     };
 }
 
-pub fn setPngDir(self: *Self, dir: []const u8) void {
-    self.png_dir = self.allocator.dupe(u8, dir) catch null;
+pub fn setTransfer(self: *Self, transfer: types.Transfer, tmp_dir: ?[]const u8) void {
+    self.transfer = transfer;
+    if (tmp_dir) |dir| self.png_dir = self.allocator.dupe(u8, dir) catch null;
 }
 
 pub fn deinit(self: *Self) void {
@@ -458,29 +462,50 @@ fn renderAttempt(
     self.rendered_w = @intCast(width);
     self.last_viewport_w = window_width;
 
-    // PNG instead of raw RGB: pages of text compress 10-40x, which shrinks
-    // both the temp file and the streamed fallback accordingly.
-    if (self.png_dir) |dir| {
+    // Raw RGB in shared memory skips PNG encode and decode entirely; the
+    // PNG paths compress 10-40x for text pages, which matters for the
+    // temp-file and especially the streamed SSH fallback.
+    if (self.transfer == .shm) {
         self.png_seq +%= 1;
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/tty-graphics-protocol-termre-{d}-{d}.png",
-            .{ dir, self.session_tag, self.png_seq },
-        );
-        errdefer self.allocator.free(path);
-        var pathz_buf: [1024]u8 = undefined;
-        const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{path}) catch return types.DocumentError.FailedToRenderPage;
-        if (c.fz_save_pixmap_png_z(self.ctx, pix, pathz.ptr) == 0) {
+        var name_buf: [32]u8 = undefined; // macOS shm names cap at 31 chars
+        const name = std.fmt.bufPrintZ(&name_buf, "/tre{x}-{x}", .{ self.session_tag, self.png_seq }) catch
             return types.DocumentError.FailedToRenderPage;
+        if (c.fz_pixmap_to_shm_z(self.ctx, pix, name.ptr) != 0) {
+            return types.EncodedImage{
+                .data = try self.allocator.dupe(u8, name),
+                .kind = .shm_rgb,
+                .width = @as(u16, @intCast(width)),
+                .height = @as(u16, @intCast(height)),
+                .origin_x = rb.ox,
+                .origin_y = rb.oy,
+            };
         }
-        return types.EncodedImage{
-            .data = path,
-            .is_path = true,
-            .width = @as(u16, @intCast(width)),
-            .height = @as(u16, @intCast(height)),
-            .origin_x = rb.ox,
-            .origin_y = rb.oy,
-        };
+        // shm failed (exhausted or unsupported): fall through to streamed PNG.
+    }
+
+    if (self.transfer == .temp_file) {
+        if (self.png_dir) |dir| {
+            self.png_seq +%= 1;
+            const path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/tty-graphics-protocol-termre-{d}-{d}.png",
+                .{ dir, self.session_tag, self.png_seq },
+            );
+            errdefer self.allocator.free(path);
+            var pathz_buf: [1024]u8 = undefined;
+            const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{path}) catch return types.DocumentError.FailedToRenderPage;
+            if (c.fz_save_pixmap_png_z(self.ctx, pix, pathz.ptr) == 0) {
+                return types.DocumentError.FailedToRenderPage;
+            }
+            return types.EncodedImage{
+                .data = path,
+                .kind = .png_path,
+                .width = @as(u16, @intCast(width)),
+                .height = @as(u16, @intCast(height)),
+                .origin_x = rb.ox,
+                .origin_y = rb.oy,
+            };
+        }
     }
 
     var png_len: usize = 0;
@@ -491,7 +516,7 @@ fn renderAttempt(
 
     return types.EncodedImage{
         .data = data,
-        .is_path = false,
+        .kind = .png_bytes,
         .width = @as(u16, @intCast(width)),
         .height = @as(u16, @intCast(height)),
         .origin_x = rb.ox,
