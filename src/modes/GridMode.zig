@@ -91,6 +91,26 @@ fn panBy(self: *Self, delta: i32) void {
 }
 
 
+// C-d/C-u: view and cursor move together by a screenful, so the cursor
+// keeps its relative screen position and the motion is symmetric.
+fn screenJump(self: *Self, dir: i32) void {
+    const rows_jump: i32 = @intCast(@max(1, self.grid_h / self.cell_h));
+    const total: i32 = @intCast(self.context.document_handler.getTotalPages());
+    self.selected = @intCast(std.math.clamp(
+        @as(i32, self.selected) + dir * rows_jump * @as(i32, self.cols),
+        0,
+        total - 1,
+    ));
+    const target = std.math.clamp(
+        @as(i32, self.scroll_cells) + dir * rows_jump * @as(i32, self.cell_h),
+        0,
+        @as(i32, self.maxScroll()),
+    );
+    if (target != self.scroll_cells) self.animateScrollTo(@intCast(target));
+    // Edge clamps can desync the pair; snap the cursor back into view.
+    self.ensureVisible(false);
+}
+
 fn moveSelected(self: *Self, delta: i32) void {
     const total: i32 = @intCast(self.context.document_handler.getTotalPages());
     self.selected = @intCast(std.math.clamp(@as(i32, self.selected) + delta, 0, total - 1));
@@ -162,14 +182,8 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) return self.moveSelected(1);
     if (key.matches(km.next.codepoint, km.next.mods)) return self.moveSelected(1);
     if (key.matches(km.prev.codepoint, km.prev.mods)) return self.moveSelected(-1);
-    if (key.matches(km.scroll_half_down.codepoint, km.scroll_half_down.mods)) {
-        const vis_rows: i32 = @intCast(@max(1, self.grid_h / self.cell_h));
-        return self.moveSelected(@as(i32, self.cols) * vis_rows);
-    }
-    if (key.matches(km.scroll_half_up.codepoint, km.scroll_half_up.mods)) {
-        const vis_rows: i32 = @intCast(@max(1, self.grid_h / self.cell_h));
-        return self.moveSelected(-@as(i32, self.cols) * vis_rows);
-    }
+    if (key.matches(km.scroll_half_down.codepoint, km.scroll_half_down.mods)) return self.screenJump(1);
+    if (key.matches(km.scroll_half_up.codepoint, km.scroll_half_up.mods)) return self.screenJump(-1);
     if (key.matches('G', .{})) {
         self.selected = self.context.document_handler.getTotalPages() - 1;
         self.ensureVisible(true);
