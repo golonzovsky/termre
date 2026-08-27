@@ -32,15 +32,26 @@ map: std.AutoHashMap(Key, *Node),
 head: ?*Node,
 tail: ?*Node,
 lru_size: u16,
+// Terminal-side footprint bound: the terminal stores decoded pixels for every
+// live image, and its own storage quota silently evicts (including the visible
+// page) when exceeded. Entry count alone doesn't bound bytes at high zoom.
+budget_bytes: usize,
+total_bytes: usize,
 
-pub fn init(allocator: std.mem.Allocator, lru_size: u16) Self {
+pub fn init(allocator: std.mem.Allocator, lru_size: u16, budget_bytes: usize) Self {
     return .{
         .allocator = allocator,
         .map = std.AutoHashMap(Key, *Node).init(allocator),
         .head = null,
         .tail = null,
         .lru_size = lru_size,
+        .budget_bytes = budget_bytes,
+        .total_bytes = 0,
     };
+}
+
+fn cost(image: CachedImage) usize {
+    return @as(usize, image.image.width) * @as(usize, image.image.height) * 4;
 }
 
 pub fn deinit(self: *Self) void {
@@ -69,6 +80,7 @@ pub fn clearInto(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(
     self.map.clearRetainingCapacity();
     self.head = null;
     self.tail = null;
+    self.total_bytes = 0;
 }
 
 pub fn contains(self: *Self, key: Key) bool {
@@ -81,12 +93,13 @@ pub fn get(self: *Self, key: Key) ?CachedImage {
     return node.value;
 }
 
-// Returns the evicted entry, if insertion pushed one out; the caller owns
-// freeing its terminal-side image.
-pub fn put(self: *Self, key: Key, image: CachedImage) !?CachedImage {
+// Inserts and evicts from the LRU tail until both the entry count and the
+// byte budget hold; displaced images land in `evicted` and the caller owns
+// freeing them terminal-side.
+pub fn put(self: *Self, key: Key, image: CachedImage, gpa: std.mem.Allocator, evicted: *std.ArrayList(CachedImage)) !void {
     if (self.map.get(key)) |node| {
         self.moveToFront(node);
-        return null;
+        return;
     }
 
     const new_node = try self.allocator.create(Node);
@@ -99,21 +112,22 @@ pub fn put(self: *Self, key: Key, image: CachedImage) !?CachedImage {
 
     try self.map.put(key, new_node);
     self.addToFront(new_node);
+    self.total_bytes += cost(image);
 
-    if (self.map.count() > self.lru_size) {
-        const tail_node = self.tail orelse unreachable;
-        const evicted = tail_node.value;
+    while (self.map.count() > 1 and
+        (self.map.count() > self.lru_size or self.total_bytes > self.budget_bytes))
+    {
+        const tail_node = self.tail orelse break;
+        evicted.append(gpa, tail_node.value) catch break;
         _ = self.remove(tail_node.key);
-        return evicted;
     }
-
-    return null;
 }
 
 // Removes an entry, returning it so the caller can free its terminal-side image.
 pub fn take(self: *Self, key: Key) ?CachedImage {
     const node = self.map.get(key) orelse return null;
     const value = node.value;
+    self.total_bytes -= cost(value);
     _ = self.map.remove(key);
     self.removeNode(node);
     self.allocator.destroy(node);
@@ -122,6 +136,7 @@ pub fn take(self: *Self, key: Key) ?CachedImage {
 
 fn remove(self: *Self, key: Key) bool {
     const node = self.map.get(key) orelse return false;
+    self.total_bytes -= cost(node.value);
     _ = self.map.remove(key);
 
     self.removeNode(node);

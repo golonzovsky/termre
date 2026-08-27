@@ -60,8 +60,7 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
             switch (mouse.button) {
                 .wheel_up => {
                     if (zoom_mod) {
-                        ctx.document_handler.zoomIn();
-                        ctx.reload_page = true;
+                        zoomIn(ctx);
                     } else if (mouse.mods.shift) {
                         ctx.document_handler.offsetScroll(step, 0);
                     } else {
@@ -70,8 +69,7 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
                 },
                 .wheel_down => {
                     if (zoom_mod) {
-                        ctx.document_handler.zoomOut();
-                        ctx.reload_page = true;
+                        zoomOut(ctx);
                     } else if (mouse.mods.shift) {
                         ctx.document_handler.offsetScroll(-step, 0);
                     } else {

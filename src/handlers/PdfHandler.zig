@@ -50,6 +50,8 @@ pix_scroll_x: i32,
 pix_scroll_y: i32,
 rendered_w: u32,
 last_viewport_w: u32,
+last_viewport_h: u32,
+fit_scale: f32,
 search_highlights: []const SearchHit,
 selection_quads: []const SearchHit,
 highlight_quads: []const SearchHit,
@@ -130,6 +132,8 @@ pub fn init(
         .pix_scroll_y = 0,
         .rendered_w = 0,
         .last_viewport_w = 0,
+        .last_viewport_h = 0,
+        .fit_scale = 0,
         .search_highlights = &.{},
         .selection_quads = &.{},
         .highlight_quads = &.{},
@@ -241,7 +245,16 @@ fn calculateZoomLevel(self: *Self, window_width: u32, window_height: u32, bound:
         }
     }
 
-    self.active_zoom = @max(self.active_zoom, self.config.general.zoom_min);
+    self.fit_scale = scale;
+    self.active_zoom = @max(self.active_zoom, self.effectiveZoomMin());
+}
+
+// zoom_min guards against unusably tiny renders, but must not override a
+// window-fit scale — otherwise narrow windows freeze at 72dpi wider than
+// the viewport. The floor is "fits the window", however small that is.
+pub fn effectiveZoomMin(self: *const Self) f32 {
+    const zm = self.config.general.zoom_min;
+    return if (self.fit_scale > 0) @min(zm, self.fit_scale) else zm;
 }
 
 const RenderBound = struct { bound: c.fz_rect, ox: f32, oy: f32 };
@@ -461,6 +474,7 @@ fn renderAttempt(
 
     self.rendered_w = @intCast(width);
     self.last_viewport_w = window_width;
+    self.last_viewport_h = window_height;
 
     return self.exportPixmap(pix, width, height, rb.ox, rb.oy);
 }
@@ -599,11 +613,15 @@ pub fn zoomOut(self: *Self) void {
     self.rescaleScroll(old_zoom);
 }
 
+// Anchors the viewport center: the content under the middle of the screen
+// stays put through the zoom (scroll clamping still applies at edges).
 fn rescaleScroll(self: *Self, old_zoom: f32) void {
     if (old_zoom == 0 or self.active_zoom == 0) return;
     const ratio = self.active_zoom / old_zoom;
-    self.pix_scroll_x = @intFromFloat(@as(f32, @floatFromInt(self.pix_scroll_x)) * ratio);
-    self.pix_scroll_y = @intFromFloat(@as(f32, @floatFromInt(self.pix_scroll_y)) * ratio);
+    const half_w: f32 = @as(f32, @floatFromInt(self.last_viewport_w)) / 2.0;
+    const half_h: f32 = @as(f32, @floatFromInt(self.last_viewport_h)) / 2.0;
+    self.pix_scroll_x = @intFromFloat((@as(f32, @floatFromInt(self.pix_scroll_x)) + half_w) * ratio - half_w);
+    self.pix_scroll_y = @intFromFloat((@as(f32, @floatFromInt(self.pix_scroll_y)) + half_h) * ratio - half_h);
 }
 
 pub fn setZoom(self: *Self, percent: f32) void {
@@ -611,7 +629,7 @@ pub fn setZoom(self: *Self, percent: f32) void {
     var dpi = self.config.general.dpi;
     if (self.config.general.detect_dpi) dpi = Utilities.getDPI() orelse dpi;
 
-    self.active_zoom = @max(percent * dpi / 7200.0, self.config.general.zoom_min);
+    self.active_zoom = @max(percent * dpi / 7200.0, self.effectiveZoomMin());
 }
 
 pub fn toggleColor(self: *Self) void {

@@ -206,6 +206,10 @@ pub const Cache = struct {
     // Number of rendered pages kept resident (also terminal-side images). Sized
     // to hold the ±3 render-ahead window plus the visible pages without churn.
     lru_size: u16 = 14,
+    // Upper bound on decoded image bytes kept alive in the terminal; stays
+    // under typical terminal image-storage quotas (~320MB) so the terminal
+    // never silently evicts the visible page.
+    budget_mb: u16 = 200,
 
     pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) Cache {
         return parseFields(Cache, val, allocator);

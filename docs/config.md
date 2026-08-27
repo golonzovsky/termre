@@ -80,7 +80,8 @@ Because termre provides sensible defaults, you only need to specify the options 
   },
   "Cache": {
     "enabled": true,
-    "lru_size": 10
+    "lru_size": 10,
+    "budget_mb": 200
   }
 }
 ```
@@ -370,4 +371,5 @@ The `Cache` section controls the page rendering cache, which speeds up navigatio
 | Property | Type | Description |
 | :--- | :--- | :--- |
 | `enabled` | Boolean | Enables caching |
+| `budget_mb` | Integer | Max decoded image bytes (MB) kept alive in the terminal; stays under terminal image-storage quotas so the visible page is never silently evicted |
 | `lru_size` | Integer | Maximum number of pages to store in the cache |

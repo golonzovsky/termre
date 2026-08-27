@@ -28,6 +28,7 @@ thumb_rows: u16,
 thumb_max_w: u32,
 grid_h: u16,
 needs_snap: bool,
+last_thumb_w: u32,
 
 pub fn init(context: *Context) Self {
     return .{
@@ -44,6 +45,7 @@ pub fn init(context: *Context) Self {
         .thumb_max_w = 1,
         .grid_h = 1,
         .needs_snap = true,
+        .last_thumb_w = 0,
     };
 }
 
@@ -235,20 +237,48 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
 
 fn layout(self: *Self, win: vaxis.Window) void {
     const ctx = self.context;
-    self.cols = @intCast(std.math.clamp(win.width / self.target_cell_w, 1, 12));
-    self.cell_w = win.width / self.cols;
     self.grid_h = win.height -| @as(u16, if (ctx.config.status_bar.enabled) 1 else 0);
 
     const b = ctx.document_handler.getPageBound(self.selected);
     const aspect: f32 = if (b.x1 > b.x0 and b.y1 > b.y0) (b.y1 - b.y0) / (b.x1 - b.x0) else 1.3;
-    const thumb_w_px: f32 = @floatFromInt(@as(u32, self.cell_w) * ctx.last_pix_per_col);
-    self.thumb_rows = @intCast(std.math.clamp(
-        @as(u32, @intFromFloat(thumb_w_px * aspect / @as(f32, @floatFromInt(ctx.last_pix_per_row)))),
-        2,
-        @as(u32, self.grid_h -| 1),
-    ));
-    self.cell_h = self.thumb_rows + 1; // the label row is the vertical gutter
+    const ppr_f: f32 = @floatFromInt(ctx.last_pix_per_row);
+
+    // Start from the grid-zoom target, then add columns until enough thumb
+    // ROWS fit: on narrow/vertical windows full-width cells give page-sized
+    // thumbs and a two-page overview. The row floor scales with height (tall
+    // window -> more rows); an explicit grid zoom (i/o) relaxes it to a
+    // degenerate-grid guard — the user asked for big thumbs.
+    const min_rows: u32 = if (self.target_cell_w == 24)
+        std.math.clamp(@as(u32, self.grid_h) / 18, 2, 5)
+    else
+        1;
+    var cols: u16 = @intCast(std.math.clamp(win.width / self.target_cell_w, 1, 12));
+    while (true) {
+        const cell_w: u16 = win.width / cols;
+        const thumb_w_px: f32 = @floatFromInt(@as(u32, cell_w) * ctx.last_pix_per_col);
+        const rows_u: u32 = std.math.clamp(
+            @as(u32, @intFromFloat(thumb_w_px * aspect / ppr_f)),
+            2,
+            @as(u32, self.grid_h -| 1),
+        );
+        const cell_h: u16 = @intCast(rows_u + 1); // label row is the gutter
+        const vis: u32 = @max(1, self.grid_h / cell_h);
+        const enough = vis >= min_rows and @as(u32, cols) * vis >= 2;
+        if (enough or cols >= 12 or cell_w <= 9) {
+            self.cols = cols;
+            self.cell_w = cell_w;
+            self.thumb_rows = @intCast(rows_u);
+            self.cell_h = cell_h;
+            break;
+        }
+        cols += 1;
+    }
     self.thumb_max_w = @as(u32, self.cell_w) * ctx.last_pix_per_col;
+    // Any size change (resize, zoom, this column pump) invalidates thumbs.
+    if (self.thumb_max_w != self.last_thumb_w) {
+        self.last_thumb_w = self.thumb_max_w;
+        self.dumpThumbs();
+    }
 }
 
 pub fn draw(self: *Self, win: vaxis.Window) void {

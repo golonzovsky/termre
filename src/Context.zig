@@ -126,8 +126,7 @@ pub const Context = struct {
     // render (deleting before would blank their placements for a frame).
     stale_images: std.ArrayList(Cache.CachedImage),
     last_save_sig: u64,
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
+ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
         const config = try allocator.create(Config);
         errdefer allocator.destroy(config);
         config.* = Config.init(allocator, io, env);
@@ -242,7 +241,7 @@ pub const Context = struct {
             .doc_abs_path = doc_abs_path,
             .outline = outline,
             .reload_page = true,
-            .cache = Cache.init(allocator, config.cache.lru_size),
+            .cache = Cache.init(allocator, config.cache.lru_size, @as(usize, config.cache.budget_mb) * 1024 * 1024),
             .reload_indicator_timer = reload_indicator_timer,
             .current_reload_indicator_state = .idle,
             .reload_indicator_active = false,
@@ -499,6 +498,9 @@ pub const Context = struct {
         try buffered.flush();
     }
 
+    // Animated zoom: scale the already-transmitted placements around the
+    // viewport center (no renders, ~60ms), then apply the real zoom so the
+    // next draw swaps in a crisp render at the new scale.
     // Half-page jump for list popups, with the same ease-out feel as
     // smoothScrollHalf: `cursor` points at the mode's cursor field and is
     // stepped along the eased path with a redraw per frame.
@@ -637,9 +639,7 @@ pub const Context = struct {
             .origin_y = encoded_image.origin_y,
         };
         if (self.config.cache.enabled) {
-            if (try self.cache.put(cache_key, cached)) |evicted| {
-                self.stale_images.append(self.allocator, evicted) catch {};
-            }
+            try self.cache.put(cache_key, cached, self.allocator, &self.stale_images);
         }
         return cached;
     }
@@ -751,12 +751,11 @@ pub const Context = struct {
                 self.deleteEncoded(r.image);
                 continue;
             };
-            const evicted = self.cache.put(r.key, .{
+            self.cache.put(r.key, .{
                 .image = image,
                 .origin_x = r.image.origin_x,
                 .origin_y = r.image.origin_y,
-            }) catch null;
-            if (evicted) |e| self.stale_images.append(self.allocator, e) catch {};
+            }, self.allocator, &self.stale_images) catch {};
         }
     }
 
@@ -766,7 +765,14 @@ pub const Context = struct {
     // flipping stays cache-warm. Uncached targets only.
     fn requestPrerender(self: *Self, top_page: u16, next_page: u16, w: u32, h: u32) void {
         if (!self.config.cache.enabled) return;
-        if (self.document_handler.getActiveZoom() <= 0) return;
+        const zoom = self.document_handler.getActiveZoom();
+        if (zoom <= 0) return;
+        // At very high zoom a single page approaches the cache byte budget;
+        // prerendered neighbors would evict each other in a render loop.
+        // Require room for the current page plus two neighbors.
+        const b = self.document_handler.getPageBound(top_page);
+        const est_f = (b.x1 - b.x0) * zoom * (b.y1 - b.y0) * zoom * 4.0;
+        if (est_f > 0 and @as(usize, @intFromFloat(est_f)) * 3 > self.cache.budget_bytes) return;
 
         const window = 3;
         var targets: [Prerenderer.slots]?u16 = .{null} ** Prerenderer.slots;
@@ -924,7 +930,6 @@ pub const Context = struct {
                     .size = .{ .cols = dest_cols, .rows = dest_rows },
                     .z_index = if (self.modeFlag("page_behind_text")) -1 else null,
                 });
-
                 if (self.visible_pages_len < self.visible_pages.len) {
                     const vp_x_left: u32 = @as(u32, col_base + x_off) * @as(u32, pix_per_col);
                     self.visible_pages[self.visible_pages_len] = .{
