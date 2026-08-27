@@ -1,6 +1,6 @@
 .{
     .name = .termre,
-    .version = "0.7.0",
+    .version = "0.7.1",
     .fingerprint = 0xd14ba88ec3e4101e, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
