@@ -870,15 +870,8 @@ pub const Context = struct {
         self.reload_page = false;
 
         const scroll_x = self.document_handler.getScrollX();
-        const ppr_i: i32 = @intCast(pix_per_row);
-        const ppc_i: i32 = @intCast(pix_per_col);
-        // Quantize to whole cells: a non-cell-aligned clip makes the terminal
-        // scale the partial top cell (visible vertical distortion on Ghostty),
-        // which isn't worth the sub-cell smoothness. Scroll steps by a cell.
-        const display_scroll_y: i32 = @divFloor(scroll_y, ppr_i) * ppr_i;
-        const display_scroll_x: i32 = @divFloor(scroll_x, ppc_i) * ppc_i;
         var draw_page = page_num;
-        var first_top: i32 = display_scroll_y;
+        var first_top: i32 = scroll_y;
 
         // The strip flows column by column; (draw_page, first_top) carry across
         // the column break so a page can end mid-column-left, mid-page.
@@ -910,12 +903,18 @@ pub const Context = struct {
                 const img_w: u32 = img.width;
                 const need_clip_x = img_w > render_w_pix;
                 const clip_w: u32 = if (need_clip_x) render_w_pix else img_w;
-                const clip_x: u32 = if (need_clip_x) @intCast(@max(0, display_scroll_x)) else 0;
+                const clip_x: u32 = if (need_clip_x) @intCast(@max(0, scroll_x)) else 0;
 
+                // Slices are placed at native pixel size (no c=/r= scaling)
+                // and stacked pixel-exact: a page ending mid-row leaves the
+                // next page to start in that same row at a pixel offset.
+                // Scaling the sub-row remainder to fill the row stretched
+                // whatever text sat on the page bottom.
                 const dest_cols: u16 = @intCast(@max(1, std.math.divCeil(u32, clip_w, pix_per_col) catch 1));
-                const dest_rows: u16 = @intCast(@max(1, std.math.divCeil(u32, visible_h, pix_per_row) catch 1));
-                const x_off: u16 = if (col_cells > dest_cols) (col_cells - dest_cols) / 2 else 0;
                 const y_off: u16 = @intCast(y_pix_used / pix_per_row);
+                const y_sub: u16 = @intCast(y_pix_used % pix_per_row);
+                const dest_rows: u16 = @intCast(@max(1, std.math.divCeil(u32, y_sub + visible_h, pix_per_row) catch 1));
+                const x_off: u16 = if (col_cells > dest_cols) (col_cells - dest_cols) / 2 else 0;
 
                 const child = win.child(.{
                     .x_off = col_base + x_off,
@@ -930,7 +929,7 @@ pub const Context = struct {
                         .width = @intCast(clip_w),
                         .height = @intCast(visible_h),
                     },
-                    .size = .{ .cols = dest_cols, .rows = dest_rows },
+                    .pixel_offset = if (y_sub > 0) .{ .x = 0, .y = y_sub } else null,
                     .z_index = if (self.modeFlag("page_behind_text")) -1 else null,
                 });
                 if (self.visible_pages_len < self.visible_pages.len) {
@@ -949,7 +948,7 @@ pub const Context = struct {
                     self.visible_pages_len += 1;
                 }
 
-                y_pix_used += @as(u32, dest_rows) * @as(u32, pix_per_row);
+                y_pix_used += visible_h;
                 if (clip_top + visible_h < img_h) {
                     // page continues — into this column's remainder or the next column
                     first_top = @intCast(clip_top + visible_h);
