@@ -126,7 +126,7 @@ pub const Context = struct {
     // render (deleting before would blank their placements for a frame).
     stale_images: std.ArrayList(Cache.CachedImage),
     last_save_sig: u64,
- pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
         const config = try allocator.create(Config);
         errdefer allocator.destroy(config);
         config.* = Config.init(allocator, io, env);
@@ -199,8 +199,10 @@ pub const Context = struct {
         // PNG encode/decode, only the shm name crosses the tty), or t=t PNG
         // temp files when disabled in config. Over SSH the terminal can't see
         // our memory or filesystem, so fall back to streaming PNG bytes.
+        // zellij (>= 0.45) implements the protocol itself and rejects t=s
+        // ("shared memory transfer is not supported") but reads t=t files.
         if (env.get("SSH_TTY") == null and env.get("SSH_CONNECTION") == null) {
-            if (config.general.shm_transfer) {
+            if (config.general.shm_transfer and env.get("ZELLIJ") == null) {
                 document_handler.setTransfer(.shm, null);
             } else {
                 const tmp = std.mem.trimEnd(u8, env.get("TMPDIR") orelse "/tmp", "/");
@@ -389,6 +391,7 @@ pub const Context = struct {
         try self.vx.enterAltScreen(self.tty.writer());
         try self.vx.setTitle(self.tty.writer(), std.fs.path.stem(self.doc_abs_path));
         try self.vx.queryTerminal(self.tty.writer(), std.Io.Duration.fromSeconds(1));
+        if (!self.vx.caps.kitty_graphics) return error.NoKittyGraphics;
         try self.vx.setMouseMode(self.tty.writer(), true);
 
         self.prerenderer.context = self;

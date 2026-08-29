@@ -92,7 +92,6 @@ fn panBy(self: *Self, delta: i32) void {
     self.scroll_cells = @intCast(target);
 }
 
-
 // C-d/C-u: view and cursor move together by a screenful, so the cursor
 // keeps its relative screen position and the motion is symmetric.
 fn screenJump(self: *Self, dir: i32) void {

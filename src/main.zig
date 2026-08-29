@@ -150,8 +150,31 @@ pub fn main(init: std.process.Init) !void {
         if (args.len == 3) initial_page = try std.fmt.parseInt(u16, args[2], 10);
     }
 
+    runApp(init, path, initial_page) catch |err| switch (err) {
+        error.NoKittyGraphics => {
+            try stderr.writeAll(no_graphics_msg);
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+}
+
+// Deinit (which leaves the alt screen) must run before the message prints,
+// or the terminal swallows it.
+fn runApp(init: std.process.Init, path: [:0]const u8, initial_page: ?u16) !void {
     var app = try Context.init(init.gpa, init.io, init.environ_map, path, initial_page);
     defer app.deinit();
-
     try app.run();
 }
+
+const no_graphics_msg =
+    \\re: this terminal did not answer the kitty graphics query, and termre needs the
+    \\kitty graphics protocol to draw pages.
+    \\
+    \\Terminals that support it: Ghostty (any), kitty >= 0.19, WezTerm >= 20220319,
+    \\Konsole >= 22.04. Multiplexers: zellij >= 0.45 (inside a supporting terminal),
+    \\tmux >= 3.3 with `set -g allow-passthrough on`. Older zellij/tmux and
+    \\Terminal.app, iTerm2, Alacritty, foot, VS Code's terminal do not support it.
+    \\
+;
