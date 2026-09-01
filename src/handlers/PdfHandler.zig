@@ -576,6 +576,7 @@ pub fn renderThumb(self: *Self, page_number: u16, max_w: u32, max_h: u32) !types
     if (self.config.general.colorize) {
         c.fz_tint_pixmap(self.ctx, pix, self.config.general.black, self.config.general.white);
     }
+    self.tintRects(pix, page_number, ctm, self.highlight_quads);
 
     const width = @as(usize, @intCast(@abs(bbox.x1)));
     const height = @as(usize, @intCast(@abs(bbox.y1)));
