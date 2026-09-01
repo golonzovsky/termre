@@ -35,7 +35,7 @@ pub fn init(context: *Context) Self {
         .context = context,
         .selected = context.document_handler.getCurrentPageNumber(),
         .scroll_cells = 0,
-        .target_cell_w = 24,
+        .target_cell_w = context.grid_cell_w,
         .thumbs = std.AutoHashMap(u16, vaxis.Image).init(context.allocator),
         .draw_arena = std.heap.ArenaAllocator.init(context.allocator),
         .cols = 1,
@@ -157,6 +157,7 @@ fn zoomGrid(self: *Self, delta: i32) void {
     const new_w: u16 = @intCast(std.math.clamp(@as(i32, self.target_cell_w) + delta, 12, 64));
     if (new_w == self.target_cell_w) return;
     self.target_cell_w = new_w;
+    self.context.grid_cell_w = new_w;
     self.dumpThumbs();
     self.needs_snap = true;
 }

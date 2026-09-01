@@ -107,6 +107,8 @@ pub const Context = struct {
     jump_back: std.ArrayList(JumpPosition),
     jump_forward: std.ArrayList(JumpPosition),
     lock_horizontal_scroll: bool,
+    // Grid-mode thumbnail size (cells); lives here so it survives mode switches.
+    grid_cell_w: u16,
     marks: std.ArrayList(Positions.Mark),
     highlights: std.ArrayList(Positions.Highlight),
     pending_op: ?enum { set_mark, jump_mark },
@@ -171,6 +173,10 @@ pub const Context = struct {
             if (pos.fit_width) document_handler.setFitWidth(true);
         }
         const restored_hlock: bool = if (positions.getSavedPosition()) |p| p.hlock else false;
+        const restored_grid: u16 = if (positions.getSavedPosition()) |p|
+            (if (p.grid_zoom >= 12 and p.grid_zoom <= 64) p.grid_zoom else 24)
+        else
+            24;
         var marks = positions.loadMarks(allocator);
         errdefer marks.deinit(allocator);
         var highlights = positions.loadHighlights(allocator);
@@ -256,6 +262,7 @@ pub const Context = struct {
             .jump_back = .empty,
             .jump_forward = .empty,
             .lock_horizontal_scroll = restored_hlock,
+            .grid_cell_w = restored_grid,
             .marks = marks,
             .highlights = highlights,
             .pending_op = null,
@@ -292,6 +299,7 @@ pub const Context = struct {
             .crop_right = self.document_handler.crop_right,
             .crop_top = self.document_handler.crop_top,
             .crop_bottom = self.document_handler.crop_bottom,
+            .grid_zoom = self.grid_cell_w,
             .path = self.doc_abs_path,
             .last_opened = time.nowRealSeconds(),
         };
@@ -306,6 +314,7 @@ pub const Context = struct {
             pos.spread,                        pos.fit_width,
             @as(u32, @bitCast(pos.crop_left)), @as(u32, @bitCast(pos.crop_right)),
             @as(u32, @bitCast(pos.crop_top)),  @as(u32, @bitCast(pos.crop_bottom)),
+            pos.grid_zoom,
         });
         for (self.marks.items) |m| {
             std.hash.autoHash(&hasher, .{ m.letter, m.page, m.scroll_x, m.scroll_y });

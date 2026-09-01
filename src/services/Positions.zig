@@ -17,6 +17,7 @@ pub const Position = struct {
     crop_right: f32 = 0,
     crop_top: f32 = 0,
     crop_bottom: f32 = 0,
+    grid_zoom: u16 = 0,
     // For the recent-files list; not restored as view state.
     path: []const u8 = "",
     last_opened: i64 = 0,
