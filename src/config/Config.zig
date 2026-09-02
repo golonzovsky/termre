@@ -216,6 +216,26 @@ pub const Cache = struct {
     }
 };
 
+pub const Sync = struct {
+    // "none", "dir" (a synced folder) or "s3" (any S3-compatible store).
+    backend: []const u8 = "none",
+    dir_path: []const u8 = "",
+    s3_bucket: []const u8 = "",
+    s3_region: []const u8 = "",
+    // Host only; defaults to s3.<region>.amazonaws.com. R2: <account>.r2.cloudflarestorage.com
+    s3_endpoint: []const u8 = "",
+    s3_prefix: []const u8 = "termre",
+    // Empty: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) from the environment.
+    s3_access_key: []const u8 = "",
+    s3_secret_key: []const u8 = "",
+    // Seconds between uploads while reading; quit flushes immediately.
+    push_debounce_s: u16 = 10,
+
+    pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) Sync {
+        return parseFields(Sync, val, allocator);
+    }
+};
+
 arena: std.heap.ArenaAllocator,
 
 key_map: KeyMap = .{},
@@ -223,6 +243,7 @@ file_monitor: FileMonitor = .{},
 general: General = .{},
 status_bar: StatusBar = .{},
 cache: Cache = .{},
+sync: Sync = .{},
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) Self {
     var self = Self{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -268,6 +289,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     if (parsed.value.object.get("General")) |general| self.general = General.parse(general, arena_allocator);
     if (parsed.value.object.get("StatusBar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
     if (parsed.value.object.get("Cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
+    if (parsed.value.object.get("Sync")) |sync| self.sync = Sync.parse(sync, arena_allocator);
 
     return self;
 }

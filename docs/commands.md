@@ -30,6 +30,7 @@ same table that dispatches these commands.)
   on the same page and relies on the document's own boxes
 - `:help` — help popup
 - `:q` — quit
+- `:sync` — push this device's reading state and pull other devices' now (see `Sync` in [config.md](./config.md#sync)).
 
 ## Key-driven features (not commands)
 

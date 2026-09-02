@@ -2,6 +2,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("Context.zig").Context;
 const Positions = @import("services/Positions.zig");
+const Config = @import("config/Config.zig");
+const Sync = @import("services/Sync.zig");
 
 // Must live in the root file to take effect: restores the terminal (exits alt
 // screen, disables mouse reporting) before printing a panic trace, so crashes
@@ -67,7 +69,11 @@ fn fzfPick(init: std.process.Init, recents: []const Positions.RecentEntry, home:
         const w = &fzf_in.interface;
         for (recents, 0..) |r, i| {
             const prefix: []const u8 = if (shortenHome(r.path, home).ptr != r.path.ptr) "~/" else "";
-            w.print("{d}\t{s}{s}  (p.{d})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1 }) catch break :feed;
+            if (r.device.len > 0) {
+                w.print("{d}\t{s}{s}  (p.{d}, on {s})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1, r.device }) catch break :feed;
+            } else {
+                w.print("{d}\t{s}{s}  (p.{d})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1 }) catch break :feed;
+            }
         }
         w.flush() catch {};
     }
@@ -91,7 +97,11 @@ fn promptPick(init: std.process.Init, recents: []const Positions.RecentEntry, ho
     try stdout.writeAll("Recent:\n");
     for (recents[0..shown], 1..) |r, i| {
         const prefix: []const u8 = if (shortenHome(r.path, home).ptr != r.path.ptr) "~/" else "";
-        try stdout.print("  {d:>2}. {s}{s}  (p.{d})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1 });
+        if (r.device.len > 0) {
+            try stdout.print("  {d:>2}. {s}{s}  (p.{d}, on {s})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1, r.device });
+        } else {
+            try stdout.print("  {d:>2}. {s}{s}  (p.{d})\n", .{ i, prefix, shortenHome(r.path, home), r.page + 1 });
+        }
     }
     try stdout.print("open [1-{d}]: ", .{shown});
     try stdout.flush();
@@ -132,6 +142,23 @@ pub fn main(init: std.process.Init) !void {
     var initial_page: ?u16 = null;
     if (args.len == 1) {
         const arena = init.arena.allocator();
+        // Other devices' books appear in the picker only once their shards
+        // are here; one listing fetches what's missing.
+        {
+            var config = Config.init(init.gpa, init.io, init.environ_map);
+            defer config.deinit();
+            if (Sync.storeFromConfig(init.gpa, init.io, init.environ_map, &config)) |store_val| {
+                var store = store_val;
+                defer store.deinit();
+                if (Positions.booksDirFor(arena, init.environ_map)) |books| {
+                    const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
+                    Sync.pullAll(init.gpa, init.io, &store, books, device) catch |err| {
+                        try stderr.print("sync: {s}\n", .{@errorName(err)});
+                        try stderr.flush();
+                    };
+                }
+            }
+        }
         const recents = Positions.listRecent(arena, init.io, init.environ_map);
         if (recents.len == 0) {
             try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n");
@@ -144,6 +171,11 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         };
         const idx = picked orelse return;
+        if (recents[idx].device.len > 0) {
+            try stderr.print("{s} is not on this machine (last read on {s})\n", .{ recents[idx].path, recents[idx].device });
+            try stderr.flush();
+            return;
+        }
         path = try arena.dupeZ(u8, recents[idx].path);
     } else {
         path = args[1];

@@ -82,6 +82,17 @@ Because termre provides sensible defaults, you only need to specify the options 
     "enabled": true,
     "lru_size": 10,
     "budget_mb": 200
+  },
+  "Sync": {
+    "backend": "none",
+    "dir_path": "",
+    "s3_bucket": "",
+    "s3_region": "",
+    "s3_endpoint": "",
+    "s3_prefix": "termre",
+    "s3_access_key": "",
+    "s3_secret_key": "",
+    "push_debounce_s": 10
   }
 }
 ```
@@ -107,6 +118,7 @@ The rest of this reference provides detailed explanations for each configuration
     - [Mode-aware Items](#mode-aware-items)
      - [Reload-aware Items](#reload-aware-items)
 - [Cache](#cache)
+- [Sync](#sync)
 
 ---
 
@@ -373,3 +385,18 @@ The `Cache` section controls the page rendering cache, which speeds up navigatio
 | `enabled` | Boolean | Enables caching |
 | `budget_mb` | Integer | Max decoded image bytes (MB) kept alive in the terminal; stays under terminal image-storage quotas so the visible page is never silently evicted |
 | `lru_size` | Integer | Maximum number of pages to store in the cache |
+
+## Sync
+
+Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. With a backend configured, that record is uploaded while you read (debounced, and on quit) and other devices' records are downloaded when a book is opened; the picker (`re` with no arguments) fetches the whole index so books read elsewhere show up too, tagged with the device name. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). `:sync` forces a push/pull. The device name is minted once into `~/.local/state/termre/device`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `backend` | String | `none`, `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, an SSHFS mount), or `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …) |
+| `dir_path` | String | Folder for the `dir` backend; `~/` is expanded |
+| `s3_bucket` | String | Bucket name |
+| `s3_region` | String | SigV4 region; empty → `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1` (R2: `auto`) |
+| `s3_endpoint` | String | Host only, empty → `s3.<region>.amazonaws.com`; R2: `<account>.r2.cloudflarestorage.com`, MinIO: `host:9000` |
+| `s3_prefix` | String | Key prefix inside the bucket |
+| `s3_access_key` / `s3_secret_key` | String | Empty → `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (`AWS_SESSION_TOKEN` is honored) from the environment |
+| `push_debounce_s` | Integer | Minimum seconds between uploads while reading |

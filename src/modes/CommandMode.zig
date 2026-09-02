@@ -139,6 +139,7 @@ pub const commands = .{
     .{ handleCrop, ":crop [TRBL]", "trim margins; bare=reset" },
     .{ handleExport, ":export [path]", "print copy: crop+oddx baked" },
     .{ handleOverride, ":override", "bake crop into this file" },
+    .{ handleSync, ":sync", "push/pull reading state now" },
     .{ handleHelp, ":help", "this help" },
     .{ handleQuit, ":q", "quit" },
 };
@@ -243,6 +244,12 @@ fn handleDelMark(self: *Self, cmd: []const u8) bool {
 fn handleHLock(self: *Self, cmd: []const u8) bool {
     if (!std.mem.eql(u8, cmd, "hlock")) return false;
     self.context.lock_horizontal_scroll = !self.context.lock_horizontal_scroll;
+    return true;
+}
+
+fn handleSync(self: *Self, cmd: []const u8) bool {
+    if (!std.mem.eql(u8, cmd, "sync")) return false;
+    self.context.syncNow();
     return true;
 }
 

@@ -18,6 +18,7 @@ const Cache = @import("./Cache.zig");
 const ReloadIndicatorTimer = @import("services/ReloadIndicatorTimer.zig");
 const History = @import("services/History.zig");
 const Positions = @import("services/Positions.zig");
+const Sync = @import("services/Sync.zig");
 const Prerenderer = @import("services/Prerenderer.zig");
 const time = @import("utilities/time.zig");
 
@@ -28,6 +29,7 @@ pub const Event = union(enum) {
     file_changed,
     reload_done: usize,
     prerender_ready,
+    sync: Sync.Result,
 };
 
 pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid };
@@ -111,6 +113,12 @@ pub const Context = struct {
     grid_cell_w: u16,
     marks: std.ArrayList(Positions.Mark),
     highlights: std.ArrayList(Positions.Highlight),
+    tombstones: std.ArrayList(Positions.Tombstone),
+    sync: ?*Sync,
+    sync_manual: bool,
+    // Timestamp of the view state we last saved or adopted; a pulled view
+    // only replaces ours when it is newer than this.
+    last_view_ts: i64,
     pending_op: ?enum { set_mark, jump_mark },
     progress_text: ?[]const u8,
     progress_buf: [128]u8,
@@ -149,28 +157,7 @@ pub const Context = struct {
         // (zoom/crop/spread/...) are always restored, otherwise the next
         // auto-save would overwrite them with defaults.
         if (positions.getSavedPositionForKey(document_handler.getPath())) |pos| {
-            config.general.colorize = pos.colorize;
-            // Crop/spread first: their toggles reset zoom/scroll, so they must
-            // run before we restore them or they wipe the restored values.
-            if (pos.crop != document_handler.getCropToContent()) {
-                document_handler.toggleCropToContent();
-            }
-            if (pos.spread != document_handler.getSpread()) {
-                document_handler.toggleSpread();
-            }
-            if (pos.crop_left != 0 or pos.crop_right != 0 or pos.crop_top != 0 or pos.crop_bottom != 0) {
-                document_handler.setMarginCrop(pos.crop_left, pos.crop_right, pos.crop_top, pos.crop_bottom);
-            }
-            if (initial_page == null and pos.page < document_handler.getTotalPages()) {
-                document_handler.setCurrentPage(pos.page);
-                document_handler.setScrollX(pos.scroll_x);
-                document_handler.setScrollY(pos.scroll_y);
-            }
-            if (pos.zoom > 0) document_handler.setActiveZoom(pos.zoom);
-            document_handler.setOddShiftX(pos.odd_shift_x);
-            // Last: when locked to fit-width, the zoom is recomputed at render
-            // regardless of the restored value above.
-            if (pos.fit_width) document_handler.setFitWidth(true);
+            applyView(&document_handler, config, pos, initial_page == null);
         }
         const restored_hlock: bool = if (positions.getSavedPosition()) |p| p.hlock else false;
         const restored_grid: u16 = if (positions.getSavedPosition()) |p|
@@ -181,6 +168,10 @@ pub const Context = struct {
         errdefer marks.deinit(allocator);
         var highlights = positions.loadHighlights(allocator);
         errdefer highlights.deinit(allocator);
+        var tombstones = positions.loadTombstones(allocator);
+        errdefer tombstones.deinit(allocator);
+        const last_view_ts: i64 = if (positions.getSavedPosition()) |p| p.last_opened else 0;
+        const sync = makeSync(allocator, io, env, config, &positions);
         {
             var flat: std.ArrayList(PdfHandler.SearchHit) = .empty;
             defer flat.deinit(allocator);
@@ -265,6 +256,10 @@ pub const Context = struct {
             .grid_cell_w = restored_grid,
             .marks = marks,
             .highlights = highlights,
+            .tombstones = tombstones,
+            .sync = sync,
+            .sync_manual = false,
+            .last_view_ts = last_view_ts,
             .pending_op = null,
             .progress_text = null,
             .progress_buf = undefined,
@@ -321,19 +316,79 @@ pub const Context = struct {
             hasher.update(m.comment);
         }
         for (self.highlights.items) |h| {
-            std.hash.autoHash(&hasher, .{ h.page, h.text.len, h.rects.len });
+            std.hash.autoHash(&hasher, .{ h.id, h.page, h.text.len, h.rects.len });
+        }
+        for (self.tombstones.items) |t| {
+            std.hash.autoHash(&hasher, .{ t.kind, t.letter, t.id, t.deleted_at });
         }
         const sig = hasher.final();
         if (sig == self.last_save_sig) return;
         self.last_save_sig = sig;
-        self.positions.save(pos, self.marks.items, self.highlights.items);
+        self.positions.save(pos, self.marks.items, self.highlights.items, self.tombstones.items);
+        self.last_view_ts = pos.last_opened;
+        if (self.sync) |s| s.requestPush(false);
     }
 
-    pub fn deinit(self: *Self) void {
-        // Before saveState: a mode's deinit may restore document state it
-        // borrowed (e.g. crop mode zeroes the margins while active).
-        self.deinitCurrentMode();
-        self.saveState();
+    fn syncNotify(ctx: *anyopaque, r: Sync.Result) void {
+        const loop: *vaxis.Loop(Event) = @ptrCast(@alignCast(ctx));
+        loop.postEvent(.{ .sync = r }) catch {};
+    }
+
+    fn onSync(self: *Self, r: Sync.Result) void {
+        switch (r) {
+            .pulled => |changed| {
+                if (changed) {
+                    self.applySynced();
+                } else if (self.sync_manual) {
+                    self.progress_text = " synced: up to date ";
+                }
+                self.sync_manual = false;
+            },
+            .pushed => {},
+            .err => |m| {
+                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m}) catch null;
+            },
+        }
+    }
+
+    // Other devices' shards arrived: re-merge, take their annotations, and
+    // jump to their view if it is newer than what we last saved.
+    fn applySynced(self: *Self) void {
+        self.positions.reload();
+        self.freeAnnotations();
+        self.marks = self.positions.loadMarks(self.allocator);
+        self.highlights = self.positions.loadHighlights(self.allocator);
+        self.tombstones = self.positions.loadTombstones(self.allocator);
+        self.rebuildHighlightQuads();
+        self.last_save_sig = 0;
+
+        const pos = self.positions.getSavedPosition() orelse return;
+        const foreign = !std.mem.eql(u8, pos.device, self.positions.deviceName());
+        if (foreign and pos.last_opened > self.last_view_ts) {
+            applyView(&self.document_handler, self.config, pos, true);
+            self.lock_horizontal_scroll = pos.hlock;
+            if (pos.grid_zoom >= 12 and pos.grid_zoom <= 64) self.grid_cell_w = pos.grid_zoom;
+            self.last_view_ts = pos.last_opened;
+            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " synced: p.{d} from {s} ", .{ pos.page + 1, pos.device }) catch null;
+        } else {
+            self.progress_text = " synced ";
+        }
+        self.clearCache();
+        self.reload_page = true;
+    }
+
+    pub fn syncNow(self: *Self) void {
+        if (self.sync) |s| {
+            self.sync_manual = true;
+            s.requestPull();
+            s.requestPush(true);
+            self.progress_text = " syncing… ";
+        } else {
+            self.progress_text = " sync: not configured (Sync.backend) ";
+        }
+    }
+
+    fn freeAnnotations(self: *Self) void {
         for (self.marks.items) |m| {
             if (m.comment.len > 0) self.allocator.free(m.comment);
         }
@@ -343,6 +398,16 @@ pub const Context = struct {
             if (h.rects.len > 0) self.allocator.free(h.rects);
         }
         self.highlights.deinit(self.allocator);
+        self.tombstones.deinit(self.allocator);
+    }
+
+    pub fn deinit(self: *Self) void {
+        // Before saveState: a mode's deinit may restore document state it
+        // borrowed (e.g. crop mode zeroes the margins while active).
+        self.deinitCurrentMode();
+        self.saveState();
+        self.freeAnnotations();
+        if (self.sync) |s| s.destroy();
         self.positions.deinit();
         self.freeOutline();
         self.search_hits.deinit(self.allocator);
@@ -408,6 +473,12 @@ pub const Context = struct {
         // Declared after the loop defers so it runs first: the worker must be
         // joined while `loop` is still alive (it posts events to it).
         defer self.prerenderer.stop();
+        if (self.sync) |s| s.start(syncNotify, @ptrCast(&loop)) catch {};
+        // Same ordering need; the final save must land before the flush push.
+        defer if (self.sync) |s| {
+            if (!self.modeFlag("suppress_autosave")) self.saveState();
+            s.stop(3 * std.time.ns_per_s);
+        };
 
         if (self.config.file_monitor.enabled) {
             if (self.watcher) |*w| {
@@ -582,6 +653,7 @@ pub const Context = struct {
                 self.clearCache();
                 self.reload_page = true;
             },
+            .sync => |r| self.onSync(r),
             .file_changed => {
                 try self.document_handler.reloadDocument();
                 self.freeOutline();
@@ -1117,6 +1189,7 @@ pub const Context = struct {
                 const h = self.highlights.items[i];
                 if (h.page != page or !rectsOverlap(h.rects, collected.items)) continue;
                 collected.appendSlice(self.allocator, h.rects) catch return;
+                self.tombstones.append(self.allocator, .{ .kind = .highlight, .id = h.id, .deleted_at = time.nowRealSeconds() }) catch {};
                 if (h.text.len > 0) self.allocator.free(h.text);
                 if (h.rects.len > 0) self.allocator.free(h.rects);
                 _ = self.highlights.orderedRemove(i);
@@ -1170,7 +1243,13 @@ pub const Context = struct {
             text = self.allocator.dupe(u8, self.selection_text) catch "";
         }
 
-        self.highlights.append(self.allocator, .{ .page = page, .text = text, .rects = rects }) catch {
+        self.highlights.append(self.allocator, .{
+            .id = Positions.highlightId(page, rects),
+            .page = page,
+            .text = text,
+            .rects = rects,
+            .created_at = time.nowRealSeconds(),
+        }) catch {
             self.allocator.free(rects);
             if (text.len > 0) self.allocator.free(@constCast(text));
             return;
@@ -1189,6 +1268,7 @@ pub const Context = struct {
     pub fn deleteHighlight(self: *Self, idx: usize) void {
         if (idx >= self.highlights.items.len) return;
         const h = self.highlights.orderedRemove(idx);
+        self.tombstones.append(self.allocator, .{ .kind = .highlight, .id = h.id, .deleted_at = time.nowRealSeconds() }) catch {};
         if (h.text.len > 0) self.allocator.free(h.text);
         if (h.rects.len > 0) self.allocator.free(h.rects);
         self.rebuildHighlightQuads();
@@ -1286,6 +1366,7 @@ pub const Context = struct {
                 m.page = page;
                 m.scroll_x = sx;
                 m.scroll_y = sy;
+                m.updated_at = time.nowRealSeconds();
                 if (m.comment.len > 0) {
                     self.allocator.free(m.comment);
                     m.comment = "";
@@ -1298,6 +1379,7 @@ pub const Context = struct {
             .page = page,
             .scroll_x = sx,
             .scroll_y = sy,
+            .updated_at = time.nowRealSeconds(),
         }) catch {};
     }
 
@@ -1319,6 +1401,7 @@ pub const Context = struct {
     pub fn deleteMark(self: *Self, letter: u8) void {
         for (self.marks.items, 0..) |m, i| {
             if (m.letter == letter) {
+                self.tombstones.append(self.allocator, .{ .kind = .mark, .letter = letter, .deleted_at = time.nowRealSeconds() }) catch {};
                 if (m.comment.len > 0) self.allocator.free(m.comment);
                 _ = self.marks.orderedRemove(i);
                 return;
@@ -1594,6 +1677,7 @@ pub const Context = struct {
             if (m.letter == letter) {
                 if (m.comment.len > 0) self.allocator.free(m.comment);
                 m.comment = try self.allocator.dupe(u8, comment);
+                m.updated_at = time.nowRealSeconds();
                 return;
             }
         }
@@ -1875,3 +1959,31 @@ pub const Context = struct {
         self.config.status_bar.enabled = !self.config.status_bar.enabled;
     }
 };
+
+// Puts saved view state onto the document: at open, and when a sync pulls a
+// newer view from another device.
+fn applyView(dh: *PdfHandler, config: *Config, pos: Positions.Position, apply_position: bool) void {
+    config.general.colorize = pos.colorize;
+    // Crop/spread first: their toggles reset zoom/scroll, so they must run
+    // before the restored values or they wipe them.
+    if (pos.crop != dh.getCropToContent()) dh.toggleCropToContent();
+    if (pos.spread != dh.getSpread()) dh.toggleSpread();
+    if (pos.crop_left != 0 or pos.crop_right != 0 or pos.crop_top != 0 or pos.crop_bottom != 0) {
+        dh.setMarginCrop(pos.crop_left, pos.crop_right, pos.crop_top, pos.crop_bottom);
+    }
+    if (apply_position and pos.page < dh.getTotalPages()) {
+        dh.setCurrentPage(pos.page);
+        dh.setScrollX(pos.scroll_x);
+        dh.setScrollY(pos.scroll_y);
+    }
+    if (pos.zoom > 0) dh.setActiveZoom(pos.zoom);
+    dh.setOddShiftX(pos.odd_shift_x);
+    // Last: when locked to fit-width, the zoom is recomputed at render.
+    if (pos.fit_width) dh.setFitWidth(true);
+}
+
+fn makeSync(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, config: *Config, positions: *Positions) ?*Sync {
+    if (positions.booksDir().len == 0) return null;
+    const store = Sync.storeFromConfig(allocator, io, env, config) orelse return null;
+    return Sync.create(allocator, io, store, positions.booksDir(), positions.bookName(), positions.deviceName(), config.sync.push_debounce_s) catch null;
+}

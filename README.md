@@ -37,6 +37,7 @@ Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.
 - Vim-style marks (`m`/`'`, `M`) and jump list (`Ctrl+O`/`Tab`)
 - Page grid overview (`g`)
 - Everything remembered per book — position, zoom, crop, colorize, marks, highlights — keyed by PDF ID, so files can move
+- Sync across devices through S3-compatible storage or any synced folder — per-device records that merge without conflicts ([config](./docs/config.md#sync))
 - Open a page or chapter as markdown in `$EDITOR` (`e`/`E`)
 
 ## Build
