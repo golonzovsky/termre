@@ -139,6 +139,7 @@ pub const commands = .{
     .{ handleCrop, ":crop [TRBL]", "trim margins; bare=reset" },
     .{ handleExport, ":export [path]", "print copy: crop+oddx baked" },
     .{ handleOverride, ":override", "bake crop into this file" },
+    .{ handleMarkdown, ":markdown [path]", "whole book as markdown" },
     .{ handleSync, ":sync", "push/pull reading state now" },
     .{ handleHelp, ":help", "this help" },
     .{ handleQuit, ":q", "quit" },
@@ -244,6 +245,13 @@ fn handleDelMark(self: *Self, cmd: []const u8) bool {
 fn handleHLock(self: *Self, cmd: []const u8) bool {
     if (!std.mem.eql(u8, cmd, "hlock")) return false;
     self.context.lock_horizontal_scroll = !self.context.lock_horizontal_scroll;
+    return true;
+}
+
+fn handleMarkdown(self: *Self, cmd: []const u8) bool {
+    if (!std.mem.startsWith(u8, cmd, "markdown")) return false;
+    const rest = std.mem.trim(u8, cmd["markdown".len..], &std.ascii.whitespace);
+    self.context.exportMarkdown(rest);
     return true;
 }
 

@@ -31,6 +31,7 @@ same table that dispatches these commands.)
 - `:help` — help popup
 - `:q` — quit
 - `:sync` — push this device's reading state and pull other devices' now (see `Sync` in [config.md](./config.md#sync)).
+- `:markdown [path]` — export the whole book to markdown: chapter headings from the outline, an invisible `<!-- page N -->` marker before each page (maps back to `:N`), diagrams as PNGs beside the file. Default `<book>-md/<book>.md` next to the PDF; a path ending in `.md` is the file, anything else a directory (relative paths are relative to the book).
 
 ## Key-driven features (not commands)
 

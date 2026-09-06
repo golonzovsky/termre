@@ -1084,7 +1084,7 @@ fn extractEventBridge(ud: ?*anyopaque, kind: c_int, chars: [*c]const c.fz_char_z
 }
 
 pub fn writePageText(self: *Self, page_number: u16, path: [:0]const u8) !void {
-    return self.writePagesText(page_number, page_number + 1, path, null, null);
+    return self.writePagesText(page_number, page_number + 1, path, null, null, null, null);
 }
 
 pub fn writePagesText(
@@ -1094,6 +1094,8 @@ pub fn writePagesText(
     path: [:0]const u8,
     on_progress: ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void,
     progress_userdata: ?*anyopaque,
+    page_hook: ?Markdown.PageHook,
+    page_hook_ctx: ?*anyopaque,
 ) !void {
     const black: c_int = if (self.config.general.colorize) @intCast(self.config.general.black) else 0x000000;
     const white: c_int = if (self.config.general.colorize) @intCast(self.config.general.white) else 0xffffff;
@@ -1108,6 +1110,9 @@ pub fn writePagesText(
 
     var md = Markdown.init(self.allocator, &fw.interface);
     defer md.deinit();
+    md.first_page = start_page;
+    md.on_page = page_hook;
+    md.on_page_ctx = page_hook_ctx;
 
     self.render_mutex.lockUncancelable(self.io);
     defer self.render_mutex.unlock(self.io);

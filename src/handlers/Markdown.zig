@@ -26,6 +26,14 @@ chars: std.ArrayList(Char) = .empty,
 line_offsets: std.ArrayList(u32) = .empty, // offset into `chars` where each line begins
 in_code_block: bool = false,
 write_failed: bool = false,
+// Called at the start of every page (absolute page index), before its text;
+// used for chapter headings and page markers.
+on_page: ?PageHook = null,
+on_page_ctx: ?*anyopaque = null,
+first_page: u16 = 0,
+pages_seen: u16 = 0,
+
+pub const PageHook = *const fn (ctx: *anyopaque, page: u16, writer: *std.Io.Writer) anyerror!void;
 
 pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) Self {
     return .{ .allocator = allocator, .writer = writer };
@@ -49,8 +57,14 @@ pub fn eventCallback(ud: ?*anyopaque, kind: c_int, chars: ?[*]const Char, n: c_i
 
 fn handle(self: *Self, kind: c_int, chars_ptr: ?[*]const Char, n: c_int, str: ?[*:0]const u8) !void {
     switch (kind) {
-        event_page_start => if (chars_ptr) |p| {
-            self.body_size = p[0].size;
+        event_page_start => {
+            if (chars_ptr) |p| self.body_size = p[0].size;
+            if (self.on_page) |hook| {
+                try self.flushBlock();
+                self.closeCodeBlock();
+                try hook(self.on_page_ctx.?, self.first_page + self.pages_seen, self.writer);
+            }
+            self.pages_seen += 1;
         },
         event_line => if (chars_ptr) |p| {
             const slice = p[0..@intCast(n)];
@@ -212,8 +226,8 @@ fn isSuper(chars: []const Char, idx: usize, m: LineMetrics) bool {
 
 fn isInvisible(cp: u32) bool {
     return cp == 0xFFFD // replacement char
-        or cp == 0x00AD // soft hyphen
-        or (cp >= 0xFE00 and cp <= 0xFE0F); // variation selectors
+    or cp == 0x00AD // soft hyphen
+    or (cp >= 0xFE00 and cp <= 0xFE0F); // variation selectors
 }
 
 fn emitParaLine(self: *Self, p: *ParaState, chars: []const Char) !void {
@@ -243,7 +257,10 @@ fn tryEmitSuperscript(self: *Self, p: *ParaState, chars: []const Char, idx: *usi
 
     var all_translatable = true;
     for (run) |sch| {
-        if (asSuperscript(sch.codepoint) == null) { all_translatable = false; break; }
+        if (asSuperscript(sch.codepoint) == null) {
+            all_translatable = false;
+            break;
+        }
     }
 
     try self.flushPendingSpace(p, run[0].bold != 0, run[0].italic != 0, run[0].mono != 0);
@@ -294,21 +311,48 @@ fn emitChar(self: *Self, p: *ParaState, ch: Char) !void {
 // space, and styles that continue stay open.
 fn flushPendingSpace(self: *Self, p: *ParaState, next_bold: bool, next_italic: bool, next_mono: bool) !void {
     if (!p.pending_space) return;
-    if (p.in_mono and !next_mono) { try self.writer.writeByte('`'); p.in_mono = false; }
-    if (p.in_italic and !next_italic) { try self.writer.writeByte('*'); p.in_italic = false; }
-    if (p.in_bold and !next_bold) { try self.writer.writeAll("**"); p.in_bold = false; }
+    if (p.in_mono and !next_mono) {
+        try self.writer.writeByte('`');
+        p.in_mono = false;
+    }
+    if (p.in_italic and !next_italic) {
+        try self.writer.writeByte('*');
+        p.in_italic = false;
+    }
+    if (p.in_bold and !next_bold) {
+        try self.writer.writeAll("**");
+        p.in_bold = false;
+    }
     try self.writer.writeByte(' ');
     p.last_was_space = true;
     p.pending_space = false;
 }
 
 fn syncStyles(self: *Self, p: *ParaState, bold: bool, italic: bool, mono: bool) !void {
-    if (p.in_mono and !mono) { try self.writer.writeByte('`'); p.in_mono = false; }
-    if (p.in_italic and !italic) { try self.writer.writeByte('*'); p.in_italic = false; }
-    if (p.in_bold and !bold) { try self.writer.writeAll("**"); p.in_bold = false; }
-    if (!p.in_bold and bold) { try self.writer.writeAll("**"); p.in_bold = true; }
-    if (!p.in_italic and italic) { try self.writer.writeByte('*'); p.in_italic = true; }
-    if (!p.in_mono and mono) { try self.writer.writeByte('`'); p.in_mono = true; }
+    if (p.in_mono and !mono) {
+        try self.writer.writeByte('`');
+        p.in_mono = false;
+    }
+    if (p.in_italic and !italic) {
+        try self.writer.writeByte('*');
+        p.in_italic = false;
+    }
+    if (p.in_bold and !bold) {
+        try self.writer.writeAll("**");
+        p.in_bold = false;
+    }
+    if (!p.in_bold and bold) {
+        try self.writer.writeAll("**");
+        p.in_bold = true;
+    }
+    if (!p.in_italic and italic) {
+        try self.writer.writeByte('*');
+        p.in_italic = true;
+    }
+    if (!p.in_mono and mono) {
+        try self.writer.writeByte('`');
+        p.in_mono = true;
+    }
 }
 
 fn asSuperscript(cp: u32) ?u32 {
