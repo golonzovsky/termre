@@ -22,6 +22,7 @@ Binaries for macOS arm64 and Linux x86_64 are on the [releases page](https://git
 ```sh
 re <path-to-pdf> [page]
 re                        # pick from recently opened
+re state export > s.json  # all reading state; `re state import s.json` merges it in elsewhere
 ```
 
 Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.md](./docs/commands.md); configuration (`~/.config/termre/config.json`) in [docs/config.md](./docs/config.md).
@@ -29,7 +30,7 @@ Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.
 ## Features
 
 - Continuous scroll with smooth half-page jumps (`Ctrl+D`/`Ctrl+U`); mouse and trackpad
-- Zoom (`i`/`o`), fit-width lock (`W`), two-column spread (`d`) for wide monitors
+- Zoom (`i`/`o`), fit-width lock (`W`), multi-column spread for wide monitors (`d`, `d3` for three, `:spread N`)
 - Margin cropping: auto (`t`), manual (`:crop`), or interactive with mouse-draggable lines (`c`); odd-page alignment (`:oddx`)
 - Print export (`:export`) — a lossless copy of the PDF with the crop baked in
 - Full-text search (`/`, `S`), link following (click, or hint mode `;`), table of contents (`T`)
@@ -39,6 +40,16 @@ Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.
 - Everything remembered per book — position, zoom, crop, colorize, marks, highlights — keyed by PDF ID, so files can move
 - Sync across devices through S3-compatible storage or any synced folder — per-device records that merge without conflicts ([config](./docs/config.md#sync))
 - Markdown out: a page or chapter into `$EDITOR` (`e`/`E`), or the whole book with chapter headings and page markers (`:markdown`) — handy for pointing an agent at a book
+
+## Agents
+
+`re mcp` serves the reader over the Model Context Protocol (stdio), so an agent can work alongside a book:
+
+```sh
+re mcp install claude      # or: re mcp install codex; `re mcp config` prints the snippet for other clients
+```
+
+Tools: `list_books` (what's open and active right now, then recents), `get_outline`, `get_pages` / `get_chapter` (markdown with `<!-- page N -->` markers), `search` (full-text, page + line), `reading_state` and `current_page` (the page you're on, the text you just selected with the mouse, marks, highlights — no arguments needed while one book is open). Read-only; details in [docs/mcp.md](./docs/mcp.md).
 
 ## Build
 

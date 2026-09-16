@@ -116,10 +116,11 @@ pub const Context = struct {
     tombstones: std.ArrayList(Positions.Tombstone),
     sync: ?*Sync,
     sync_manual: bool,
+    started_at: i64,
     // Timestamp of the view state we last saved or adopted; a pulled view
     // only replaces ours when it is newer than this.
     last_view_ts: i64,
-    pending_op: ?enum { set_mark, jump_mark },
+    pending_op: ?enum { set_mark, jump_mark, spread_digit },
     progress_text: ?[]const u8,
     progress_buf: [128]u8,
     search_hits: std.ArrayList(PdfHandler.SearchHit),
@@ -130,6 +131,9 @@ pub const Context = struct {
     selection_dragged: bool,
     selection_hits: std.ArrayList(PdfHandler.SearchHit),
     selection_text: []u8,
+    last_sel_text: []u8,
+    last_sel_page: u16,
+    last_sel_at: i64,
     selection_gen: u32,
     selection_render_ns: i64,
     // Images displaced from the cache; deleted terminal-side after the next
@@ -259,6 +263,7 @@ pub const Context = struct {
             .tombstones = tombstones,
             .sync = sync,
             .sync_manual = false,
+            .started_at = time.nowRealSeconds(),
             .last_view_ts = last_view_ts,
             .pending_op = null,
             .progress_text = null,
@@ -271,6 +276,9 @@ pub const Context = struct {
             .selection_dragged = false,
             .selection_hits = .empty,
             .selection_text = &.{},
+            .last_sel_text = &.{},
+            .last_sel_page = 0,
+            .last_sel_at = 0,
             .selection_gen = 0,
             .selection_render_ns = 0,
             .stale_images = .empty,
@@ -289,6 +297,7 @@ pub const Context = struct {
             .crop = self.document_handler.getCropToContent(),
             .hlock = self.lock_horizontal_scroll,
             .spread = self.document_handler.getSpread(),
+            .spread_cols = self.document_handler.spread_cols,
             .fit_width = self.document_handler.getFitWidth(),
             .crop_left = self.document_handler.crop_left,
             .crop_right = self.document_handler.crop_right,
@@ -302,14 +311,14 @@ pub const Context = struct {
         // read-merge-write when the saved state would be identical.
         var hasher = std.hash.Wyhash.init(0);
         std.hash.autoHash(&hasher, .{
-            pos.page,                          pos.scroll_x,
-            pos.scroll_y,                      @as(u32, @bitCast(pos.zoom)),
-            pos.odd_shift_x,                   pos.colorize,
-            pos.crop,                          pos.hlock,
-            pos.spread,                        pos.fit_width,
-            @as(u32, @bitCast(pos.crop_left)), @as(u32, @bitCast(pos.crop_right)),
-            @as(u32, @bitCast(pos.crop_top)),  @as(u32, @bitCast(pos.crop_bottom)),
-            pos.grid_zoom,
+            pos.page,                            pos.scroll_x,
+            pos.scroll_y,                        @as(u32, @bitCast(pos.zoom)),
+            pos.odd_shift_x,                     pos.colorize,
+            pos.crop,                            pos.hlock,
+            pos.spread,                          pos.fit_width,
+            pos.spread_cols,                     @as(u32, @bitCast(pos.crop_left)),
+            @as(u32, @bitCast(pos.crop_right)),  @as(u32, @bitCast(pos.crop_top)),
+            @as(u32, @bitCast(pos.crop_bottom)), pos.grid_zoom,
         });
         for (self.marks.items) |m| {
             std.hash.autoHash(&hasher, .{ m.letter, m.page, m.scroll_x, m.scroll_y });
@@ -326,6 +335,7 @@ pub const Context = struct {
         self.last_save_sig = sig;
         self.positions.save(pos, self.marks.items, self.highlights.items, self.tombstones.items);
         self.last_view_ts = pos.last_opened;
+        self.positions.writePresence(self.doc_abs_path, self.started_at, pos.last_opened, self.last_sel_text, self.last_sel_page, self.last_sel_at);
         if (self.sync) |s| s.requestPush(false);
     }
 
@@ -408,12 +418,14 @@ pub const Context = struct {
         self.saveState();
         self.freeAnnotations();
         if (self.sync) |s| s.destroy();
+        self.positions.clearPresence();
         self.positions.deinit();
         self.freeOutline();
         self.search_hits.deinit(self.allocator);
         if (self.search_needle.len > 0) self.allocator.free(self.search_needle);
         self.selection_hits.deinit(self.allocator);
         if (self.selection_text.len > 0) self.allocator.free(self.selection_text);
+        if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
         self.stale_images.deinit(self.allocator);
         self.allocator.free(self.doc_key);
         self.allocator.free(self.doc_abs_path);
@@ -467,6 +479,7 @@ pub const Context = struct {
         try self.vx.queryTerminal(self.tty.writer(), std.Io.Duration.fromSeconds(1));
         if (!self.vx.caps.kitty_graphics) return error.NoKittyGraphics;
         try self.vx.setMouseMode(self.tty.writer(), true);
+        self.positions.writePresence(self.doc_abs_path, self.started_at, self.started_at, self.last_sel_text, self.last_sel_page, self.last_sel_at);
 
         self.prerenderer.context = self;
         if (self.config.cache.enabled) try self.prerenderer.start();
@@ -901,7 +914,7 @@ pub const Context = struct {
 
         // In spread mode the strip flows through two columns; pages render at
         // full column width (flush — no gutter) and may straddle the column break.
-        const columns: u16 = if (self.document_handler.getSpread()) 2 else 1;
+        const columns: u16 = self.document_handler.getSpreadColumns();
         const col_cells: u16 = win.width / columns;
         const render_cells: u16 = col_cells;
         const render_w_pix: u32 = @as(u32, render_cells) * @as(u32, pix_per_col);
@@ -1143,6 +1156,14 @@ pub const Context = struct {
         // Shown until the next keypress clears progress_text.
         const msg = std.fmt.bufPrint(&self.progress_buf, " copied {d} chars ", .{self.selection_text.len}) catch return;
         self.progress_text = msg;
+        // Publish for `re mcp` (current_page / reading_state show the selection).
+        if (self.allocator.dupe(u8, self.selection_text)) |copy| {
+            if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
+            self.last_sel_text = copy;
+            self.last_sel_page = if (self.selection_hits.items.len > 0) self.selection_hits.items[0].page else self.document_handler.getCurrentPageNumber();
+            self.last_sel_at = time.nowRealSeconds();
+            self.positions.writePresence(self.doc_abs_path, self.started_at, self.last_sel_at, self.last_sel_text, self.last_sel_page, self.last_sel_at);
+        } else |_| {}
     }
 
     fn rebuildHighlightQuads(self: *Self) void {
@@ -2032,7 +2053,9 @@ fn applyView(dh: *PdfHandler, config: *Config, pos: Positions.Position, apply_po
     // Crop/spread first: their toggles reset zoom/scroll, so they must run
     // before the restored values or they wipe them.
     if (pos.crop != dh.getCropToContent()) dh.toggleCropToContent();
-    if (pos.spread != dh.getSpread()) dh.toggleSpread();
+    if (pos.spread) {
+        dh.setSpreadColumns(pos.spread_cols);
+    } else if (dh.getSpread()) dh.toggleSpread();
     if (pos.crop_left != 0 or pos.crop_right != 0 or pos.crop_top != 0 or pos.crop_bottom != 0) {
         dh.setMarginCrop(pos.crop_left, pos.crop_right, pos.crop_top, pos.crop_bottom);
     }

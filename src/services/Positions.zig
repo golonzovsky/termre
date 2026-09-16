@@ -20,6 +20,7 @@ pub const Position = struct {
     crop: bool = false,
     hlock: bool = false,
     spread: bool = false,
+    spread_cols: u8 = 2,
     fit_width: bool = false,
     crop_left: f32 = 0,
     crop_right: f32 = 0,
@@ -58,6 +59,19 @@ pub const Tombstone = struct {
     deleted_at: i64,
 };
 
+// A running `re` instance: <state>/open/<pid>.json, refreshed on every
+// state save, removed on exit, pruned when the pid is gone.
+pub const OpenEntry = struct {
+    path: []const u8 = "",
+    pid: i32 = 0,
+    since: i64 = 0,
+    last_activity: i64 = 0,
+    // Last text selected with the mouse in that instance.
+    selection: []const u8 = "",
+    selection_page: u16 = 0,
+    selection_at: i64 = 0,
+};
+
 pub const RecentEntry = struct {
     path: []const u8,
     page: u16,
@@ -86,6 +100,7 @@ const View = struct {
     crop: bool = false,
     hlock: bool = false,
     spread: bool = false,
+    spread_cols: u8 = 2,
     fit_width: bool = false,
     crop_left: f32 = 0,
     crop_right: f32 = 0,
@@ -285,6 +300,63 @@ pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const
     writeAtomic(a, self.io, file_path, json_str);
 }
 
+pub fn writePresence(self: *Self, path: []const u8, since: i64, last_activity: i64, sel_text: []const u8, sel_page: u16, sel_at: i64) void {
+    if (self.books_dir.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = std.fmt.allocPrint(a, "{s}/../open", .{self.books_dir}) catch return;
+    std.Io.Dir.cwd().createDirPath(self.io, dir) catch return;
+    const file = std.fmt.allocPrint(a, "{s}/{d}.json", .{ dir, std.c.getpid() }) catch return;
+    const entry = OpenEntry{ .path = path, .pid = std.c.getpid(), .since = since, .last_activity = last_activity, .selection = sel_text, .selection_page = sel_page, .selection_at = sel_at };
+    const json_str = std.json.Stringify.valueAlloc(a, entry, .{}) catch return;
+    writeAtomic(a, self.io, file, json_str);
+}
+
+pub fn clearPresence(self: *Self) void {
+    if (self.books_dir.len == 0) return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = std.fmt.bufPrint(&buf, "{s}/../open/{d}.json", .{ self.books_dir, std.c.getpid() }) catch return;
+    std.Io.Dir.cwd().deleteFile(self.io, file) catch {};
+}
+
+// Live instances; stale files (dead pids) are removed on the way.
+pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []OpenEntry {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = stateDir(a, env) orelse return &.{};
+    const dir_path = std.fmt.allocPrint(a, "{s}/open", .{state}) catch return &.{};
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var out: std.ArrayList(OpenEntry) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const file = std.fmt.allocPrint(a, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const content = cwd.readFileAlloc(io, file, a, .limited(4096)) catch continue;
+        const e = std.json.parseFromSliceLeaky(OpenEntry, a, content, .{ .ignore_unknown_fields = true }) catch continue;
+        // pid reuse guard: a reader that hasn't saved in a day isn't one.
+        const fresh = time.nowRealSeconds() - e.last_activity < 24 * 3600;
+        const alive = fresh and e.pid > 0 and std.c.kill(e.pid, @enumFromInt(0)) == 0;
+        if (alive) {
+            out.append(allocator, .{
+                .path = allocator.dupe(u8, e.path) catch continue,
+                .pid = e.pid,
+                .since = e.since,
+                .last_activity = e.last_activity,
+                .selection = allocator.dupe(u8, e.selection) catch "",
+                .selection_page = e.selection_page,
+                .selection_at = e.selection_at,
+            }) catch break;
+        } else {
+            cwd.deleteFile(io, file) catch {};
+        }
+    }
+    return out.toOwnedSlice(allocator) catch &.{};
+}
+
 // Every book with a shard, newest first. Prefers this device's path, then any
 // shard whose path exists here, else the newest shard's path tagged with its
 // device (the book is not on this machine).
@@ -339,6 +411,103 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, env: *std.process.En
         }
     }.newerFirst);
     return out.toOwnedSlice(allocator) catch &.{};
+}
+
+// ---- export / import (manual transfer without a store) -------------------
+
+const Bundle = struct {
+    v: u32 = 1,
+    exported_at: i64 = 0,
+    exported_by: []const u8 = "",
+    books: []const BookBundle = &.{},
+};
+
+const BookBundle = struct {
+    book: []const u8,
+    shards: []const Shard,
+};
+
+pub const TransferStats = struct { books: usize = 0, shards: usize = 0 };
+
+// Every shard of every book as one JSON document.
+pub fn exportAll(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, out: *std.Io.Writer) !TransferStats {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = stateDir(a, env) orelse return error.NoStateDir;
+    const books = try std.fmt.allocPrint(a, "{s}/books", .{state});
+    const device = deviceId(a, io, state);
+    migrateLegacy(a, io, env, state, books, device);
+
+    var list: std.ArrayList(BookBundle) = .empty;
+    var stats = TransferStats{};
+    const cwd = std.Io.Dir.cwd();
+    var root = cwd.openDir(io, books, .{ .iterate = true }) catch return error.NoStateDir;
+    defer root.close(io);
+    var it = root.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ books, entry.name });
+        const shards = try readAllShards(a, io, dir);
+        if (shards.len == 0) continue;
+        try list.append(a, .{ .book = try a.dupe(u8, entry.name), .shards = shards });
+        stats.books += 1;
+        stats.shards += shards.len;
+    }
+    const bundle = Bundle{ .exported_at = time.nowRealSeconds(), .exported_by = device, .books = list.items };
+    try std.json.Stringify.value(bundle, .{ .whitespace = .indent_2 }, out);
+    try out.writeByte('\n');
+    return stats;
+}
+
+// Merges a bundle into the local shards: each imported shard is merged with
+// the local shard of the same book+device (newest view wins, annotations
+// union with tombstones), so importing is idempotent and never loses work.
+pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, json: []const u8) !TransferStats {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = stateDir(a, env) orelse return error.NoStateDir;
+    const books = try std.fmt.allocPrint(a, "{s}/books", .{state});
+    const device = deviceId(a, io, state);
+    migrateLegacy(a, io, env, state, books, device);
+
+    const bundle = try std.json.parseFromSliceLeaky(Bundle, a, json, .{ .ignore_unknown_fields = true });
+    const cwd = std.Io.Dir.cwd();
+    var stats = TransferStats{};
+    for (bundle.books) |bb| {
+        if (bb.book.len == 0 or std.mem.indexOfScalar(u8, bb.book, '/') != null) continue;
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ books, bb.book });
+        try cwd.createDirPath(io, dir);
+        for (bb.shards) |imported| {
+            if (imported.device.len == 0 or std.mem.indexOfScalar(u8, imported.device, '/') != null) continue;
+            const file = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, imported.device });
+            var pair: [2]Shard = .{ imported, imported };
+            var n: usize = 1;
+            if (readShard(a, io, file)) |local| {
+                pair[1] = local;
+                n = 2;
+            }
+            const merged = try mergeShards(a, pair[0..n]);
+            const view = merged.view orelse continue;
+            // Keep the path this machine knows the book by.
+            const path = if (n == 2 and pair[1].path.len > 0) pair[1].path else view.path;
+            const out = Shard{
+                .device = imported.device,
+                .path = path,
+                .updated_at = view.last_opened,
+                .view = toView(view),
+                .marks = try marksToRecs(a, merged.marks),
+                .highlights = try hlToRecs(a, merged.highlights),
+                .tombstones = try tombsToRecs(a, merged.tombstones),
+            };
+            const json_str = try std.json.Stringify.valueAlloc(a, out, .{ .whitespace = .indent_2 });
+            writeAtomic(a, io, file, json_str);
+            stats.shards += 1;
+        }
+        stats.books += 1;
+    }
+    return stats;
 }
 
 // ---- merge ---------------------------------------------------------------

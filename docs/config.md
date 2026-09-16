@@ -390,6 +390,8 @@ The `Cache` section controls the page rendering cache, which speeds up navigatio
 
 Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. With a backend configured, that record is uploaded while you read (debounced, and on quit) and other devices' records are downloaded when a book is opened; the picker (`re` with no arguments) fetches the whole index so books read elsewhere show up too, tagged with the device name. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). `:sync` forces a push/pull. The device name is minted once into `~/.local/state/termre/device`.
 
+Without a store, move state by hand: `re state export [file]` writes every record as one JSON document (stdout by default), and `re state import <file|->` merges it into the local records with the same rules sync uses — safe to re-run, never loses local work.
+
 | Field | Type | Description |
 | --- | --- | --- |
 | `backend` | String | `none`, `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, an SSHFS mount), or `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …) |

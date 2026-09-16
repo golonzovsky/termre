@@ -122,14 +122,24 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
 
     if (ctx.pending_op) |op| {
         ctx.pending_op = null;
-        if (key.codepoint >= 'a' and key.codepoint <= 'z') {
-            const letter: u8 = @intCast(key.codepoint);
-            switch (op) {
-                .set_mark => ctx.setMark(letter),
-                .jump_mark => ctx.jumpToMark(letter),
+        if (op == .spread_digit) {
+            // `d` already toggled; a digit right after picks the column count.
+            if (key.codepoint >= '2' and key.codepoint <= '9') {
+                ctx.document_handler.setSpreadColumns(@intCast(key.codepoint - '0'));
+                ctx.reload_page = true;
+                return;
             }
+        } else {
+            if (key.codepoint >= 'a' and key.codepoint <= 'z') {
+                const letter: u8 = @intCast(key.codepoint);
+                switch (op) {
+                    .set_mark => ctx.setMark(letter),
+                    .jump_mark => ctx.jumpToMark(letter),
+                    .spread_digit => {},
+                }
+            }
+            return;
         }
-        return;
     }
 
     inline for (bindings) |b| {
@@ -174,6 +184,7 @@ fn toggleCrop(ctx: *Context) void {
 
 fn toggleSpread(ctx: *Context) void {
     ctx.document_handler.toggleSpread();
+    ctx.pending_op = .spread_digit;
     ctx.reload_page = true;
 }
 

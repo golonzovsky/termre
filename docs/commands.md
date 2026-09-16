@@ -17,7 +17,7 @@ same table that dispatches these commands.)
 - `:edit chapter` (or `:edit c`) — same, but the current chapter (range from TOC)
 - `:oddx <number>` — shift odd pages horizontally by N PDF points (for asymmetric inner margins)
 - `:hlock` — toggle horizontal scroll lock (trackpad reading mode)
-- `:spread` — toggle the two-column continuous spread
+- `:spread [N]` — toggle the continuous spread, or set it to N columns (2–8); in view mode `d` toggles and `d3` sets three
 - `:fit` — toggle fit-width lock (zoom tracks the cropped page width, or two
   pages in spread); also bound to `W`. A manual zoom releases it
 - `:crop [T [R [B [L]]]]` — trim margins in PDF points, CSS-shorthand value rules;
@@ -60,3 +60,6 @@ non-obvious ones:
 - `t` auto-crop, `d` spread, `T` table of contents, `M` marks, `;` link hints,
   `m<a-z>`/`'<a-z>` set/jump mark, `Ctrl+O`/`Tab` jump back/forward,
   `e`/`E` page/chapter in `$EDITOR`
+
+
+See [mcp.md](./mcp.md) for the `re mcp` agent server.

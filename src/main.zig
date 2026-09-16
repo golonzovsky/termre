@@ -132,8 +132,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "state")) return stateCli(init, args[2..], stdout, stderr);
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "mcp")) {
+        if (args.len == 2) return @import("mcp.zig").run(init);
+        return @import("mcp.zig").cli(init, args[2..], stdout, stderr);
+    }
+
     if (args.len > 3 or (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))) {
-        try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n       re                   (pick from recently opened)\n");
+        try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n       re                   (pick from recently opened)\n       re mcp               (MCP server over stdio for agents)\n");
         try stderr.flush();
         return;
     }
@@ -179,7 +186,11 @@ pub fn main(init: std.process.Init) !void {
         path = try arena.dupeZ(u8, recents[idx].path);
     } else {
         path = args[1];
-        if (args.len == 3) initial_page = try std.fmt.parseInt(u16, args[2], 10);
+        if (args.len == 3) initial_page = std.fmt.parseInt(u16, args[2], 10) catch {
+            try stderr.print("re: `{s}` is not a page number (run `re --help` for subcommands)\n", .{args[2]});
+            try stderr.flush();
+            std.process.exit(2);
+        };
     }
 
     runApp(init, path, initial_page) catch |err| switch (err) {
@@ -210,3 +221,49 @@ const no_graphics_msg =
     \\Terminal.app, iTerm2, Alacritty, foot, VS Code's terminal do not support it.
     \\
 ;
+
+// `re state export [file]` / `re state import <file|->`: move reading state
+// between machines by hand; import merges like sync does.
+fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    const usage = "usage: re state export [file] | re state import <file|->\n";
+    if (args.len == 0) {
+        try stderr.writeAll(usage);
+        try stderr.flush();
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "export")) {
+        if (args.len >= 2) {
+            var file = try std.Io.Dir.cwd().createFile(init.io, args[1], .{});
+            defer file.close(init.io);
+            var buf: [8192]u8 = undefined;
+            var fw = file.writer(init.io, &buf);
+            const stats = try Positions.exportAll(init.gpa, init.io, init.environ_map, &fw.interface);
+            try fw.interface.flush();
+            try stderr.print("exported {d} books ({d} device records) to {s}\n", .{ stats.books, stats.shards, args[1] });
+        } else {
+            _ = try Positions.exportAll(init.gpa, init.io, init.environ_map, stdout);
+            try stdout.flush();
+        }
+        try stderr.flush();
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "import") and args.len >= 2) {
+        const limit: std.Io.Limit = .limited(64 * 1024 * 1024);
+        const json = if (std.mem.eql(u8, args[1], "-")) blk: {
+            var rbuf: [8192]u8 = undefined;
+            var r = std.Io.File.stdin().reader(init.io, &rbuf);
+            break :blk try r.interface.allocRemaining(init.gpa, limit);
+        } else try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], init.gpa, limit);
+        defer init.gpa.free(json);
+        const stats = Positions.importBundle(init.gpa, init.io, init.environ_map, json) catch |err| {
+            try stderr.print("import failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return;
+        };
+        try stderr.print("imported {d} books ({d} device records), merged with local state\n", .{ stats.books, stats.shards });
+        try stderr.flush();
+        return;
+    }
+    try stderr.writeAll(usage);
+    try stderr.flush();
+}

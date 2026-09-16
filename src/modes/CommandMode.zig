@@ -134,7 +134,7 @@ pub const commands = .{
     .{ handleEdit, ":edit [c]", "page/chapter in $EDITOR" },
     .{ handleAltShift, ":oddx N", "shift odd pages (pt)" },
     .{ handleHLock, ":hlock", "lock horiz scroll" },
-    .{ handleSpread, ":spread", "2-column spread" },
+    .{ handleSpread, ":spread [N]", "N-column spread (2..8)" },
     .{ handleFit, ":fit", "lock zoom to width" },
     .{ handleCrop, ":crop [TRBL]", "trim margins; bare=reset" },
     .{ handleExport, ":export [path]", "print copy: crop+oddx baked" },
@@ -262,8 +262,14 @@ fn handleSync(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleSpread(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.eql(u8, cmd, "spread")) return false;
-    self.context.document_handler.toggleSpread();
+    if (!std.mem.startsWith(u8, cmd, "spread")) return false;
+    const rest = std.mem.trim(u8, cmd["spread".len..], &std.ascii.whitespace);
+    if (rest.len == 0) {
+        self.context.document_handler.toggleSpread();
+    } else {
+        const n = std.fmt.parseInt(u8, rest, 10) catch return false;
+        self.context.document_handler.setSpreadColumns(n);
+    }
     self.context.resetCurrentPage();
     return true;
 }

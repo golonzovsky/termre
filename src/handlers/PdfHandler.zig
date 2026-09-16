@@ -31,6 +31,7 @@ fit_width: bool,
 // Two-column continuous flow: the right column continues the strip where
 // the left column's bottom ends, so pages may straddle the column break.
 spread: bool,
+spread_cols: u8,
 crop_to_content: bool,
 crop_margin: f32,
 // Manual margin crop in PDF points, applied to every page before layout.
@@ -117,6 +118,7 @@ pub fn init(
         .width_mode = false,
         .fit_width = false,
         .spread = false,
+        .spread_cols = 2,
         .crop_to_content = false,
         .crop_margin = 4,
         .crop_left = 0,
@@ -680,6 +682,20 @@ pub fn getSpread(self: *Self) bool {
 
 pub fn toggleSpread(self: *Self) void {
     self.spread = !self.spread;
+    self.default_zoom = 0;
+    self.active_zoom = 0;
+    self.pix_scroll_x = 0;
+    self.pix_scroll_y = 0;
+}
+
+pub fn getSpreadColumns(self: *Self) u8 {
+    return if (self.spread) @max(self.spread_cols, 2) else 1;
+}
+
+// Spread with exactly `n` columns (2..8); the zoom refits to the column width.
+pub fn setSpreadColumns(self: *Self, n: u8) void {
+    self.spread_cols = std.math.clamp(n, 2, 8);
+    self.spread = true;
     self.default_zoom = 0;
     self.active_zoom = 0;
     self.pix_scroll_x = 0;
