@@ -283,6 +283,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena_allocator, content.?, .{}) catch return self;
     defer parsed.deinit();
+    if (parsed.value != .object) return self;
 
     if (parsed.value.object.get("KeyMap")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
     if (parsed.value.object.get("FileMonitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);

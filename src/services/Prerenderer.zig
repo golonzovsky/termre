@@ -194,8 +194,10 @@ fn run(self: *Self) void {
 
         for (pages) |maybe_page| {
             const page = maybe_page orelse continue;
+            const gen = self.context.cache_gen.load(.monotonic);
             const encoded = self.context.document_handler.renderPage(page, w, h) catch continue;
-            const key = self.context.cacheKeyFor(page);
+            var key = self.context.cacheKeyFor(page);
+            key.gen = gen; // a clear during the render makes this result stale
             const result = self.context.allocator.create(Result) catch {
                 self.context.deleteEncoded(encoded);
                 self.context.allocator.free(encoded.data);

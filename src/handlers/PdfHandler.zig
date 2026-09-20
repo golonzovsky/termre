@@ -602,10 +602,14 @@ pub fn clampScrollX(self: *Self, viewport_w: u32) void {
     self.pix_scroll_x = @max(0, @min(self.maxScrollX(viewport_w), self.pix_scroll_x));
 }
 
+// Pixmaps grow quadratically with zoom; past this a page is hundreds of MB
+// and mupdf's allocation failure would abort the process.
+const max_zoom: f32 = 10.0;
+
 pub fn zoomIn(self: *Self) void {
     self.fit_width = false; // manual zoom exits the locked fit
     const old_zoom = self.active_zoom;
-    self.active_zoom *= self.config.general.zoom_step;
+    self.active_zoom = @min(self.active_zoom * self.config.general.zoom_step, max_zoom);
     self.rescaleScroll(old_zoom);
 }
 
@@ -632,7 +636,7 @@ pub fn setZoom(self: *Self, percent: f32) void {
     var dpi = self.config.general.dpi;
     if (self.config.general.detect_dpi) dpi = Utilities.getDPI() orelse dpi;
 
-    self.active_zoom = @max(percent * dpi / 7200.0, self.effectiveZoomMin());
+    self.active_zoom = std.math.clamp(percent * dpi / 7200.0, self.effectiveZoomMin(), max_zoom);
 }
 
 pub fn toggleColor(self: *Self) void {

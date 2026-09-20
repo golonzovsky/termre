@@ -24,9 +24,10 @@ jobs:
           version: 0.16.0
 
       - run: zig build
+      - run: zig test src/services/S3Store.zig
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
-      - run: zig fmt --check src/*.zig
+      - run: zig fmt --check src

@@ -116,6 +116,12 @@ pub const Context = struct {
     tombstones: std.ArrayList(Positions.Tombstone),
     sync: ?*Sync,
     sync_manual: bool,
+    sync_stopped: bool,
+    cache_gen: std.atomic.Value(u32),
+    // The reader changed the view (or opened at an explicit page) this
+    // session; recorded so an opened-but-untouched record can't outrank it.
+    view_touched: bool,
+    saved_once: bool,
     started_at: i64,
     // Timestamp of the view state we last saved or adopted; a pulled view
     // only replaces ours when it is newer than this.
@@ -263,6 +269,10 @@ pub const Context = struct {
             .tombstones = tombstones,
             .sync = sync,
             .sync_manual = false,
+            .sync_stopped = true,
+            .cache_gen = .init(0),
+            .view_touched = initial_page != null,
+            .saved_once = false,
             .started_at = time.nowRealSeconds(),
             .last_view_ts = last_view_ts,
             .pending_op = null,
@@ -304,6 +314,7 @@ pub const Context = struct {
             .crop_top = self.document_handler.crop_top,
             .crop_bottom = self.document_handler.crop_bottom,
             .grid_zoom = self.grid_cell_w,
+            .touched = self.view_touched,
             .path = self.doc_abs_path,
             .last_opened = time.nowRealSeconds(),
         };
@@ -332,9 +343,16 @@ pub const Context = struct {
         }
         const sig = hasher.final();
         if (sig == self.last_save_sig) return;
+        // The first save just persists the restored view; any later change
+        // is the reader acting.
+        if (self.saved_once) self.view_touched = true;
+        var pos_out = pos;
+        pos_out.touched = self.view_touched;
+        // Only a successful write counts as saved; a failed one is retried.
+        const ts = self.positions.save(pos_out, self.marks.items, self.highlights.items, self.tombstones.items) orelse return;
+        self.saved_once = true;
         self.last_save_sig = sig;
-        self.positions.save(pos, self.marks.items, self.highlights.items, self.tombstones.items);
-        self.last_view_ts = pos.last_opened;
+        self.last_view_ts = ts;
         self.positions.writePresence(self.doc_abs_path, self.started_at, pos.last_opened, self.last_sel_text, self.last_sel_page, self.last_sel_at);
         if (self.sync) |s| s.requestPush(false);
     }
@@ -417,7 +435,9 @@ pub const Context = struct {
         self.deinitCurrentMode();
         self.saveState();
         self.freeAnnotations();
-        if (self.sync) |s| s.destroy();
+        // A worker stuck in a network call still references this; leaking it
+        // at exit beats a use-after-free.
+        if (self.sync) |s| if (self.sync_stopped) s.destroy();
         self.positions.clearPresence();
         self.positions.deinit();
         self.freeOutline();
@@ -490,7 +510,7 @@ pub const Context = struct {
         // Same ordering need; the final save must land before the flush push.
         defer if (self.sync) |s| {
             if (!self.modeFlag("suppress_autosave")) self.saveState();
-            s.stop(3 * std.time.ns_per_s);
+            self.sync_stopped = s.stop(3 * std.time.ns_per_s);
         };
 
         if (self.config.file_monitor.enabled) {
@@ -698,6 +718,8 @@ pub const Context = struct {
             .spread = self.document_handler.getSpread(),
             .shift_x = if (page_number % 2 == 1) self.document_handler.getOddShiftX() else 0,
             .sel = if (self.selectionPage()) |sp| (if (sp == page_number) self.selection_gen else 0) else 0,
+            .gen = self.cache_gen.load(.monotonic),
+            .margins = marginsBits(&self.document_handler),
         };
     }
 
@@ -825,6 +847,7 @@ pub const Context = struct {
     // Empties the render cache and queues the displaced terminal-side images
     // for deletion after the next render.
     pub fn clearCache(self: *Self) void {
+        _ = self.cache_gen.fetchAdd(1, .monotonic);
         self.cache.clearInto(self.allocator, &self.stale_images);
     }
 
@@ -1689,15 +1712,6 @@ pub const Context = struct {
     }
 
     fn spawnEditorAndWait(self: *Self, path: [:0]const u8, dir: []const u8, line: ?usize) !void {
-        var writer = self.tty.writer();
-        try self.vx.setMouseMode(writer, false);
-        try self.vx.exitAltScreen(writer);
-        try writer.flush();
-
-        // Release the tty so the editor can read stdin — otherwise the vaxis
-        // input thread keeps consuming keystrokes from underneath the editor.
-        if (self.loop) |loop| loop.stop();
-
         const editor_raw = self.env.get("EDITOR") orelse self.env.get("VISUAL") orelse "vim";
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
@@ -1723,10 +1737,23 @@ pub const Context = struct {
         }
         try argv.append(self.allocator, path);
 
-        var child = try std.process.spawn(self.io, .{
+        // Everything fallible is done; now hand the terminal over. Release the
+        // tty so the editor can read stdin — otherwise the vaxis input thread
+        // keeps consuming keystrokes from underneath the editor.
+        var writer = self.tty.writer();
+        try self.vx.setMouseMode(writer, false);
+        try self.vx.exitAltScreen(writer);
+        try writer.flush();
+        if (self.loop) |loop| loop.stop();
+
+        var child = std.process.spawn(self.io, .{
             .argv = argv.items,
             .environ_map = self.env,
-        });
+        }) catch |err| {
+            self.restoreAfterEditor() catch {};
+            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " cannot run $EDITOR `{s}`: {s} ", .{ editor_raw, @errorName(err) }) catch null;
+            return err;
+        };
         _ = child.wait(self.io) catch {};
 
         // Clean up the per-extract directory and everything inside it.
@@ -1739,8 +1766,12 @@ pub const Context = struct {
             parent_dir.deleteTree(self.io, leaf) catch {};
         } else |_| {}
 
-        if (self.loop) |loop| try loop.start();
+        try self.restoreAfterEditor();
+    }
 
+    fn restoreAfterEditor(self: *Self) !void {
+        var writer = self.tty.writer();
+        if (self.loop) |loop| try loop.start();
         try self.vx.enterAltScreen(writer);
         // Re-measure: the alt screen was torn down and rebuilt while the editor
         // owned the tty, so screen.width_pix/height_pix are stale. Without this
@@ -1829,7 +1860,7 @@ pub const Context = struct {
         }
 
         // Right side
-        if (separator_index < items.len - 1) {
+        if (items.len > 0 and separator_index < items.len - 1) {
             var right_col: usize = win.width;
             for (0..(items.len - separator_index - 1)) |j| {
                 try self.drawStatusText(status_bar, items[items.len - 1 - j], &right_col, false, arena);
@@ -2056,7 +2087,7 @@ fn applyView(dh: *PdfHandler, config: *Config, pos: Positions.Position, apply_po
     if (pos.spread) {
         dh.setSpreadColumns(pos.spread_cols);
     } else if (dh.getSpread()) dh.toggleSpread();
-    if (pos.crop_left != 0 or pos.crop_right != 0 or pos.crop_top != 0 or pos.crop_bottom != 0) {
+    if (pos.crop_left != dh.crop_left or pos.crop_right != dh.crop_right or pos.crop_top != dh.crop_top or pos.crop_bottom != dh.crop_bottom) {
         dh.setMarginCrop(pos.crop_left, pos.crop_right, pos.crop_top, pos.crop_bottom);
     }
     if (apply_position and pos.page < dh.getTotalPages()) {
@@ -2067,11 +2098,17 @@ fn applyView(dh: *PdfHandler, config: *Config, pos: Positions.Position, apply_po
     if (pos.zoom > 0) dh.setActiveZoom(pos.zoom);
     dh.setOddShiftX(pos.odd_shift_x);
     // Last: when locked to fit-width, the zoom is recomputed at render.
-    if (pos.fit_width) dh.setFitWidth(true);
+    if (pos.fit_width != dh.getFitWidth()) dh.setFitWidth(pos.fit_width);
 }
 
 fn makeSync(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, config: *Config, positions: *Positions) ?*Sync {
     if (positions.booksDir().len == 0) return null;
     const store = Sync.storeFromConfig(allocator, io, env, config) orelse return null;
     return Sync.create(allocator, io, store, positions.booksDir(), positions.bookName(), positions.deviceName(), config.sync.push_debounce_s) catch null;
+}
+
+fn marginsBits(dh: *PdfHandler) u64 {
+    var h = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&h, .{ @as(u32, @bitCast(dh.crop_left)), @as(u32, @bitCast(dh.crop_right)), @as(u32, @bitCast(dh.crop_top)), @as(u32, @bitCast(dh.crop_bottom)) });
+    return h.final();
 }

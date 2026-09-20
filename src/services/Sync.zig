@@ -131,13 +131,15 @@ pub fn requestPush(self: *Self, immediate: bool) void {
 }
 
 // Asks the worker to flush a pending push and exit; waits at most `max_ns`
-// so a dead network can't hang quit.
-pub fn stop(self: *Self, max_ns: i64) void {
+// so a dead network can't hang quit. False if the worker is still running:
+// the caller must then leak this object rather than free it under the thread.
+pub fn stop(self: *Self, max_ns: i64) bool {
     self.quit.store(true, .release);
     const deadline = time.nowNs() + max_ns;
     while (!self.done.load(.acquire) and time.nowNs() < deadline) {
         time.sleep(20 * std.time.ns_per_ms);
     }
+    return self.done.load(.acquire);
 }
 
 fn worker(self: *Self) void {

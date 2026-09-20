@@ -25,6 +25,8 @@ const Server = struct {
     book: ?Book = null,
     // Set per call when `book` was defaulted while other books are open.
     default_note: []const u8 = "",
+    // Each extraction gets its own directory: the extractor restarts image numbering.
+    req_seq: u32 = 0,
 
     fn closeBook(self: *Server) void {
         if (self.book) |*b| {
@@ -553,14 +555,17 @@ fn pageHook(ctx: *anyopaque, page: u16, w: *std.Io.Writer) anyerror!void {
 
 // Pages [start, end) via the same extractor as `:markdown`, through a temp file.
 fn pagesMarkdown(self: *Server, a: std.mem.Allocator, book: *Book, start: u16, end: u16, heading: ?[]const u8) ![]const u8 {
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/pages-{d}-{d}.md", .{ self.tmp_dir, start + 1, end }, 0);
+    self.req_seq += 1;
+    const dir = try std.fmt.allocPrint(a, "{s}/{d}", .{ self.tmp_dir, self.req_seq });
+    try std.Io.Dir.cwd().createDirPath(self.io, dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/pages-{d}-{d}.md", .{ dir, start + 1, end }, 0);
     var hook = HookCtx{ .book = book, .heading = heading };
     try book.handler.writePagesText(start, end, path, null, null, pageHook, &hook);
     const md = try std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_result_bytes));
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     if (heading) |h| try w.print("# {s}\n\n", .{h});
-    try w.print("<!-- {s}, pages {d}-{d} of {d}; diagram PNGs in {s} -->\n\n", .{ std.fs.path.basename(book.path), start + 1, end, book.handler.getTotalPages(), self.tmp_dir });
+    try w.print("<!-- {s}, pages {d}-{d} of {d}; diagram PNGs in {s} -->\n\n", .{ std.fs.path.basename(book.path), start + 1, end, book.handler.getTotalPages(), dir });
     try w.writeAll(md);
     return w.buffered();
 }

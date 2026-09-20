@@ -225,15 +225,27 @@ const no_graphics_msg =
 // `re state export [file]` / `re state import <file|->`: move reading state
 // between machines by hand; import merges like sync does.
 fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    const usage = "usage: re state export [file] | re state import <file|->\n";
-    if (args.len == 0) {
-        try stderr.writeAll(usage);
-        try stderr.flush();
+    const usage =
+        \\usage: re state export [file]     write all reading state as JSON (stdout by default)
+        \\       re state import <file|->   merge a state export into this machine (`-` = stdin)
+        \\
+    ;
+    var wants_help = args.len == 0;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) wants_help = true;
+    }
+    if (wants_help) {
+        try stdout.writeAll(usage);
+        try stdout.flush();
         return;
     }
     if (std.mem.eql(u8, args[0], "export")) {
         if (args.len >= 2) {
-            var file = try std.Io.Dir.cwd().createFile(init.io, args[1], .{});
+            var file = std.Io.Dir.cwd().createFile(init.io, args[1], .{}) catch |err| {
+                try stderr.print("re state export: cannot write {s} ({s})\n", .{ args[1], @errorName(err) });
+                try stderr.flush();
+                std.process.exit(2);
+            };
             defer file.close(init.io);
             var buf: [8192]u8 = undefined;
             var fw = file.writer(init.io, &buf);
@@ -253,7 +265,11 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
             var rbuf: [8192]u8 = undefined;
             var r = std.Io.File.stdin().reader(init.io, &rbuf);
             break :blk try r.interface.allocRemaining(init.gpa, limit);
-        } else try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], init.gpa, limit);
+        } else std.Io.Dir.cwd().readFileAlloc(init.io, args[1], init.gpa, limit) catch |err| {
+            try stderr.print("re state import: cannot read {s} ({s})\n", .{ args[1], @errorName(err) });
+            try stderr.flush();
+            std.process.exit(2);
+        };
         defer init.gpa.free(json);
         const stats = Positions.importBundle(init.gpa, init.io, init.environ_map, json) catch |err| {
             try stderr.print("import failed: {s}\n", .{@errorName(err)});

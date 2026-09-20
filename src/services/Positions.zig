@@ -27,6 +27,9 @@ pub const Position = struct {
     crop_top: f32 = 0,
     crop_bottom: f32 = 0,
     grid_zoom: u16 = 0,
+    // False until the reader moves or changes the view in that record's
+    // lifetime: an opened-but-untouched record never outranks real progress.
+    touched: bool = false,
     // Not view state: this device's path, when the view was last saved, and
     // which device saved it (the one whose view won the merge on load).
     path: []const u8 = "",
@@ -107,6 +110,7 @@ const View = struct {
     crop_top: f32 = 0,
     crop_bottom: f32 = 0,
     grid_zoom: u16 = 0,
+    touched: bool = false,
 };
 
 const MarkRec = struct {
@@ -261,43 +265,49 @@ pub fn loadTombstones(self: *Self, allocator: std.mem.Allocator) std.ArrayList(T
     return out;
 }
 
-pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const Highlight, tombstones: []const Tombstone) void {
-    if (self.books_dir.len == 0) return;
+// Returns the record's view timestamp: now if the view changed, else the
+// previous one (so opening a book doesn't make its record "newer"); null
+// when nothing could be written, so the caller retries next time.
+pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const Highlight, tombstones: []const Tombstone) ?i64 {
+    const now = time.nowRealSeconds();
+    if (self.books_dir.len == 0) return null;
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const dir = self.bookDir(a, self.doc_key) catch return;
-    const file_path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, self.device }) catch return;
+    const dir = self.bookDir(a, self.doc_key) catch return null;
+    const file_path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, self.device }) catch return null;
 
     var mine = Shard{
         .device = self.device,
         .path = pos.path,
-        .updated_at = time.nowRealSeconds(),
+        .updated_at = now,
         .view = toView(pos),
-        .marks = marksToRecs(a, marks) catch return,
-        .highlights = hlToRecs(a, highlights) catch return,
-        .tombstones = tombsToRecs(a, tombstones) catch return,
+        .marks = marksToRecs(a, marks) catch return null,
+        .highlights = hlToRecs(a, highlights) catch return null,
+        .tombstones = tombsToRecs(a, tombstones) catch return null,
     };
+    mine.view.touched = pos.touched or mine.view.page != 0 or mine.view.scroll_y != 0 or mine.view.scroll_x != 0;
     // Another instance on this device may have saved since we loaded; merge
-    // rather than overwrite. Our view is newest, so it wins by timestamp.
-    var shards: [2]Shard = .{ mine, mine };
-    var n: usize = 1;
+    // rather than overwrite.
     if (readShard(a, self.io, file_path)) |on_disk| {
-        shards[1] = on_disk;
-        n = 2;
-    }
-    if (n == 2) {
-        const merged = mergeShards(a, shards[0..n]) catch return;
-        mine.marks = marksToRecs(a, merged.marks) catch return;
-        mine.highlights = hlToRecs(a, merged.highlights) catch return;
-        mine.tombstones = tombsToRecs(a, merged.tombstones) catch return;
+        const changed = !viewEql(mine.view, on_disk.view);
+        if (!changed) mine.updated_at = on_disk.updated_at;
+        mine.view.touched = mine.view.touched or on_disk.view.touched or changed;
+        const shards: [2]Shard = .{ mine, on_disk };
+        const merged = mergeShards(a, &shards) catch return null;
+        mine.view = toView(merged.view.?);
+        mine.updated_at = merged.view.?.last_opened;
+        mine.marks = marksToRecs(a, merged.marks) catch return null;
+        mine.highlights = hlToRecs(a, merged.highlights) catch return null;
+        mine.tombstones = tombsToRecs(a, merged.tombstones) catch return null;
     }
 
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(self.io, dir) catch return;
-    const json_str = std.json.Stringify.valueAlloc(a, mine, .{ .whitespace = .indent_2 }) catch return;
-    writeAtomic(a, self.io, file_path, json_str);
+    cwd.createDirPath(self.io, dir) catch return null;
+    const json_str = std.json.Stringify.valueAlloc(a, mine, .{ .whitespace = .indent_2 }) catch return null;
+    if (!writeAtomic(a, self.io, file_path, json_str)) return null;
+    return mine.updated_at;
 }
 
 pub fn writePresence(self: *Self, path: []const u8, since: i64, last_activity: i64, sel_text: []const u8, sel_page: u16, sel_at: i64) void {
@@ -310,7 +320,7 @@ pub fn writePresence(self: *Self, path: []const u8, since: i64, last_activity: i
     const file = std.fmt.allocPrint(a, "{s}/{d}.json", .{ dir, std.c.getpid() }) catch return;
     const entry = OpenEntry{ .path = path, .pid = std.c.getpid(), .since = since, .last_activity = last_activity, .selection = sel_text, .selection_page = sel_page, .selection_at = sel_at };
     const json_str = std.json.Stringify.valueAlloc(a, entry, .{}) catch return;
-    writeAtomic(a, self.io, file, json_str);
+    _ = writeAtomic(a, self.io, file, json_str);
 }
 
 pub fn clearPresence(self: *Self) void {
@@ -502,8 +512,7 @@ pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
                 .tombstones = try tombsToRecs(a, merged.tombstones),
             };
             const json_str = try std.json.Stringify.valueAlloc(a, out, .{ .whitespace = .indent_2 });
-            writeAtomic(a, io, file, json_str);
-            stats.shards += 1;
+            if (writeAtomic(a, io, file, json_str)) stats.shards += 1;
         }
         stats.books += 1;
     }
@@ -516,9 +525,16 @@ fn mergeShards(a: std.mem.Allocator, shards: []const Shard) !Merged {
     var out = Merged{};
     if (shards.len == 0) return out;
 
+    // Newest view wins, but an untouched record (a book opened and never
+    // moved) never outranks real progress from another record.
     var best: usize = 0;
-    for (shards, 0..) |s, i| {
-        if (s.updated_at > shards[best].updated_at) best = i;
+    var best_progress = hasProgress(shards[0].view);
+    for (shards[1..], 1..) |s, i| {
+        const progress = hasProgress(s.view);
+        if ((progress and !best_progress) or (progress == best_progress and s.updated_at > shards[best].updated_at)) {
+            best = i;
+            best_progress = progress;
+        }
     }
     var pos = fromView(shards[best].view);
     pos.path = shards[best].path;
@@ -607,6 +623,19 @@ fn mergeShards(a: std.mem.Allocator, shards: []const Shard) !Merged {
     return out;
 }
 
+fn hasProgress(v: View) bool {
+    return v.touched or v.page != 0 or v.scroll_y != 0 or v.scroll_x != 0;
+}
+
+// Equality of what the reader sees; `touched` is bookkeeping, not view.
+fn viewEql(x: View, y: View) bool {
+    inline for (std.meta.fields(View)) |f| {
+        if (comptime std.mem.eql(u8, f.name, "touched")) continue;
+        if (@field(x, f.name) != @field(y, f.name)) return false;
+    }
+    return true;
+}
+
 fn sameTombKey(x: Tombstone, y: Tombstone) bool {
     return x.kind == y.kind and x.letter == y.letter and x.id == y.id;
 }
@@ -647,18 +676,20 @@ fn readShard(a: std.mem.Allocator, io: std.Io, path: []const u8) ?Shard {
     return std.json.parseFromSliceLeaky(Shard, a, content, .{ .ignore_unknown_fields = true }) catch null;
 }
 
-fn writeAtomic(a: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) void {
+// True on success. Per-process temp name: two instances may save at once.
+fn writeAtomic(a: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) bool {
     const cwd = std.Io.Dir.cwd();
-    const tmp_path = std.fmt.allocPrint(a, "{s}.tmp", .{path}) catch return;
+    const tmp_path = std.fmt.allocPrint(a, "{s}.{d}.tmp", .{ path, std.c.getpid() }) catch return false;
     {
-        var file = cwd.createFile(io, tmp_path, .{}) catch return;
+        var file = cwd.createFile(io, tmp_path, .{}) catch return false;
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var fw = file.writer(io, &buf);
-        fw.interface.writeAll(data) catch return;
-        fw.interface.flush() catch return;
+        fw.interface.writeAll(data) catch return false;
+        fw.interface.flush() catch return false;
     }
-    std.Io.Dir.renameAbsolute(tmp_path, path, io) catch return;
+    std.Io.Dir.renameAbsolute(tmp_path, path, io) catch return false;
+    return true;
 }
 
 fn bookDir(self: *Self, a: std.mem.Allocator, key: []const u8) ![]u8 {
@@ -704,7 +735,7 @@ fn deviceId(a: std.mem.Allocator, io: std.Io, state: []const u8) []const u8 {
         if (!std.ascii.isAlphanumeric(c.*) and c.* != '-') c.* = '-';
     }
     cwd.createDirPath(io, state) catch {};
-    writeAtomic(a, io, path, id);
+    _ = writeAtomic(a, io, path, id);
     return id;
 }
 
@@ -799,7 +830,7 @@ fn migrateLegacy(a: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
         cwd.createDirPath(io, dir) catch continue;
         const path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, device }) catch continue;
         const json_str = std.json.Stringify.valueAlloc(a, shard, .{ .whitespace = .indent_2 }) catch continue;
-        writeAtomic(a, io, path, json_str);
+        _ = writeAtomic(a, io, path, json_str);
     }
 }
 

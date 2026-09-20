@@ -13,6 +13,11 @@ pub const Key = struct {
     // Selection generation: 0 for pages without an active selection; bumped on
     // every selection change so the page with baked-in highlights re-renders once.
     sel: u32,
+    // Bumped on every cache clear so a render that was in flight before the
+    // clear (reload, highlight change, ...) can't repopulate it.
+    gen: u32,
+    // Manual margins, bit-packed: they change the raster.
+    margins: u64,
 };
 pub const CachedImage = struct {
     image: vaxis.Image,
