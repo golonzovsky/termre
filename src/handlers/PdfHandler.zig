@@ -96,7 +96,9 @@ pub fn init(
     };
     errdefer c.fz_drop_document(ctx, doc);
 
-    const total_pages = @as(u16, @intCast(c.fz_count_pages(ctx, doc)));
+    const page_count = c.fz_count_pages_z(ctx, doc);
+    if (page_count <= 0) return types.DocumentError.FailedToOpenDocument;
+    const total_pages = @as(u16, @intCast(page_count));
 
     const current_page_number = if (initial_page) |page| blk: {
         if (page < 1 or page > total_pages) {
@@ -294,7 +296,7 @@ fn computeStableBox(self: *Self) void {
         if (n == 0) {
             const page = c.fz_load_page_z(self.ctx, self.doc, @intCast(p)) orelse continue;
             defer c.fz_drop_page(self.ctx, page);
-            self.sample_bound = c.fz_bound_page(self.ctx, page);
+            self.sample_bound = c.fz_bound_page_z(self.ctx, page);
         }
         // Normalize odd pages into aligned space so the box is parity-correct.
         const shift: f32 = if (p % 2 == 1) @floatFromInt(self.odd_shift_x) else 0;
@@ -318,7 +320,7 @@ fn computeStableBox(self: *Self) void {
 }
 
 fn pageRenderBound(self: *Self, page: [*c]c.fz_page) RenderBound {
-    const page_bound = c.fz_bound_page(self.ctx, page);
+    const page_bound = c.fz_bound_page_z(self.ctx, page);
     var rb = RenderBound{ .bound = page_bound, .ox = 0, .oy = 0 };
 
     if (self.crop_left != 0 or self.crop_right != 0 or self.crop_top != 0 or self.crop_bottom != 0) {
@@ -349,11 +351,8 @@ fn pageRenderBound(self: *Self, page: [*c]c.fz_page) RenderBound {
     return rb;
 }
 
-fn runPageInto(self: *Self, page: [*c]c.fz_page, ctm: c.fz_matrix, pix: [*c]c.fz_pixmap) void {
-    const dev = c.fz_new_draw_device(self.ctx, ctm, pix);
-    defer c.fz_drop_device(self.ctx, dev);
-    c.fz_run_page(self.ctx, page, dev, c.fz_identity, null);
-    c.fz_close_device(self.ctx, dev);
+fn runPageInto(self: *Self, page: [*c]c.fz_page, ctm: c.fz_matrix, pix: [*c]c.fz_pixmap) !void {
+    if (c.fz_run_page_into_z(self.ctx, page, ctm, pix) == 0) return types.DocumentError.FailedToRenderPage;
 }
 
 fn invertRects(self: *Self, pix: [*c]c.fz_pixmap, page_num: u16, ctm: c.fz_matrix, hits: []const SearchHit) void {
@@ -451,7 +450,8 @@ fn renderAttempt(
     const full_h = @max(1.0, self.active_zoom * render_h_pdf);
 
     const bbox = c.fz_make_irect(0, 0, @intFromFloat(full_w), @intFromFloat(full_h));
-    const pix = c.fz_new_pixmap_with_bbox(self.ctx, c.fz_device_rgb(self.ctx), bbox, null, 0);
+    const pix = c.fz_new_pixmap_rgb_z(self.ctx, bbox);
+    if (pix == null) return types.DocumentError.FailedToRenderPage;
     defer c.fz_drop_pixmap(self.ctx, pix);
     c.fz_clear_pixmap_with_value(self.ctx, pix, 0xFF);
 
@@ -463,7 +463,7 @@ fn renderAttempt(
     else
         0;
     const ctm = c.fz_pre_translate(scale, -rb.ox + shift_pdf, -rb.oy);
-    self.runPageInto(page, ctm, pix);
+    try self.runPageInto(page, ctm, pix);
     self.highlightHits(pix, page_number, ctm);
 
     if (self.config.general.colorize) {
@@ -565,7 +565,8 @@ pub fn renderThumb(self: *Self, page_number: u16, max_w: u32, max_h: u32) !types
     const full_w = @max(1.0, zoom * w_pdf);
     const full_h = @max(1.0, zoom * h_pdf);
     const bbox = c.fz_make_irect(0, 0, @intFromFloat(full_w), @intFromFloat(full_h));
-    const pix = c.fz_new_pixmap_with_bbox(self.ctx, c.fz_device_rgb(self.ctx), bbox, null, 0);
+    const pix = c.fz_new_pixmap_rgb_z(self.ctx, bbox);
+    if (pix == null) return types.DocumentError.FailedToRenderPage;
     defer c.fz_drop_pixmap(self.ctx, pix);
     c.fz_clear_pixmap_with_value(self.ctx, pix, 0xFF);
 
@@ -574,7 +575,7 @@ pub fn renderThumb(self: *Self, page_number: u16, max_w: u32, max_h: u32) !types
     else
         0;
     const ctm = c.fz_pre_translate(c.fz_scale(zoom, zoom), -rb.ox + shift_pdf, -rb.oy);
-    self.runPageInto(page, ctm, pix);
+    try self.runPageInto(page, ctm, pix);
     if (self.config.general.colorize) {
         c.fz_tint_pixmap(self.ctx, pix, self.config.general.black, self.config.general.white);
     }
@@ -751,7 +752,7 @@ pub fn getPageBound(self: *Self, page_number: u16) PageBound {
     const page = c.fz_load_page_z(self.ctx, self.doc, @as(c_int, @intCast(page_number))) orelse
         return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
     defer c.fz_drop_page(self.ctx, page);
-    const b = c.fz_bound_page(self.ctx, page);
+    const b = c.fz_bound_page_z(self.ctx, page);
     return .{ .x0 = b.x0, .y0 = b.y0, .x1 = b.x1, .y1 = b.y1 };
 }
 

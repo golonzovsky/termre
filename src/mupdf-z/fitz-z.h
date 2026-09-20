@@ -86,3 +86,9 @@ int fz_export_cropped_z(fz_context *ctx, const char *src_path, const char *dst_p
 // memory object `name` for kitty t=s transfer; the terminal unlinks it after
 // reading. Returns 1 on success.
 int fz_pixmap_to_shm_z(fz_context *ctx, fz_pixmap *pix, const char *name);
+
+// Exception-safe versions of raw fitz calls: an uncaught fz_throw would end
+// the process. NULL / 0 / an empty rect on failure.
+fz_pixmap *fz_new_pixmap_rgb_z(fz_context *ctx, fz_irect bbox);
+int fz_run_page_into_z(fz_context *ctx, fz_page *page, fz_matrix ctm, fz_pixmap *pix);
+fz_rect fz_bound_page_z(fz_context *ctx, fz_page *page);

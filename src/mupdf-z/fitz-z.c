@@ -625,3 +625,32 @@ int fz_pixmap_to_shm_z(fz_context *ctx, fz_pixmap *pix, const char *name) {
   munmap(dst, size);
   return 1;
 }
+
+fz_pixmap *fz_new_pixmap_rgb_z(fz_context *ctx, fz_irect bbox) {
+  fz_pixmap *pix = NULL;
+  fz_try(ctx) { pix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), bbox, NULL, 0); }
+  fz_catch(ctx) {}
+  return pix;
+}
+
+int fz_run_page_into_z(fz_context *ctx, fz_page *page, fz_matrix ctm, fz_pixmap *pix) {
+  fz_device *dev = NULL;
+  int ok = 1;
+  fz_var(dev);
+  fz_var(ok);
+  fz_try(ctx) {
+    dev = fz_new_draw_device(ctx, ctm, pix);
+    fz_run_page(ctx, page, dev, fz_identity, NULL);
+    fz_close_device(ctx, dev);
+  }
+  fz_catch(ctx) { ok = 0; }
+  fz_drop_device(ctx, dev);
+  return ok;
+}
+
+fz_rect fz_bound_page_z(fz_context *ctx, fz_page *page) {
+  fz_rect r = fz_empty_rect;
+  fz_try(ctx) { r = fz_bound_page(ctx, page); }
+  fz_catch(ctx) { r = fz_empty_rect; }
+  return r;
+}
