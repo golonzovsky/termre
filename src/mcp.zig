@@ -7,6 +7,9 @@ const PdfHandler = @import("handlers/PdfHandler.zig");
 const Positions = @import("services/Positions.zig");
 
 const protocol_version = "2024-11-05";
+// Workflow guidance for agents (Agent Skills format); installed next to the
+// MCP registration and printable with `re mcp skill`.
+const skill_md = @embedFile("skill/termre/SKILL.md");
 const max_result_bytes = 512 * 1024;
 
 const Book = struct {
@@ -88,10 +91,15 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
         try stdout.flush();
         return;
     }
+    if (std.mem.eql(u8, sub, "skill")) {
+        try stdout.writeAll(skill_md);
+        try stdout.flush();
+        return;
+    }
     if (std.mem.eql(u8, sub, "install") and args.len == 2) {
         const client = args[1];
         const argv: []const []const u8 = if (std.mem.eql(u8, client, "claude"))
-            &.{ "claude", "mcp", "add", "termre", "--", "re", "mcp" }
+            &.{ "claude", "mcp", "add", "--scope", "user", "termre", "--", "re", "mcp" }
         else if (std.mem.eql(u8, client, "codex"))
             &.{ "codex", "mcp", "add", "termre", "--", "re", "mcp" }
         else {
@@ -99,6 +107,38 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
             try stderr.flush();
             return;
         };
+        // Both clients discover skills at ~/.<client>/skills/<name>/SKILL.md.
+        if (init.environ_map.get("HOME")) |home| {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const dir = try std.fmt.bufPrint(&buf, "{s}/.{s}/skills/termre", .{ home, client });
+            const cwd = std.Io.Dir.cwd();
+            if (cwd.createDirPath(init.io, dir)) |_| {
+                var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try std.fmt.bufPrint(&pbuf, "{s}/SKILL.md", .{dir});
+                const existed = if (cwd.access(init.io, path, .{})) |_| true else |_| false;
+                if (cwd.createFile(init.io, path, .{})) |file| {
+                    defer file.close(init.io);
+                    var wbuf: [4096]u8 = undefined;
+                    var fw = file.writer(init.io, &wbuf);
+                    fw.interface.writeAll(skill_md) catch {};
+                    fw.interface.flush() catch {};
+                    try stdout.print("skill {s}: {s}\n", .{ if (existed) "updated" else "installed", path });
+                    try stdout.flush();
+                } else |err| try stderr.print("skill not installed ({s}); `re mcp skill` prints it\n", .{@errorName(err)});
+            } else |err| try stderr.print("skill not installed ({s}); `re mcp skill` prints it\n", .{@errorName(err)});
+            try stderr.flush();
+        }
+        // Already registered? Then don't let the client print a scary error.
+        const probe: []const []const u8 = &.{ argv[0], "mcp", "get", "termre" };
+        if (std.process.spawn(init.io, .{ .argv = probe, .environ_map = init.environ_map, .stdout = .ignore, .stderr = .ignore })) |p| {
+            var probe_child = p;
+            const term = probe_child.wait(init.io) catch null;
+            if (term != null and term.? == .exited and term.?.exited == 0) {
+                try stdout.print("MCP server termre already registered with {s}\n", .{client});
+                try stdout.flush();
+                return;
+            }
+        } else |_| {}
         var child = std.process.spawn(init.io, .{ .argv = argv, .environ_map = init.environ_map }) catch |err| {
             try stderr.print("re mcp install: cannot run `{s}` ({s}); is it on PATH? Alternatively add this to its MCP config:\n", .{ argv[0], @errorName(err) });
             try stderr.flush();
@@ -107,7 +147,7 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
         _ = try child.wait(init.io);
         return;
     }
-    try stderr.writeAll("usage: re mcp [install claude|codex | config]\n");
+    try stderr.writeAll("usage: re mcp [install claude|codex | config | skill]\n");
     try stderr.flush();
 }
 
@@ -298,6 +338,8 @@ const tools = [_]Tool{
     .{ .name = "search", .description = "Full-text search; returns page numbers with the matching line.", .params = &.{ book_param, .{ "query", "string", "Text to find", true }, .{ "limit", "integer", "Max hits (default 20)", false } } },
     .{ .name = "reading_state", .description = "Where the reader is: current page and chapter, whether it is open now, the last text selected with the mouse, marks and highlights (with text). Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
     .{ .name = "current_page", .description = "The page the reader is on right now — its markdown, plus the current mouse selection and highlights on that page. Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
+    .{ .name = "select_text", .description = "Select a passage in the running reader — ONLY when the user explicitly asks for it. `text` must occur verbatim on `page` (take it from search or get_pages). It is shown selected and scrolled into view; the user can highlight it with H and return with Ctrl-O. Nothing is copied to the clipboard. Same targeting rules as goto_page.", .params = &.{ book_param_opt, .{ "page", "integer", "Page the text is on (1-based)", true }, .{ "text", "string", "Exact text to select (a few words to a sentence)", true }, .{ "pid", "integer", "Instance to use, from list_books", false } } },
+    .{ .name = "goto_page", .description = "Move the running reader to a page (1-based) — ONLY when the user explicitly asks to be taken there; otherwise cite p.N. They can return with Ctrl-O. Needs the book to be open in termre. Omit `book` for the book being read right now; pass `pid` (from list_books) when the same book is open in several splits.", .params = &.{ book_param_opt, .{ "page", "integer", "Page to show (1-based)", true }, .{ "pid", "integer", "Instance to move, from list_books", false } } },
 };
 
 fn writeToolList(s: *std.json.Stringify) !void {
@@ -376,7 +418,47 @@ fn callTool(self: *Server, a: std.mem.Allocator, name: []const u8, args: std.jso
     if (std.mem.eql(u8, name, "search")) return searchText(self, a, book, args);
     if (std.mem.eql(u8, name, "reading_state")) return readingState(self, a, book);
     if (std.mem.eql(u8, name, "current_page")) return currentPage(self, a, book);
+    if (std.mem.eql(u8, name, "goto_page")) return gotoPage(self, a, book, args);
+    if (std.mem.eql(u8, name, "select_text")) return selectText(self, a, book, args);
     return error.UnknownTool;
+}
+
+fn instanceFor(self: *Server, a: std.mem.Allocator, book: *Book, want_pid: ?i64) !Positions.OpenEntry {
+    const open = Positions.listOpen(a, self.io, self.env);
+    var target: ?Positions.OpenEntry = null;
+    for (open) |o| {
+        if (!std.mem.eql(u8, o.path, book.path)) continue;
+        if (want_pid) |wp| {
+            if (o.pid == wp) target = o;
+        } else if (target == null or o.last_activity > target.?.last_activity) target = o;
+    }
+    return target orelse error.BookNotOpenInTermre;
+}
+
+fn selectText(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.ObjectMap) ![]const u8 {
+    const total: i64 = book.handler.getTotalPages();
+    const page = argInt(args, "page") orelse return error.PageRequired;
+    if (page < 1 or page > total) return error.PageOutOfRange;
+    const text = std.mem.trim(u8, argStr(args, "text") orelse "", &std.ascii.whitespace);
+    if (text.len == 0) return error.TextRequired;
+    // Check here so the reader never shows "not found".
+    var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
+    try book.handler.searchPage(a, @intCast(page - 1), try a.dupeZ(u8, text), &hits);
+    if (hits.items.len == 0) return error.TextNotFoundOnPage;
+    const t = try instanceFor(self, a, book, argInt(args, "pid"));
+    const cmd = try std.fmt.allocPrint(a, "select {d} {s}", .{ page, text });
+    if (!Positions.sendCommand(self.gpa, self.io, self.env, t.pid, cmd)) return error.CommandNotDelivered;
+    return std.fmt.allocPrint(a, "{s}selected on p.{d} of {s} (instance {d}); the reader shows it inverted — H highlights it, Ctrl-O goes back", .{ self.default_note, page, std.fs.path.basename(book.path), t.pid });
+}
+
+fn gotoPage(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.ObjectMap) ![]const u8 {
+    const total: i64 = book.handler.getTotalPages();
+    const page = argInt(args, "page") orelse return error.PageRequired;
+    if (page < 1 or page > total) return error.PageOutOfRange;
+    const t = try instanceFor(self, a, book, argInt(args, "pid"));
+    const cmd = try std.fmt.allocPrint(a, "goto {d}", .{page});
+    if (!Positions.sendCommand(self.gpa, self.io, self.env, t.pid, cmd)) return error.CommandNotDelivered;
+    return std.fmt.allocPrint(a, "{s}moved {s} (instance {d}) to p.{d}; the reader can go back with Ctrl-O", .{ self.default_note, std.fs.path.basename(book.path), t.pid, page });
 }
 
 const DefaultBook = union(enum) { path: []const u8, ambiguous: []const u8 };
@@ -492,7 +574,7 @@ fn listBooks(self: *Server, a: std.mem.Allocator) ![]const u8 {
             if (std.mem.eql(u8, r.path, o.path)) page = r.page;
         }
         const idle = now_s - o.last_activity;
-        try w.print("  {s}", .{o.path});
+        try w.print("  {s}  [instance {d}]", .{ o.path, o.pid });
         if (page) |pg| try w.print("  (p.{d})", .{pg + 1});
         if (idle < 600) {
             try w.print("  — ACTIVE, moved {s} ago\n", .{ago(a, idle)});

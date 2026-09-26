@@ -30,6 +30,8 @@ pub const Event = union(enum) {
     reload_done: usize,
     prerender_ready,
     sync: Sync.Result,
+    // From the command inbox (an agent's goto_page); owned, freed by the handler.
+    control: []u8,
 };
 
 pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid };
@@ -122,6 +124,8 @@ pub const Context = struct {
     // session; recorded so an opened-but-untouched record can't outrank it.
     view_touched: bool,
     saved_once: bool,
+    control_quit: std.atomic.Value(bool),
+    control_thread: ?std.Thread,
     started_at: i64,
     // Timestamp of the view state we last saved or adopted; a pulled view
     // only replaces ours when it is newer than this.
@@ -273,6 +277,8 @@ pub const Context = struct {
             .cache_gen = .init(0),
             .view_touched = initial_page != null,
             .saved_once = false,
+            .control_quit = .init(false),
+            .control_thread = null,
             .started_at = time.nowRealSeconds(),
             .last_view_ts = last_view_ts,
             .pending_op = null,
@@ -355,6 +361,49 @@ pub const Context = struct {
         self.last_view_ts = ts;
         self.positions.writePresence(self.doc_abs_path, self.started_at, pos.last_opened, self.last_sel_text, self.last_sel_page, self.last_sel_at);
         if (self.sync) |s| s.requestPush(false);
+    }
+
+    // Polls the command inbox so an agent can move the reader (goto_page).
+    fn controlWorker(self: *Self, loop: *vaxis.Loop(Event)) void {
+        while (!self.control_quit.load(.acquire)) {
+            if (self.positions.takeCommand(self.allocator)) |cmd| {
+                loop.postEvent(.{ .control = cmd }) catch self.allocator.free(cmd);
+            }
+            time.sleep(200 * std.time.ns_per_ms);
+        }
+    }
+
+    // `goto <page> [pdf_y]` and `select <page> <text…>` (1-based pages).
+    fn handleControl(self: *Self, cmd: []const u8) void {
+        var it = std.mem.tokenizeAny(u8, cmd, &std.ascii.whitespace);
+        const verb = it.next() orelse return;
+        const page_1 = std.fmt.parseInt(u32, it.next() orelse return, 10) catch return;
+        const total = self.document_handler.getTotalPages();
+        if (page_1 < 1 or page_1 > total) return;
+        const page: u16 = @intCast(page_1 - 1);
+        if (std.mem.eql(u8, verb, "select")) {
+            const text = std.mem.trim(u8, it.rest(), &std.ascii.whitespace);
+            if (text.len == 0) return;
+            if (self.selectTextOnPage(page, text)) {
+                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent selected on p.{d} — H to highlight, Ctrl-O to go back ", .{page_1}) catch null;
+            } else {
+                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: text not found on p.{d} ", .{page_1}) catch null;
+            }
+            self.reload_page = true;
+            return;
+        }
+        if (!std.mem.eql(u8, verb, "goto")) return;
+        const y: f32 = if (it.next()) |ys| (std.fmt.parseFloat(f32, ys) catch 0) else 0;
+        self.pushJump();
+        if (y > 0) {
+            self.gotoPagePdfY(page, y);
+        } else {
+            self.document_handler.setCurrentPage(page);
+            self.document_handler.setScrollX(0);
+            self.document_handler.setScrollY(0);
+            self.resetCurrentPage();
+        }
+        self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: p.{d} (Ctrl-O to go back) ", .{page_1}) catch null;
     }
 
     fn syncNotify(ctx: *anyopaque, r: Sync.Result) void {
@@ -507,6 +556,12 @@ pub const Context = struct {
         // joined while `loop` is still alive (it posts events to it).
         defer self.prerenderer.stop();
         if (self.sync) |s| s.start(syncNotify, @ptrCast(&loop)) catch {};
+        self.control_thread = std.Thread.spawn(.{}, controlWorker, .{ self, &loop }) catch null;
+        defer if (self.control_thread) |t| {
+            self.control_quit.store(true, .release);
+            t.join();
+            self.control_thread = null;
+        };
         // Same ordering need; the final save must land before the flush push.
         defer if (self.sync) |s| {
             if (!self.modeFlag("suppress_autosave")) self.saveState();
@@ -687,6 +742,10 @@ pub const Context = struct {
                 self.reload_page = true;
             },
             .sync => |r| self.onSync(r),
+            .control => |cmd| {
+                defer self.allocator.free(cmd);
+                self.handleControl(cmd);
+            },
             .file_changed => {
                 try self.document_handler.reloadDocument();
                 self.freeOutline();
@@ -1179,7 +1238,11 @@ pub const Context = struct {
         // Shown until the next keypress clears progress_text.
         const msg = std.fmt.bufPrint(&self.progress_buf, " copied {d} chars ", .{self.selection_text.len}) catch return;
         self.progress_text = msg;
-        // Publish for `re mcp` (current_page / reading_state show the selection).
+        self.publishSelection();
+    }
+
+    // For `re mcp` (current_page / reading_state show the selection).
+    fn publishSelection(self: *Self) void {
         if (self.allocator.dupe(u8, self.selection_text)) |copy| {
             if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
             self.last_sel_text = copy;
@@ -1187,6 +1250,30 @@ pub const Context = struct {
             self.last_sel_at = time.nowRealSeconds();
             self.positions.writePresence(self.doc_abs_path, self.started_at, self.last_sel_at, self.last_sel_text, self.last_sel_page, self.last_sel_at);
         } else |_| {}
+    }
+
+    // An agent's `select`: every occurrence of `text` on the page becomes the
+    // selection (shown inverted, `H` highlights it), the view scrolls there.
+    // Nothing goes to the clipboard.
+    fn selectTextOnPage(self: *Self, page: u16, text: []const u8) bool {
+        const needle = self.allocator.dupeZ(u8, text) catch return false;
+        defer self.allocator.free(needle);
+        var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
+        defer hits.deinit(self.allocator);
+        self.document_handler.searchPage(self.allocator, page, needle, &hits) catch return false;
+        if (hits.items.len == 0) return false;
+        self.clearSelection();
+        self.selection_hits.appendSlice(self.allocator, hits.items) catch return false;
+        self.selection_text = self.allocator.dupe(u8, text) catch &.{};
+        self.selection_anchor = null;
+        self.selection_dragged = false;
+        self.document_handler.setSelectionQuads(self.selection_hits.items);
+        self.dropSelectionEntry();
+        self.selection_gen +%= 1;
+        self.pushJump();
+        self.gotoPagePdfY(page, hits.items[0].y0);
+        self.publishSelection();
+        return true;
     }
 
     fn rebuildHighlightQuads(self: *Self) void {

@@ -46,10 +46,11 @@ Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.
 `re mcp` serves the reader over the Model Context Protocol (stdio), so an agent can work alongside a book:
 
 ```sh
-re mcp install claude      # or: re mcp install codex; `re mcp config` prints the snippet for other clients
+re mcp install claude      # or: re mcp install codex; registers the server and installs the termre skill
+                           # `re mcp config` / `re mcp skill` print both for other clients
 ```
 
-Tools: `list_books` (what's open and active right now, then recents), `get_outline`, `get_pages` / `get_chapter` (markdown with `<!-- page N -->` markers), `search` (full-text, page + line), `reading_state` and `current_page` (the page you're on, the text you just selected with the mouse, marks, highlights — no arguments needed while one book is open). Read-only; details in [docs/mcp.md](./docs/mcp.md).
+Tools: `list_books` (what's open and active right now, then recents), `get_outline`, `get_pages` / `get_chapter` (markdown with `<!-- page N -->` markers), `search` (full-text, page + line), `reading_state` and `current_page` (the page you're on, the text you just selected with the mouse, marks, highlights — no arguments needed while one book is open), `goto_page` / `select_text` (the agent moves your reader to the passage it's citing, or selects it so one `H` keeps it as a highlight; Ctrl-O brings you back). Details in [docs/mcp.md](./docs/mcp.md).
 
 ## Build
 

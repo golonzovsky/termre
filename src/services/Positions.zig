@@ -330,6 +330,32 @@ pub fn clearPresence(self: *Self) void {
     std.Io.Dir.cwd().deleteFile(self.io, file) catch {};
 }
 
+// Agent-to-reader command inbox: <state>/open/<pid>.cmd, one command per
+// file, consumed by the instance's control thread.
+pub fn controlPath(a: std.mem.Allocator, env: *std.process.Environ.Map, pid: i32) ?[]u8 {
+    const state = stateDir(a, env) orelse return null;
+    return std.fmt.allocPrint(a, "{s}/open/{d}.cmd", .{ state, pid }) catch null;
+}
+
+pub fn sendCommand(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, pid: i32, command: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = controlPath(a, env, pid) orelse return false;
+    return writeAtomic(a, io, path, command);
+}
+
+// The pending command for this process, if any (the file is removed).
+pub fn takeCommand(self: *Self, allocator: std.mem.Allocator) ?[]u8 {
+    if (self.books_dir.len == 0) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/../open/{d}.cmd", .{ self.books_dir, std.c.getpid() }) catch return null;
+    const cwd = std.Io.Dir.cwd();
+    const content = cwd.readFileAlloc(self.io, path, allocator, .limited(4096)) catch return null;
+    cwd.deleteFile(self.io, path) catch {};
+    return content;
+}
+
 // Live instances; stale files (dead pids) are removed on the way.
 pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []OpenEntry {
     var arena = std.heap.ArenaAllocator.init(allocator);

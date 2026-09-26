@@ -140,7 +140,16 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.len > 3 or (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))) {
-        try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n       re                   (pick from recently opened)\n       re mcp               (MCP server over stdio for agents)\n");
+        try stderr.writeAll(
+            \\Usage: re <path-to-pdf> [page]
+            \\       re                          pick from recently opened
+            \\       re mcp                      MCP server over stdio for agents
+            \\       re mcp install claude|codex register it there and install the termre skill
+            \\       re mcp config | skill       print the server snippet / the skill for other clients
+            \\       re state export [file]      all reading state as JSON (stdout by default)
+            \\       re state import <file|->    merge a state export into this machine
+            \\
+        );
         try stderr.flush();
         return;
     }
