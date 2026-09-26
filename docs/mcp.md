@@ -22,7 +22,7 @@ Any MCP client works the same way: run `re mcp` as the server command.
 | `reading_state` | `book` (optional) | Current page and chapter, whether it is open right now, the last text selected with the mouse (with page and age), last-read date and device, marks, highlights with their text |
 | `current_page` | `book` (optional) | The page the reader is on: header with chapter and open/active state, the current mouse selection, highlights on that page, then the page's markdown |
 
-`book` is an absolute path, `~/path`, or a case-insensitive substring of a recent book's path — `"Inference"` is enough. `reading_state` and `current_page` accept no `book` at all: they then use the book being read right now (the most recently active running `re`), so "what does the selected text mean?" needs no arguments.
+`book` is an absolute path, `~/path`, or a case-insensitive substring of a recent book's path — `"Inference"` is enough. `reading_state` and `current_page` accept no `book` at all: they then use the book being read right now — but only when that is unambiguous (exactly one running `re` moved in the last 10 minutes, or only one is open at all). With several books open the tool lists them and asks for `book` instead of guessing, and when it does default while other books sit idle it says so. So "what does the selected text mean?" needs no arguments while you're reading one book.
 
 ## Presence
 
