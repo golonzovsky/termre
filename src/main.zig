@@ -148,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
             \\       re mcp config | skill       print the server snippet / the skill for other clients
             \\       re state export [file]      all reading state as JSON (stdout by default)
             \\       re state import <file|->    merge a state export into this machine
+            \\       re state sync               pull/push reading state through the Sync backend
             \\
         );
         try stderr.flush();
@@ -166,7 +167,9 @@ pub fn main(init: std.process.Init) !void {
             if (Sync.storeFromConfig(init.gpa, init.io, init.environ_map, &config)) |store_val| {
                 var store = store_val;
                 defer store.deinit();
-                if (Positions.booksDirFor(arena, init.environ_map)) |books| {
+                if (store.manual()) {
+                    // git: nothing happens unless asked (`re state sync`).
+                } else if (Positions.booksDirFor(arena, init.environ_map)) |books| {
                     const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
                     Sync.pullAll(init.gpa, init.io, &store, books, device) catch |err| {
                         try stderr.print("sync: {s}\n", .{@errorName(err)});
@@ -237,6 +240,7 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     const usage =
         \\usage: re state export [file]     write all reading state as JSON (stdout by default)
         \\       re state import <file|->   merge a state export into this machine (`-` = stdin)
+        \\       re state sync              pull other devices' records and push this device's (Sync backend)
         \\
     ;
     var wants_help = args.len == 0;
@@ -265,6 +269,32 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
             _ = try Positions.exportAll(init.gpa, init.io, init.environ_map, stdout);
             try stdout.flush();
         }
+        try stderr.flush();
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "sync")) {
+        var config = Config.init(init.gpa, init.io, init.environ_map);
+        defer config.deinit();
+        var store = Sync.storeFromConfig(init.gpa, init.io, init.environ_map, &config) orelse {
+            try stderr.writeAll("re state sync: no Sync backend configured (see docs/config.md)\n");
+            try stderr.flush();
+            std.process.exit(2);
+        };
+        defer store.deinit();
+        const arena = init.arena.allocator();
+        const books = Positions.booksDirFor(arena, init.environ_map) orelse return;
+        const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
+        Sync.pullAll(init.gpa, init.io, &store, books, device) catch |err| {
+            try stderr.print("re state sync: pull failed ({s})\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const pushed = Sync.pushAll(init.gpa, init.io, &store, books, device) catch |err| {
+            try stderr.print("re state sync: push failed ({s})\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        try stderr.print("synced via {s}: pulled other devices' records, pushed {d} of this device's\n", .{ store.name(), pushed });
         try stderr.flush();
         return;
     }

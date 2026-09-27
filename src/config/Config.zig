@@ -217,9 +217,14 @@ pub const Cache = struct {
 };
 
 pub const Sync = struct {
-    // "none", "dir" (a synced folder) or "s3" (any S3-compatible store).
+    // "none", "dir" (a synced folder), "s3" (any S3-compatible store) or
+    // "git" (a folder inside a git repo; manual: `:sync` / `re state sync`).
     backend: []const u8 = "none",
     dir_path: []const u8 = "",
+    // A folder inside an existing repo (e.g. ~/dotfiles/termre); only it is
+    // ever staged/committed. Missing folder + git_remote => cloned there.
+    git_dir: []const u8 = "",
+    git_remote: []const u8 = "",
     s3_bucket: []const u8 = "",
     s3_region: []const u8 = "",
     // Host only; defaults to s3.<region>.amazonaws.com. R2: <account>.r2.cloudflarestorage.com

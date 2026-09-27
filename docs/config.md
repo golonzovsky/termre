@@ -92,6 +92,8 @@ Because termre provides sensible defaults, you only need to specify the options 
     "s3_prefix": "termre",
     "s3_access_key": "",
     "s3_secret_key": "",
+    "git_dir": "",
+    "git_remote": "",
     "push_debounce_s": 10
   }
 }
@@ -390,11 +392,15 @@ The `Cache` section controls the page rendering cache, which speeds up navigatio
 
 Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. With a backend configured, that record is uploaded while you read (debounced, and on quit) and other devices' records are downloaded when a book is opened; the picker (`re` with no arguments) fetches the whole index so books read elsewhere show up too, tagged with the device name. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). `:sync` forces a push/pull. The device name is minted once into `~/.local/state/termre/device`.
 
+The `git` backend never acts on its own — no pull at open, no push on page turns or quit. `:sync` in the reader and `re state sync` outside it are the only moments it touches git, so a dotfiles repo gets one "termre: reading state" commit per sync, not per page.
+
 Without a store, move state by hand: `re state export [file]` writes every record as one JSON document (stdout by default), and `re state import <file|->` merges it into the local records with the same rules sync uses — safe to re-run, never loses local work.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `backend` | String | `none`, `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, an SSHFS mount), or `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …) |
+| `backend` | String | `none`, `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, an SSHFS mount), `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …), or `git` (a folder inside a git repo, **manual only**) |
+| `git_dir` | String | Folder inside an existing repository, e.g. `~/dotfiles/termre`; only that folder is ever staged and committed (`git add -A -- .`, `git commit -- .`), pulls use `--rebase --autostash`, pushes go to the repo's remote. A missing folder is cloned from `git_remote` |
+| `git_remote` | String | Optional; used only when `git_dir` does not exist: the repo is cloned *as* `git_dir`, so records sit at that repo's root. For a folder inside a shared repo (dotfiles), clone the repo yourself and point `git_dir` at the folder — it is created if missing. All devices must use the same layout |
 | `dir_path` | String | Folder for the `dir` backend; `~/` is expanded |
 | `s3_bucket` | String | Bucket name |
 | `s3_region` | String | SigV4 region; empty → `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1` (R2: `auto`) |

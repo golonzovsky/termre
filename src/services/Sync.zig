@@ -64,6 +64,15 @@ pub fn storeFromConfig(allocator: std.mem.Allocator, io: std.Io, env: *std.proce
         }
         return .{ .dir = StoreMod.DirStore.init(io, root) };
     }
+    if (std.mem.eql(u8, s.backend, "git")) {
+        if (s.git_dir.len == 0) return null;
+        var dir = s.git_dir;
+        if (std.mem.startsWith(u8, dir, "~/")) {
+            const home = env.get("HOME") orelse return null;
+            dir = std.fmt.allocPrint(ca, "{s}/{s}", .{ home, dir[2..] }) catch return null;
+        }
+        return .{ .git = StoreMod.GitStore.init(allocator, io, env, std.mem.trimEnd(u8, dir, "/"), s.git_remote) };
+    }
     if (std.mem.eql(u8, s.backend, "s3")) {
         if (s.s3_bucket.len == 0) return null;
         const access = if (s.s3_access_key.len > 0) s.s3_access_key else (env.get("AWS_ACCESS_KEY_ID") orelse return null);
@@ -116,13 +125,17 @@ pub fn destroy(self: *Self) void {
 pub fn start(self: *Self, notify: Notify, ctx: *anyopaque) !void {
     self.notify = notify;
     self.notify_ctx = ctx;
-    self.want_pull.store(true, .release);
+    if (!self.store.manual()) self.want_pull.store(true, .release);
     const thread = try std.Thread.spawn(.{}, worker, .{self});
     thread.detach();
 }
 
 pub fn requestPull(self: *Self) void {
     self.want_pull.store(true, .release);
+}
+
+pub fn isManual(self: *Self) bool {
+    return self.store.manual();
 }
 
 pub fn requestPush(self: *Self, immediate: bool) void {
@@ -150,7 +163,10 @@ fn worker(self: *Self) void {
             self.report(self.pull());
         }
         if (self.want_push.load(.acquire)) {
-            const due = quitting or self.push_now.load(.acquire) or time.nowNs() - last_push >= self.debounce_ns;
+            const due = if (self.store.manual())
+                self.push_now.load(.acquire)
+            else
+                quitting or self.push_now.load(.acquire) or time.nowNs() - last_push >= self.debounce_ns;
             if (due) {
                 self.want_push.store(false, .release);
                 self.push_now.store(false, .release);
@@ -208,7 +224,30 @@ fn push(self: *Self) !Result {
     const data = std.Io.Dir.cwd().readFileAlloc(self.io, local_path, a, .limited(4 * 1024 * 1024)) catch return .pushed;
     const key = try std.fmt.allocPrint(a, "books/{s}/{s}.json", .{ self.book, self.device });
     try self.store.put(key, data);
+    try self.store.flush();
     return .pushed;
+}
+
+// Uploads this device's record of every book (`re state sync`).
+pub fn pushAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_dir: []const u8, device: []const u8) !usize {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    var root = cwd.openDir(io, books_dir, .{ .iterate = true }) catch return 0;
+    defer root.close(io);
+    var n: usize = 0;
+    var it = root.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const local_path = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ books_dir, entry.name, device });
+        const data = cwd.readFileAlloc(io, local_path, a, .limited(4 * 1024 * 1024)) catch continue;
+        const key = try std.fmt.allocPrint(a, "books/{s}/{s}.json", .{ entry.name, device });
+        try store.put(key, data);
+        n += 1;
+    }
+    try store.flush();
+    return n;
 }
 
 fn writeAtomic(a: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) !void {

@@ -459,7 +459,7 @@ pub const Context = struct {
             self.sync_manual = true;
             s.requestPull();
             s.requestPush(true);
-            self.progress_text = " syncing… ";
+            self.progress_text = if (s.isManual()) " syncing (git)… " else " syncing… ";
         } else {
             self.progress_text = " sync: not configured (Sync.backend) ";
         }

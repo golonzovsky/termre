@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const DirStore = @import("DirStore.zig");
 pub const S3Store = @import("S3Store.zig");
+pub const GitStore = @import("GitStore.zig");
 
 pub const Entry = struct {
     key: []const u8,
@@ -12,6 +13,7 @@ pub const Entry = struct {
 pub const Store = union(enum) {
     dir: DirStore,
     s3: S3Store,
+    git: GitStore,
 
     // Keys under `prefix` (which ends with '/'), allocated with `a`.
     pub fn list(self: *Store, a: std.mem.Allocator, prefix: []const u8) ![]Entry {
@@ -31,6 +33,24 @@ pub const Store = union(enum) {
         switch (self.*) {
             inline else => |*s| return s.put(key, data),
         }
+    }
+
+    // Commit/upload anything buffered by `put`; a no-op for stores that
+    // write through.
+    pub fn flush(self: *Store) !void {
+        switch (self.*) {
+            .git => |*g| try g.flush(),
+            else => {},
+        }
+    }
+
+    // Manual stores act only on explicit `:sync` / `re state sync`, never
+    // on page turns, open, or quit.
+    pub fn manual(self: *Store) bool {
+        return switch (self.*) {
+            .git => true,
+            else => false,
+        };
     }
 
     pub fn deinit(self: *Store) void {
