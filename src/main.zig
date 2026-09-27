@@ -10,6 +10,9 @@ const Sync = @import("services/Sync.zig");
 // don't leave the terminal broken with the trace hidden in the alt screen.
 pub const panic = vaxis.panic_handler;
 
+// Dependencies (vaxis, zig-yaml) log at debug level; keep the tty clean.
+pub const std_options: std.Options = .{ .log_level = .warn };
+
 // Types for build.zig.zon
 // For now metadata is only used in main.zig, but can move it to types.zig if needed eleswhere
 // This wont be necessary once https://github.com/ziglang/zig/pull/22907 is merged
@@ -29,6 +32,7 @@ const DependenciesType = struct {
     vaxis: DependencyType,
     fastb64z: DependencyType,
     fzwatch: PathDependencyType,
+    yaml: PathDependencyType,
 };
 
 const MetadataType = struct {
@@ -164,15 +168,14 @@ pub fn main(init: std.process.Init) !void {
         {
             var config = Config.init(init.gpa, init.io, init.environ_map);
             defer config.deinit();
-            if (Sync.storeFromConfig(init.gpa, init.io, init.environ_map, &config)) |store_val| {
-                var store = store_val;
-                defer store.deinit();
-                if (store.manual()) {
-                    // git: nothing happens unless asked (`re state sync`).
-                } else if (Positions.booksDirFor(arena, init.environ_map)) |books| {
-                    const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
-                    Sync.pullAll(init.gpa, init.io, &store, books, device) catch |err| {
-                        try stderr.print("sync: {s}\n", .{@errorName(err)});
+            const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
+            defer for (backends) |*b| b.store.deinit();
+            if (Positions.booksDirFor(arena, init.environ_map)) |books| {
+                const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
+                for (backends) |*b| {
+                    if (b.manual()) continue; // acts only on `re state sync`
+                    Sync.pullAll(init.gpa, init.io, &b.store, books, device) catch |err| {
+                        try stderr.print("sync ({s}): {s}\n", .{ b.name(), @errorName(err) });
                         try stderr.flush();
                     };
                 }
@@ -275,27 +278,32 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     if (std.mem.eql(u8, args[0], "sync")) {
         var config = Config.init(init.gpa, init.io, init.environ_map);
         defer config.deinit();
-        var store = Sync.storeFromConfig(init.gpa, init.io, init.environ_map, &config) orelse {
-            try stderr.writeAll("re state sync: no Sync backend configured (see docs/config.md)\n");
+        const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
+        defer for (backends) |*b| b.store.deinit();
+        if (backends.len == 0) {
+            try stderr.writeAll("re state sync: no Sync backends configured (see docs/config.md#sync)\n");
             try stderr.flush();
             std.process.exit(2);
-        };
-        defer store.deinit();
+        }
         const arena = init.arena.allocator();
         const books = Positions.booksDirFor(arena, init.environ_map) orelse return;
         const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
-        Sync.pullAll(init.gpa, init.io, &store, books, device) catch |err| {
-            try stderr.print("re state sync: pull failed ({s})\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        const pushed = Sync.pushAll(init.gpa, init.io, &store, books, device) catch |err| {
-            try stderr.print("re state sync: push failed ({s})\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        try stderr.print("synced via {s}: pulled other devices' records, pushed {d} of this device's\n", .{ store.name(), pushed });
+        var failed = false;
+        for (backends) |*b| {
+            Sync.pullAll(init.gpa, init.io, &b.store, books, device) catch |err| {
+                try stderr.print("{s}: pull failed ({s})\n", .{ b.name(), @errorName(err) });
+                failed = true;
+                continue;
+            };
+            const pushed = Sync.pushAll(init.gpa, init.io, &b.store, books, device) catch |err| {
+                try stderr.print("{s}: push failed ({s})\n", .{ b.name(), @errorName(err) });
+                failed = true;
+                continue;
+            };
+            try stderr.print("{s}: pulled other devices' records, pushed {d} of this device's\n", .{ b.name(), pushed });
+        }
         try stderr.flush();
+        if (failed) std.process.exit(1);
         return;
     }
     if (std.mem.eql(u8, args[0], "import") and args.len >= 2) {

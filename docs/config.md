@@ -5,98 +5,102 @@ On startup, termre looks for a configuration file in the following locations:
 **Primary**
 
 ```
-$XDG_CONFIG_HOME/termre/config.json
+$XDG_CONFIG_HOME/termre/config.yaml
 ```
 
 **Fallback**
 
 ```
-$HOME/.config/termre/config.json
-```
-
-**Legacy**
-
-```
-$HOME/.config/termre/config.json
+$HOME/.config/termre/config.yaml
 ```
 
 If no configuration file is found in any of these locations, termre creates an empty configuration file in the primary or fallback location.
+
+The file is YAML; keys are lowerCamelCase.
 
 ## Defaults
 
 Because termre provides sensible defaults, you only need to specify the options you wish to override. Below is an example configuration file that replicates the default settings. You can use this example as a starting point for your customizations:
 
-```json
-{
-  "KeyMap": {
-    "next": { "key": "n" },
-    "prev": { "key": "p" },
-    "scroll_up": { "key": "k" },
-    "scroll_down": { "key": "j" },
-    "scroll_left": { "key": "h" },
-    "scroll_right": { "key": "l" },
-    "zoom_in": { "key": "i" },
-    "zoom_out": { "key": "o" },
-    "width_mode": { "key": "w" },
-    "colorize": { "key": "z" },
-    "quit": { "key": "c", "modifiers": [ "ctrl" ] },
-    "full_screen": { "key": "f"},
-    "enter_command_mode": { "key": ":" },
-    "exit_command_mode": { "key": "escape" },
-    "execute_command": { "key": "enter" },
-    "history_back": { "key": "up" },
-    "history_forward": { "key": "down" }
-  },
-  "FileMonitor": {
-    "enabled": true,
-    "latency": 0.1,
-    "reload_indicator_duration": 1.0
-  },
-  "General": {
-    "colorize": false,
-    "white": "#000000",
-    "black": "#ffffff",
-    "size": 1.0,
-    "zoom_step": 1.25,
-    "zoom_min": 1.0,
-    "scroll_step": 100.0,
-    "retry_delay": 0.2,
-    "timeout": 5.0,
-    "detect_dpi": true,
-    "shm_transfer": true,
-    "dpi": 96.0,
-    "history": 1000
-  },
-  "StatusBar": {
-    "enabled": true,
-    "style": { "bg": "#000000", "fg": "#ffffff" },
-    "items": [
-      " ",
-      { "view": { "text": "VIS" }, "command": { "text": "CMD" } },
-      "   <path> ",
-      { "idle": { "text": " " }, "reload": { "text": "*" }, "watching": { "text": " " } },
-      "<separator><page>:<total_pages> "
-    ]
-  },
-  "Cache": {
-    "enabled": true,
-    "lru_size": 10,
-    "budget_mb": 200
-  },
-  "Sync": {
-    "backend": "none",
-    "dir_path": "",
-    "s3_bucket": "",
-    "s3_region": "",
-    "s3_endpoint": "",
-    "s3_prefix": "termre",
-    "s3_access_key": "",
-    "s3_secret_key": "",
-    "git_dir": "",
-    "git_remote": "",
-    "push_debounce_s": 10
-  }
-}
+```yaml
+keyMap:
+  next:
+    key: n
+  prev:
+    key: p
+  scrollUp:
+    key: k
+  scrollDown:
+    key: j
+  scrollLeft:
+    key: h
+  scrollRight:
+    key: l
+  zoomIn:
+    key: i
+  zoomOut:
+    key: o
+  widthMode:
+    key: w
+  colorize:
+    key: z
+  quit:
+    key: c
+    modifiers: [ctrl]
+  fullScreen:
+    key: f
+  enterCommandMode:
+    key: ":"
+  exitCommandMode:
+    key: escape
+  executeCommand:
+    key: enter
+  historyBack:
+    key: up
+  historyForward:
+    key: down
+fileMonitor:
+  enabled: true
+  latency: 0.1
+  reloadIndicatorDuration: 1.0
+general:
+  colorize: false
+  white: "#000000"
+  black: "#ffffff"
+  size: 1.0
+  zoomStep: 1.25
+  zoomMin: 1.0
+  scrollStep: 100.0
+  retryDelay: 0.2
+  timeout: 5.0
+  detectDpi: true
+  shmTransfer: true
+  dpi: 96.0
+  history: 1000
+statusBar:
+  enabled: true
+  style:
+    bg: "#000000"
+    fg: "#ffffff"
+  items:
+    - " "
+    - view:
+        text: VIS
+      command:
+        text: CMD
+    - "   <path> "
+    - idle:
+        text: " "
+      reload:
+        text: "*"
+      watching:
+        text: " "
+    - "<separator><page>:<total_pages> "
+cache:
+  enabled: true
+  lruSize: 10
+  budgetMb: 200
+sync: []
 ```
 
 The rest of this reference provides detailed explanations for each configuration section. 
@@ -126,27 +130,27 @@ The rest of this reference provides detailed explanations for each configuration
 
 ## Key Map
 
-The `KeyMap` section defines keybindings for various actions.
+The `keyMap` section defines keybindings for various actions.
 
 | Action | Description |
 | :--- | :--- |
 | `next` | Go to the next page |
 | `prev` | Go to the previous page |
-| `scroll_up` | Move the viewport up |
-| `scroll_down` | Move the viewport down |
-| `scroll_left` | Move the viewport left |
-| `scroll_right` | Move the viewport right |
-| `zoom_in` | Increase the zoom level |
-| `zoom_out` | Decrease the zoom level |
-| `width_mode` | Toggle between full-height or full-width mode |
+| `scrollUp` | Move the viewport up |
+| `scrollDown` | Move the viewport down |
+| `scrollLeft` | Move the viewport left |
+| `scrollRight` | Move the viewport right |
+| `zoomIn` | Increase the zoom level |
+| `zoomOut` | Decrease the zoom level |
+| `widthMode` | Toggle between full-height or full-width mode |
 | `colorize` | Toggle color replacement |
 | `quit` | Exit the program |
-| `full_screen` | Toggle full screen (i.e. hide status bar) |
-| `enter_command_mode` | Enter command mode |
-| `exit_command_mode` | Exit command mode |
-| `execute_command` | Execute the entered command |
-| `history_back` | Go back one command in history |
-| `history_forward` | Go forward one command in history |
+| `fullScreen` | Toggle full screen (i.e. hide status bar) |
+| `enterCommandMode` | Enter command mode |
+| `exitCommandMode` | Exit command mode |
+| `executeCommand` | Execute the entered command |
+| `historyBack` | Go back one command in history |
+| `historyForward` | Go forward one command in history |
 
 ### Keybindings
 
@@ -172,8 +176,8 @@ The `key` property can be set to either a single character (like `a`, `1`, or `:
 | `insert` | Insert key |
 | `home` | Home key |
 | `end` | End key |
-| `page_up` | Page Up key |
-| `page_down` | Page Down key |
+| `pageUp` | Page Up key |
+| `pageDown` | Page Down key |
 | `up` | Up arrow key |
 | `down` | Down arrow key |
 | `left` | Left arrow key |
@@ -195,26 +199,26 @@ The `modifiers` property can be set to an array that includes any combination of
 | `super` | Super (Windows or Command) key |
 | `hyper` | An advanced modifier key |
 | `meta` | Another advanced modifier key |
-| `caps_lock` | Caps Lock key |
-| `num_lock` | Num Lock key |
+| `capsLock` | Caps Lock key |
+| `numLock` | Num Lock key |
 
 ---
 
 ## File Monitor
 
-The `FileMonitor` section controls the automatic reloading feature, useful for live previews.
+The `fileMonitor` section controls the automatic reloading feature, useful for live previews.
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
 | `enabled` | Boolean | Enables file change detection and automatic reloading |
 | `latency` | Float (seconds) | The time interval between checking for changes |
-| `reload_indicator_duration` | Float (seconds) | How long the reload indicator remains visible (`0.0` disables it) |
+| `reloadIndicatorDuration` | Float (seconds) | How long the reload indicator remains visible (`0.0` disables it) |
 
 ---
 
 ## General
 
-The `General` section includes various display and timing settings.
+The `general` section includes various display and timing settings.
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
@@ -222,13 +226,13 @@ The `General` section includes various display and timing settings.
 | `white` | [Color](#color) | Replacement color for white |
 | `black` | [Color](#color) | Replacement color for black |
 | `size` | Float | Initial zoom level multiplier (`1.0` fits the full height) |
-| `zoom_step` | Float | Zoom multiplier per keystroke |
-| `zoom_min` | Float | Minimum zoom level allowed |
-| `scroll_step` | Float (pixels) | Distance the viewport moves per scroll keystroke |
-| `detect_dpi` | Boolean | Enables pixel-density detection so that 100% zoom = actual size |
-| `shm_transfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support (done automatically inside zellij) |
+| `zoomStep` | Float | Zoom multiplier per keystroke |
+| `zoomMin` | Float | Minimum zoom level allowed |
+| `scrollStep` | Float (pixels) | Distance the viewport moves per scroll keystroke |
+| `detectDpi` | Boolean | Enables pixel-density detection so that 100% zoom = actual size |
+| `shmTransfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support (done automatically inside zellij) |
 | `dpi` | Float | Pixel density to use if `detect_dpi` is false, or fallback if detection fails |
-| `retry_delay` | Float (seconds) | Delay before retrying to load a document or render a page |
+| `retryDelay` | Float (seconds) | Delay before retrying to load a document or render a page |
 | `timeout` | Float (seconds) | Maximum time to keep retrying before giving up on loading a document or rendering a page |
 | `history` | Integer | Maximum number of entries in command history |
 
@@ -260,19 +264,11 @@ $XDG_STATE_HOME/termre/history
 $HOME/.local/state/termre/history
 ```
 
-**Legacy**
-
-```
-$HOME/.config/termre/config.json_history
-```
->[!NOTE]
->The legacy location is only used if the [configuration file](#configuration) itself is located at `$HOME/.config/termre/config.json`.
-
 ---
 
 ## Status Bar
 
-The `StatusBar` section controls the information shown at the bottom of the window.
+The `statusBar` section controls the information shown at the bottom of the window.
 
 | Property | Type | Description |
 | :--- | :--- |  :--- |
@@ -291,7 +287,7 @@ A `style` object can include the following properties:
 | `ul` | [Color](#color) | Underline color |
 | `bold` | Boolean | Bold text |
 | `italic` | Boolean | Italic text |
-| `ul_style` | [Underline](#underline) | Underline style |
+| `ulStyle` | [Underline](#underline) | Underline style |
 
 >[!NOTE]
 >This reference provides the most commonly used style properties. The [complete list](https://github.com/rockorager/libvaxis/blob/main/src/Cell.zig) includes others, though support may vary by terminal.
@@ -339,8 +335,11 @@ Each styled item is an object containing:
 
 **Example:** Underline the file path with a single green line:
 
-```json
-{ "text": "<path>", "style": { "ul": "#00ff00", "ul_style": "single" } }
+```yaml
+text: <path>
+style:
+  ul: "#00ff00"
+  ulStyle: single
 ```
 >[!NOTE]
 >If no style is provided, a styled item behaves just like a plain item.
@@ -356,11 +355,17 @@ Mode-aware items switch their content based on the current mode. Each item must 
 
 **Example:** Display a bold red "VIS" in view mode and a bold blue "CMD" in command mode:
 
-```json
-{
-  "view": { "text": "VIS", "style": { "fg": "#ff0000", "bold": true } },
-  "command": { "text": "CMD", "style": { "fg": "#0000ff", "bold": true } }
-}
+```yaml
+view:
+  text: VIS
+  style:
+    fg: "#ff0000"
+    bold: true
+command:
+  text: CMD
+  style:
+    fg: "#0000ff"
+    bold: true
 ```
 
 #### Reload-aware Items
@@ -380,31 +385,48 @@ Reload-aware items switch their content based on the file monitor state and the 
 
 ## Cache
 
-The `Cache` section controls the page rendering cache, which speeds up navigation between recently viewed pages.
+The `cache` section controls the page rendering cache, which speeds up navigation between recently viewed pages.
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
 | `enabled` | Boolean | Enables caching |
-| `budget_mb` | Integer | Max decoded image bytes (MB) kept alive in the terminal; stays under terminal image-storage quotas so the visible page is never silently evicted |
-| `lru_size` | Integer | Maximum number of pages to store in the cache |
+| `budgetMb` | Integer | Max decoded image bytes (MB) kept alive in the terminal; stays under terminal image-storage quotas so the visible page is never silently evicted |
+| `lruSize` | Integer | Maximum number of pages to store in the cache |
 
 ## Sync
 
-Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. With a backend configured, that record is uploaded while you read (debounced, and on quit) and other devices' records are downloaded when a book is opened; the picker (`re` with no arguments) fetches the whole index so books read elsewhere show up too, tagged with the device name. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). `:sync` forces a push/pull. The device name is minted once into `~/.local/state/termre/device`.
+Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. `sync` is a list of backends; any number can be active at once, each with its own mode. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). The device name is minted once into `~/.local/state/termre/device`.
 
-The `git` backend never acts on its own — no pull at open, no push on page turns or quit. `:sync` in the reader and `re state sync` outside it are the only moments it touches git, so a dotfiles repo gets one "termre: reading state" commit per sync, not per page.
-
-Without a store, move state by hand: `re state export [file]` writes every record as one JSON document (stdout by default), and `re state import <file|->` merges it into the local records with the same rules sync uses — safe to re-run, never loses local work.
+```yaml
+sync:
+  - type: s3
+    mode: periodic                 # pull at open, push while reading (every `debounce`) and on quit
+    bucket: private
+    region: auto
+    endpoint: <account>.r2.cloudflarestorage.com
+    prefix: termre
+    accessKey: "..."            # empty -> AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    secretKey: "..."
+  - type: git
+    mode: manual                   # only `:sync` / `re state sync`
+    dir: ~/.local/state/termre/git
+    remote: git@github.com:you/termre-state.git
+```
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `backend` | String | `none`, `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, an SSHFS mount), `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …), or `git` (a folder inside a git repo, **manual only**) |
-| `git_dir` | String | Folder inside an existing repository, e.g. `~/dotfiles/termre`; only that folder is ever staged and committed (`git add -A -- .`, `git commit -- .`), pulls use `--rebase --autostash`, pushes go to the repo's remote. A missing folder is cloned from `git_remote` |
-| `git_remote` | String | Optional; used only when `git_dir` does not exist: the repo is cloned *as* `git_dir`, so records sit at that repo's root. For a folder inside a shared repo (dotfiles), clone the repo yourself and point `git_dir` at the folder — it is created if missing. All devices must use the same layout |
-| `dir_path` | String | Folder for the `dir` backend; `~/` is expanded |
-| `s3_bucket` | String | Bucket name |
-| `s3_region` | String | SigV4 region; empty → `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1` (R2: `auto`) |
-| `s3_endpoint` | String | Host only, empty → `s3.<region>.amazonaws.com`; R2: `<account>.r2.cloudflarestorage.com`, MinIO: `host:9000` |
-| `s3_prefix` | String | Key prefix inside the bucket |
-| `s3_access_key` / `s3_secret_key` | String | Empty → `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (`AWS_SESSION_TOKEN` is honored) from the environment |
-| `push_debounce_s` | Integer | Minimum seconds between uploads while reading |
+| `type` | String | `dir` (a folder — anything that syncs folders: Syncthing, iCloud Drive, rsync, SSHFS), `s3` (AWS S3, Cloudflare R2, Backblaze B2, MinIO, …) or `git` (a folder inside a git repo) |
+| `mode` | String | `manual`: only `:sync` in the reader or `re state sync`. `open-close`: pull other devices' records when a book opens, push this device's when it closes, nothing in between. `periodic`: `open-close` plus a push at most every `debounce` while reading. Default: `manual` for `git`, `periodic` otherwise; there is never a periodic *pull* |
+| `enabled` | Boolean | `false` parks an entry without deleting it |
+| `debounce` | Duration | Minimum time between automatic pushes: `10s`, `5m`, `3h`, `1d`; default `10s`, or `3h` for git |
+| `path` | String | `dir`: the folder; `~/` is expanded |
+| `bucket`, `region`, `endpoint`, `prefix` | String | `s3`: bucket; SigV4 region (empty → `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1`; R2: `auto`); host only, empty → `s3.<region>.amazonaws.com` (R2: `<account>.r2.cloudflarestorage.com`, MinIO: `host:9000`); key prefix (default `termre`) |
+| `accessKey`, `secretKey` | String | `s3`: empty → `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (`AWS_SESSION_TOKEN` is honored) from the environment |
+| `dir` | String | `git`: a folder inside a repository, e.g. `~/dotfiles/termre` — only that folder is ever staged and committed (`git add -A -- .`, `git commit -- .`), pulls are `--rebase --autostash`, pushes go to the repo's remote. A missing folder is created when its parent is already a work tree |
+| `remote` | String | `git`: used only when `dir` does not exist and is not inside a repo — the repo is cloned *as* `dir` (records at its root). For a folder inside a shared repo, clone the repo yourself. All devices must use the same layout |
+
+`:sync` forces a pull and push through every backend; `re state sync` does the same outside the reader for all books. The `re` picker pulls the index from automatic backends at startup so books read elsewhere show up. A git entry gets one "termre: reading state" commit per sync, not per page.
+
+Without a store, move state by hand: `re state export [file]` writes every record as one JSON document (stdout by default), and `re state import <file|->` merges it into the local records with the same rules sync uses — safe to re-run, never loses local work.
+
+

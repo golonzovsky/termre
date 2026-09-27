@@ -25,6 +25,7 @@ jobs:
 
       - run: zig build
       - run: zig test src/services/S3Store.zig
+      - run: zig test src/utilities/duration.zig
   lint:
     runs-on: ubuntu-latest
     steps:

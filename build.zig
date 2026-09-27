@@ -121,6 +121,7 @@ pub fn build(b: *std.Build) void {
         .vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize }),
         .fastb64z = b.dependency("fastb64z", .{ .target = target, .optimize = optimize }),
         .fzwatch = b.dependency("fzwatch", .{ .target = target, .optimize = optimize }),
+        .yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize }),
     };
 
     const fzwatch_mod = deps.fzwatch.module("fzwatch");
@@ -132,6 +133,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("fastb64z", deps.fastb64z.module("fastb64z"));
     exe_mod.addImport("vaxis", deps.vaxis.module("vaxis"));
     exe_mod.addImport("fzwatch", fzwatch_mod);
+    exe_mod.addImport("yaml", deps.yaml.module("yaml"));
 
     exe_mod.addAnonymousImport("metadata", .{ .root_source_file = b.path("build.zig.zon") });
 

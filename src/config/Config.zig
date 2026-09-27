@@ -1,5 +1,6 @@
 const Self = @This();
 const std = @import("std");
+const yaml = @import("yaml");
 const vaxis = @import("vaxis");
 
 pub const KeyMap = struct {
@@ -216,30 +217,49 @@ pub const Cache = struct {
     }
 };
 
-pub const Sync = struct {
-    // "none", "dir" (a synced folder), "s3" (any S3-compatible store) or
-    // "git" (a folder inside a git repo; manual: `:sync` / `re state sync`).
-    backend: []const u8 = "none",
-    dir_path: []const u8 = "",
-    // A folder inside an existing repo (e.g. ~/dotfiles/termre); only it is
-    // ever staged/committed. Missing folder + git_remote => cloned there.
-    git_dir: []const u8 = "",
-    git_remote: []const u8 = "",
-    s3_bucket: []const u8 = "",
-    s3_region: []const u8 = "",
-    // Host only; defaults to s3.<region>.amazonaws.com. R2: <account>.r2.cloudflarestorage.com
-    s3_endpoint: []const u8 = "",
-    s3_prefix: []const u8 = "termre",
-    // Empty: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) from the environment.
-    s3_access_key: []const u8 = "",
-    s3_secret_key: []const u8 = "",
-    // Seconds between uploads while reading; quit flushes immediately.
-    push_debounce_s: u16 = 10,
+// One sync backend. Several can be active at once; each has its own mode.
+pub const SyncEntry = struct {
+    // "dir" | "s3" | "git"
+    type: []const u8 = "",
+    // "manual": only `:sync` / `re state sync`. "open-close": pull at open,
+    // push at quit. "periodic": open-close plus debounced pushes while
+    // reading. Default: manual for git, periodic otherwise.
+    mode: []const u8 = "",
+    enabled: bool = true,
+    // Time between automatic pushes: "10s", "5m", "3h", "1d". Empty =
+    // default (10s; 3h for git).
+    debounce: []const u8 = "",
+    // dir
+    path: []const u8 = "",
+    // s3 (empty keys -> AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+    bucket: []const u8 = "",
+    region: []const u8 = "",
+    endpoint: []const u8 = "",
+    prefix: []const u8 = "termre",
+    access_key: []const u8 = "",
+    secret_key: []const u8 = "",
+    // git: a folder inside a repo (created if missing), or cloned from `remote`
+    dir: []const u8 = "",
+    remote: []const u8 = "",
 
-    pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) Sync {
-        return parseFields(Sync, val, allocator);
+    pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) SyncEntry {
+        return parseFields(SyncEntry, val, allocator);
     }
 };
+
+fn parseSync(val: std.json.Value, allocator: std.mem.Allocator) []const SyncEntry {
+    switch (val) {
+        .array => |arr| {
+            var list: std.ArrayList(SyncEntry) = .empty;
+            for (arr.items) |item| {
+                if (item != .object) continue;
+                list.append(allocator, SyncEntry.parse(item, allocator)) catch break;
+            }
+            return list.toOwnedSlice(allocator) catch &.{};
+        },
+        else => return &.{},
+    }
+}
 
 arena: std.heap.ArenaAllocator,
 
@@ -248,7 +268,7 @@ file_monitor: FileMonitor = .{},
 general: General = .{},
 status_bar: StatusBar = .{},
 cache: Cache = .{},
-sync: Sync = .{},
+sync: []const SyncEntry = &.{},
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) Self {
     var self = Self{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -256,28 +276,19 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
     const home = env.get("HOME") orelse return self;
 
-    var path: []u8 = "";
-    if (env.get("XDG_CONFIG_HOME")) |x| {
-        path = std.fmt.allocPrint(allocator, "{s}/termre/config.json", .{x}) catch return self;
-    } else path = std.fmt.allocPrint(allocator, "{s}/.config/termre/config.json", .{home}) catch return self;
-    defer allocator.free(path);
-
+    const dir = if (env.get("XDG_CONFIG_HOME")) |x|
+        std.fmt.allocPrint(allocator, "{s}/termre", .{x}) catch return self
+    else
+        std.fmt.allocPrint(allocator, "{s}/.config/termre", .{home}) catch return self;
+    defer allocator.free(dir);
     const cwd = std.Io.Dir.cwd();
-    var content: ?[]u8 = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch null;
+    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
+    defer allocator.free(cfg_path);
+    const content: ?[]u8 = cwd.readFileAlloc(io, cfg_path, allocator, .limited(1024 * 1024)) catch null;
     if (content == null) {
-        // Pre-rename fallback: read an existing fancy-cat config once; writes
-        // (the auto-created empty file) go to the termre path.
-        const legacy: ?[]u8 = if (env.get("XDG_CONFIG_HOME")) |x|
-            std.fmt.allocPrint(allocator, "{s}/fancy-cat/config.json", .{x}) catch null
-        else
-            std.fmt.allocPrint(allocator, "{s}/.config/fancy-cat/config.json", .{home}) catch null;
-        if (legacy) |lp| {
-            defer allocator.free(lp);
-            content = cwd.readFileAlloc(io, lp, allocator, .limited(1024 * 1024)) catch null;
-        }
-    }
-    if (content == null) {
-        if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch {};
+        cwd.createDirPath(io, dir) catch {};
+        const path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
+        defer allocator.free(path);
         const file = cwd.createFile(io, path, .{}) catch return self;
         file.close(io);
         return self;
@@ -286,16 +297,17 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
     if (content.?.len == 0) return self;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, arena_allocator, content.?, .{}) catch return self;
-    defer parsed.deinit();
-    if (parsed.value != .object) return self;
+    var root: std.json.Value = parseYaml(arena_allocator, content.?) catch return self;
+    if (root != .object) return self;
+    normalizeKeys(arena_allocator, &root.object) catch return self;
+    const parsed = struct { value: std.json.Value }{ .value = root };
 
-    if (parsed.value.object.get("KeyMap")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
-    if (parsed.value.object.get("FileMonitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);
-    if (parsed.value.object.get("General")) |general| self.general = General.parse(general, arena_allocator);
-    if (parsed.value.object.get("StatusBar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
-    if (parsed.value.object.get("Cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
-    if (parsed.value.object.get("Sync")) |sync| self.sync = Sync.parse(sync, arena_allocator);
+    if (parsed.value.object.get("key_map")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
+    if (parsed.value.object.get("file_monitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);
+    if (parsed.value.object.get("general")) |general| self.general = General.parse(general, arena_allocator);
+    if (parsed.value.object.get("status_bar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
+    if (parsed.value.object.get("cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
+    if (parsed.value.object.get("sync")) |sync| self.sync = parseSync(sync, arena_allocator);
 
     return self;
 }
@@ -343,6 +355,96 @@ fn parseType(comptime T: type, obj: std.json.ObjectMap, key: []const u8, allocat
 }
 
 // Fills every field of T from the JSON object, keeping the default on miss/mismatch.
+// zig-yaml (e5cf8ac) folds a trailing `# comment` into the value before it;
+// drop such comments (outside quotes) before parsing.
+fn stripTrailingComments(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        var quote: u8 = 0;
+        var cut: usize = line.len;
+        for (line, 0..) |ch, i| {
+            if (quote != 0) {
+                if (ch == quote) quote = 0;
+            } else if (ch == '"' or ch == '\'') {
+                quote = ch;
+            } else if (ch == '#' and i > 0 and (line[i - 1] == ' ' or line[i - 1] == '\t')) {
+                cut = i;
+                break;
+            }
+        }
+        try out.appendSlice(arena, std.mem.trimEnd(u8, line[0..cut], " \t"));
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
+// zig-yaml gives scalars as text; the config code expects JSON-typed values.
+fn parseYaml(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const source = try stripTrailingComments(arena, raw);
+    var y = yaml.Yaml{ .source = source };
+    defer y.deinit(arena);
+    try y.load(arena);
+    if (y.docs.items.len == 0) return .null;
+    return yamlToJson(arena, y.docs.items[0]);
+}
+
+fn yamlToJson(arena: std.mem.Allocator, v: yaml.Yaml.Value) !std.json.Value {
+    switch (v) {
+        .empty => return .null,
+        .boolean => |b| return .{ .bool = b },
+        .scalar => |s| {
+            if (std.mem.eql(u8, s, "null") or std.mem.eql(u8, s, "~")) return .null;
+            if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .integer = i } else |_| {}
+            if (s.len > 0 and (std.ascii.isDigit(s[0]) or s[0] == '-' or s[0] == '.')) {
+                if (std.fmt.parseFloat(f64, s)) |f| return .{ .float = f } else |_| {}
+            }
+            return .{ .string = try arena.dupe(u8, s) };
+        },
+        .list => |items| {
+            var arr = std.json.Array.init(arena);
+            for (items) |item| try arr.append(try yamlToJson(arena, item));
+            return .{ .array = arr };
+        },
+        .map => |map| {
+            var obj = std.json.ObjectMap.empty;
+            var it = map.iterator();
+            while (it.next()) |kv| try obj.put(arena, try arena.dupe(u8, kv.key_ptr.*), try yamlToJson(arena, kv.value_ptr.*));
+            return .{ .object = obj };
+        },
+    }
+}
+
+// Config keys are lowerCamelCase (`statusBar`, `zoomStep`); struct fields
+// are snake_case. Rewrite every object key once, recursively.
+fn normalizeKeys(arena: std.mem.Allocator, obj: *std.json.ObjectMap) !void {
+    var renamed = std.json.ObjectMap.empty;
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        var v = kv.value_ptr.*;
+        switch (v) {
+            .object => |*o| try normalizeKeys(arena, o),
+            .array => |arr| for (arr.items) |*item| {
+                if (item.* == .object) try normalizeKeys(arena, &item.object);
+            },
+            else => {},
+        }
+        try renamed.put(arena, try toSnake(arena, kv.key_ptr.*), v);
+    }
+    obj.* = renamed;
+}
+
+fn toSnake(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (key, 0..) |ch, i| {
+        if (std.ascii.isUpper(ch)) {
+            if (i > 0) try out.append(arena, '_');
+            try out.append(arena, std.ascii.toLower(ch));
+        } else try out.append(arena, ch);
+    }
+    return out.toOwnedSlice(arena);
+}
+
 fn parseFields(comptime T: type, val: std.json.Value, allocator: std.mem.Allocator) T {
     var result = T{};
     if (val != .object) return result;

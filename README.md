@@ -25,7 +25,7 @@ re                        # pick from recently opened
 re state export > s.json  # all reading state; `re state import s.json` merges it in elsewhere
 ```
 
-Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.md](./docs/commands.md); configuration (`~/.config/termre/config.json`) in [docs/config.md](./docs/config.md).
+Modal, vim-like: `?` lists every key and `:` command. Details in [docs/commands.md](./docs/commands.md); configuration (`~/.config/termre/config.yaml`) in [docs/config.md](./docs/config.md).
 
 ## Features
 

@@ -459,9 +459,9 @@ pub const Context = struct {
             self.sync_manual = true;
             s.requestPull();
             s.requestPush(true);
-            self.progress_text = if (s.isManual()) " syncing (git)… " else " syncing… ";
+            self.progress_text = if (s.allManual()) " syncing (manual backends)… " else " syncing… ";
         } else {
-            self.progress_text = " sync: not configured (Sync.backend) ";
+            self.progress_text = " sync: not configured (see docs/config.md#sync) ";
         }
     }
 
@@ -2190,8 +2190,9 @@ fn applyView(dh: *PdfHandler, config: *Config, pos: Positions.Position, apply_po
 
 fn makeSync(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, config: *Config, positions: *Positions) ?*Sync {
     if (positions.booksDir().len == 0) return null;
-    const store = Sync.storeFromConfig(allocator, io, env, config) orelse return null;
-    return Sync.create(allocator, io, store, positions.booksDir(), positions.bookName(), positions.deviceName(), config.sync.push_debounce_s) catch null;
+    const backends = Sync.backendsFromConfig(allocator, io, env, config);
+    if (backends.len == 0) return null;
+    return Sync.create(allocator, io, backends, positions.booksDir(), positions.bookName(), positions.deviceName()) catch null;
 }
 
 fn marginsBits(dh: *PdfHandler) u64 {
