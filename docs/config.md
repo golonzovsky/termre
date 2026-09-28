@@ -16,7 +16,12 @@ $HOME/.config/termre/config.yaml
 
 If no configuration file is found in any of these locations, termre creates an empty configuration file in the primary or fallback location.
 
-The file is YAML; keys are lowerCamelCase.
+The file is YAML; keys are lowerCamelCase. On first run termre writes a commented template listing every section.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `downloadDir` | String | Where `re <url>` saves PDFs (arXiv `abs`/`html`/`pdf` links resolve to the PDF and are named `arxiv-<id>.pdf`; a URL is downloaded once). Default `<stateDir>/downloads` |
+| `stateDir` | String | Where reading state (per-book/device records, device name, presence) lives. Default `$XDG_STATE_HOME/termre`, else `~/.local/state/termre`; `~/` is expanded |
 
 ## Defaults
 

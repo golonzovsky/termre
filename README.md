@@ -21,6 +21,7 @@ Binaries for macOS arm64 and Linux x86_64 are on the [releases page](https://git
 
 ```sh
 re <path-to-pdf> [page]
+re https://arxiv.org/abs/2608.10257v2   # URLs are downloaded once (arXiv abs/html/pdf all work)
 re                        # pick from recently opened
 re state export > s.json  # all reading state; `re state import s.json` merges it in elsewhere
 ```

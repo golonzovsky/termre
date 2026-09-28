@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len > 3 or (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))) {
         try stderr.writeAll(
-            \\Usage: re <path-to-pdf> [page]
+            \\Usage: re <path-to-pdf | url> [page]   urls (incl. arxiv abs/html) are downloaded once
             \\       re                          pick from recently opened
             \\       re mcp                      MCP server over stdio for agents
             \\       re mcp install claude|codex register it there and install the termre skill
@@ -201,6 +201,13 @@ pub fn main(init: std.process.Init) !void {
         path = try arena.dupeZ(u8, recents[idx].path);
     } else {
         path = args[1];
+        if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
+            path = fetchRemote(init, path, stderr) catch |err| {
+                try stderr.print("re: cannot download {s} ({s})\n", .{ path, @errorName(err) });
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        }
         if (args.len == 3) initial_page = std.fmt.parseInt(u16, args[2], 10) catch {
             try stderr.print("re: `{s}` is not a page number (run `re --help` for subcommands)\n", .{args[2]});
             try stderr.flush();
@@ -329,4 +336,70 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     }
     try stderr.writeAll(usage);
     try stderr.flush();
+}
+
+// Downloads a PDF once into the library dir (`downloadDir`, default
+// <stateDir>/downloads) and returns its path. arXiv abs/html links map to
+// the PDF; the file is named after the arXiv id or the URL's last segment.
+fn fetchRemote(init: std.process.Init, url_in: []const u8, stderr: *std.Io.Writer) ![:0]const u8 {
+    const a = init.arena.allocator();
+    var url = url_in;
+    var name: []const u8 = "";
+    if (std.mem.indexOf(u8, url, "arxiv.org/")) |i| {
+        const rest = url[i + "arxiv.org/".len ..];
+        for ([_][]const u8{ "abs/", "html/", "pdf/" }) |kind| {
+            if (std.mem.startsWith(u8, rest, kind)) {
+                var id = rest[kind.len..];
+                if (std.mem.indexOfAny(u8, id, "?#")) |q| id = id[0..q];
+                id = std.mem.trimEnd(u8, id, "/");
+                if (std.mem.endsWith(u8, id, ".pdf")) id = id[0 .. id.len - 4];
+                url = try std.fmt.allocPrint(a, "https://arxiv.org/pdf/{s}", .{id});
+                name = try std.fmt.allocPrint(a, "arxiv-{s}.pdf", .{id});
+                break;
+            }
+        }
+    }
+    if (name.len == 0) {
+        var last = url;
+        if (std.mem.indexOfAny(u8, last, "?#")) |q| last = last[0..q];
+        last = std.mem.trimEnd(u8, last, "/");
+        if (std.mem.lastIndexOfScalar(u8, last, '/')) |s| last = last[s + 1 ..];
+        if (last.len == 0 or std.mem.eql(u8, last, "pdf")) last = try std.fmt.allocPrint(a, "{x}", .{std.hash.Wyhash.hash(0, url)});
+        name = if (std.mem.endsWith(u8, last, ".pdf")) last else try std.fmt.allocPrint(a, "{s}.pdf", .{last});
+    }
+    var config = Config.init(init.gpa, init.io, init.environ_map);
+    defer config.deinit();
+    const dir = try config.downloadDir(a, init.environ_map);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(init.io, dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0);
+    if (cwd.access(init.io, path, .{})) |_| return path else |_| {}
+
+    try stderr.print("downloading {s}\n", .{url});
+    try stderr.flush();
+    var client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
+    defer client.deinit();
+    var body: std.Io.Writer.Allocating = .init(init.gpa);
+    defer body.deinit();
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+        .extra_headers = &.{.{ .name = "user-agent", .value = "termre" }},
+    });
+    if (res.status != .ok) return error.HttpStatus;
+    const data = body.writer.buffered();
+    if (!std.mem.startsWith(u8, data, "%PDF")) return error.NotAPdf;
+    const tmp = try std.fmt.allocPrint(a, "{s}.part", .{path});
+    {
+        var file = try cwd.createFile(init.io, tmp, .{});
+        defer file.close(init.io);
+        var wbuf: [8192]u8 = undefined;
+        var fw = file.writer(init.io, &wbuf);
+        try fw.interface.writeAll(data);
+        try fw.interface.flush();
+    }
+    try std.Io.Dir.renameAbsolute(tmp, path, init.io);
+    try stderr.print("saved to {s}\n", .{path});
+    try stderr.flush();
+    return path;
 }

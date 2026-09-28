@@ -1,6 +1,7 @@
 const Self = @This();
 const std = @import("std");
 const yaml = @import("yaml");
+const Positions = @import("../services/Positions.zig");
 const vaxis = @import("vaxis");
 
 pub const KeyMap = struct {
@@ -261,7 +262,45 @@ fn parseSync(val: std.json.Value, allocator: std.mem.Allocator) []const SyncEntr
     }
 }
 
+// Written on first run so the file explains itself.
+const template =
+    \\# termre — https://github.com/golonzovsky/termre/blob/master/docs/config.md
+    \\# Every key is optional; these are the defaults.
+    \\
+    \\# Reading state (position, marks, highlights per book + device) and the
+    \\# device name live here. Default: $XDG_STATE_HOME/termre or ~/.local/state/termre
+    \\# stateDir: ~/.local/state/termre
+    \\# PDFs opened by URL (`re https://arxiv.org/abs/…`) are saved here.
+    \\# downloadDir: ~/.local/state/termre/downloads
+    \\
+    \\# Sync backends; any number, each with its own mode.
+    \\# sync:
+    \\#   - type: s3                  # AWS S3, Cloudflare R2, Backblaze B2, MinIO
+    \\#     mode: periodic            # pull at open, push while reading and on quit
+    \\#     bucket: my-books
+    \\#     region: auto
+    \\#     endpoint: <account>.r2.cloudflarestorage.com
+    \\#     accessKey: ""             # empty: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    \\#     secretKey: ""
+    \\#   - type: git                 # a folder in a repo (dotfiles) or a dedicated clone
+    \\#     mode: manual              # only :sync / re state sync
+    \\#     dir: ~/.local/state/termre/git
+    \\#     remote: git@github.com:you/termre-state.git
+    \\#   - type: dir                 # any synced folder (Syncthing, iCloud Drive, rsync)
+    \\#     path: ~/Sync/termre
+    \\
+    \\# general:
+    \\#   colorize: false
+    \\#   zoomStep: 1.1
+    \\
+;
+
 arena: std.heap.ArenaAllocator,
+
+// Where reading state lives; empty = $XDG_STATE_HOME/termre or ~/.local/state/termre.
+state_dir: []const u8 = "",
+// Where `re <url>` saves PDFs; empty = <stateDir>/downloads.
+download_dir: []const u8 = "",
 
 key_map: KeyMap = .{},
 file_monitor: FileMonitor = .{},
@@ -290,7 +329,11 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
         const path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
         defer allocator.free(path);
         const file = cwd.createFile(io, path, .{}) catch return self;
-        file.close(io);
+        defer file.close(io);
+        var wbuf: [4096]u8 = undefined;
+        var fw = file.writer(io, &wbuf);
+        fw.interface.writeAll(template) catch {};
+        fw.interface.flush() catch {};
         return self;
     }
     defer allocator.free(content.?);
@@ -308,12 +351,34 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     if (parsed.value.object.get("status_bar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
     if (parsed.value.object.get("cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
     if (parsed.value.object.get("sync")) |sync| self.sync = parseSync(sync, arena_allocator);
+    if (parsed.value.object.get("download_dir")) |dd| {
+        if (dd == .string) self.download_dir = arena_allocator.dupe(u8, dd.string) catch "";
+    }
+    if (parsed.value.object.get("state_dir")) |sd| {
+        if (sd == .string) self.state_dir = arena_allocator.dupe(u8, sd.string) catch "";
+    }
+    if (self.state_dir.len > 0) {
+        Positions.state_dir_override = if (std.mem.startsWith(u8, self.state_dir, "~/"))
+            std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ home, self.state_dir[2..] }) catch null
+        else
+            self.state_dir;
+    }
 
     return self;
 }
 
 pub fn deinit(self: *Self) void {
     self.arena.deinit();
+}
+
+pub fn downloadDir(self: *Self, a: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
+    const home = env.get("HOME") orelse "";
+    if (self.download_dir.len > 0) {
+        if (std.mem.startsWith(u8, self.download_dir, "~/")) return std.fmt.allocPrint(a, "{s}/{s}", .{ home, self.download_dir[2..] });
+        return self.download_dir;
+    }
+    const state = Positions.stateDirFor(a, env) orelse return error.NoStateDir;
+    return std.fmt.allocPrint(a, "{s}/downloads", .{state});
 }
 
 fn parseKeyBinding(obj: std.json.ObjectMap, name: []const u8, allocator: std.mem.Allocator, fallback: vaxis.Key) vaxis.Key {

@@ -735,7 +735,15 @@ fn safeKey(a: std.mem.Allocator, key: []const u8) ![]u8 {
     return out;
 }
 
+// Set from config (`stateDir`) before any state access.
+pub var state_dir_override: ?[]const u8 = null;
+
+pub fn stateDirFor(a: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
+    return stateDir(a, env);
+}
+
 fn stateDir(a: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
+    if (state_dir_override) |d| return a.dupe(u8, std.mem.trimEnd(u8, d, "/")) catch null;
     if (env.get("XDG_STATE_HOME")) |x| {
         return std.fmt.allocPrint(a, "{s}/termre", .{x}) catch null;
     }
