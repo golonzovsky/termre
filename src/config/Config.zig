@@ -358,10 +358,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
         if (sd == .string) self.state_dir = arena_allocator.dupe(u8, sd.string) catch "";
     }
     if (self.state_dir.len > 0) {
-        Positions.state_dir_override = if (std.mem.startsWith(u8, self.state_dir, "~/"))
-            std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ home, self.state_dir[2..] }) catch null
-        else
-            self.state_dir;
+        if (std.mem.startsWith(u8, self.state_dir, "~/")) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, self.state_dir[2..] })) |full| Positions.setStateDirOverride(full) else |_| {}
+        } else Positions.setStateDirOverride(self.state_dir);
     }
 
     return self;

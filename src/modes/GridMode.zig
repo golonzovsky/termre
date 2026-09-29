@@ -136,6 +136,13 @@ fn ensureVisible(self: *Self, animate: bool) void {
     self.animateScrollTo(target);
 }
 
+// On open (and re-render) the current page sits mid-screen, not at the edge.
+fn centerSelected(self: *Self) void {
+    const top: u32 = (@as(u32, self.selected) / self.cols) * self.cell_h;
+    const half: u32 = (@as(u32, self.grid_h) -| self.cell_h) / 2;
+    self.scroll_cells = @intCast(@min(top -| half, self.maxScroll()));
+}
+
 fn animateScrollTo(self: *Self, target: u16) void {
     const frames: usize = 10;
     const frame_ns: u64 = 11 * std.time.ns_per_ms;
@@ -292,7 +299,7 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
     self.scroll_cells = @min(self.scroll_cells, self.maxScroll());
     if (self.needs_snap) {
         self.needs_snap = false;
-        self.ensureVisible(false);
+        self.centerSelected();
     }
 
     _ = self.draw_arena.reset(.retain_capacity);
