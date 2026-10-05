@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 fn addMupdfStatic(mod: *std.Build.Module, b: *std.Build, prefix: []const u8) void {
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
@@ -42,11 +43,11 @@ fn patchMupdfContextH(b: *std.Build) void {
     const io = b.graph.io;
     const path = "deps/mupdf/include/mupdf/fitz/context.h";
     const a = b.allocator;
-    const src = b.build_root.handle.readFileAlloc(io, path, a, .limited(4 * 1024 * 1024)) catch return;
+    const src = b.root.root_dir.handle.readFileAlloc(io, path, a, .limited(4 * 1024 * 1024)) catch return;
     var out = std.mem.replaceOwned(u8, a, src, "++*refs;", "*refs += 1;") catch return;
     out = std.mem.replaceOwned(u8, a, out, "drop = --*refs == 0;", "*refs -= 1; drop = *refs == 0;") catch return;
     if (std.mem.eql(u8, out, src)) return;
-    var f = b.build_root.handle.createFile(io, path, .{}) catch return;
+    var f = b.root.root_dir.handle.createFile(io, path, .{}) catch return;
     defer f.close(io);
     var buf: [4096]u8 = undefined;
     var fw = f.writer(io, &buf);
@@ -59,11 +60,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     var useVendorMupdf = true;
-    const root = b.build_root.path orelse ".";
+    const root = b.root.root_dir.path orelse ".";
     const prefix = b.fmt("{s}/mupdf-out", .{root});
     const location = prefix;
 
-    b.build_root.handle.access(b.graph.io, "deps/mupdf/Makefile", .{}) catch |err| {
+    b.root.root_dir.handle.access(b.graph.io, "deps/mupdf/Makefile", .{}) catch |err| {
         if (err == error.FileNotFound) {
             useVendorMupdf = false;
         } else {
@@ -119,7 +120,6 @@ pub fn build(b: *std.Build) void {
 
     const deps = .{
         .vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize }),
-        .fastb64z = b.dependency("fastb64z", .{ .target = target, .optimize = optimize }),
         .fzwatch = b.dependency("fzwatch", .{ .target = target, .optimize = optimize }),
         .yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize }),
     };
@@ -130,7 +130,6 @@ pub fn build(b: *std.Build) void {
         fzwatch_mod.link_libc = true;
     }
 
-    exe_mod.addImport("fastb64z", deps.fastb64z.module("fastb64z"));
     exe_mod.addImport("vaxis", deps.vaxis.module("vaxis"));
     exe_mod.addImport("fzwatch", fzwatch_mod);
     exe_mod.addImport("yaml", deps.yaml.module("yaml"));
@@ -148,9 +147,25 @@ pub fn build(b: *std.Build) void {
     }
 
     exe_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/src/mupdf-z", .{root}) });
+
+    const c_mod: Translator = .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/mupdf-z/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_mod.addIncludePath(b.path("src/mupdf-z"));
+    if (useVendorMupdf) {
+        c_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{location}) });
+        c_mod.run.step.dependOn(&mupdf_build_step.step);
+    } else if (target.result.os.tag == .macos) {
+        c_mod.addIncludePath(.{ .cwd_relative = if (target.result.cpu.arch == .aarch64) "/opt/homebrew/include" else "/usr/local/include" });
+    } else {
+        c_mod.addIncludePath(.{ .cwd_relative = "/home/linuxbrew/.linuxbrew/include" });
+    }
+    exe_mod.addImport("c", c_mod.mod);
     exe_mod.addCSourceFile(.{ .file = .{ .cwd_relative = b.fmt("{s}/src/mupdf-z/fitz-z.c", .{root}) } });
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run the app").dependOn(&run_cmd.step);
 }

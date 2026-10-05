@@ -1,22 +1,22 @@
 .{
     .name = .termre,
-    .version = "0.12.2",
+    .version = "0.13.0",
     .fingerprint = 0xd14ba88ec3e4101e, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vaxis = .{
-            .url = "https://github.com/rockorager/libvaxis/archive/d569f8eb.tar.gz",
-            .hash = "vaxis-0.6.0-BWNV_D7wCQBc96pX3enYqw-uqOTDuzbvRbozo4qIGwnr",
-        },
-        .fastb64z = .{
-            .url = "https://github.com/freref/fastb64z/archive/3defc5d33162670c28e42af073cf9bc003017da6.tar.gz",
-            .hash = "fastb64z-1.0.0-x5LyQZ2gAAAYQrdQBKuqfNOY0beaxhunrksEtUOmIjhq",
+            .url = "https://github.com/rockorager/libvaxis/archive/6fd944a27f.tar.gz",
+            .hash = "vaxis-0.6.0-BWNV_MafDAAEzkVUvrW9NFUqnnMUoeHqrs2mecnD6D7w",
         },
         // Vendored: upstream fzwatch's build script predates Zig 0.16; this
         // copy carries the API fixes (see vendor/fzwatch, MIT).
         .fzwatch = .{ .path = "vendor/fzwatch" },
         .yaml = .{
             .path = "vendor/zig-yaml",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#02ff0c523fb92a38939b04d0145c4a9602a74d56",
+            .hash = "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
         },
     },
     .paths = .{

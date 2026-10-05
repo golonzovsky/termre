@@ -65,7 +65,7 @@ fn autoExpandToCurrentPage(self: *Self) void {
 
 fn rebuildVisible(self: *Self) !void {
     self.visible.clearRetainingCapacity();
-    var depth_open: [33]bool = .{false} ** 33;
+    var depth_open: [33]bool = @splat(false);
     for (self.entries, 0..) |e, i| {
         const d: usize = @min(e.depth, 32);
         var ok = true;

@@ -162,7 +162,7 @@ fn request(self: *Self, a: std.mem.Allocator, method: []const u8, path: []const 
         .extra_headers = extra[0..n],
         .response_writer = &aw.writer,
     });
-    return .{ .status = @intFromEnum(result.status), .body = aw.writer.buffered() };
+    return .{ .status = @backingInt(result.status), .body = aw.writer.buffered() };
 }
 
 fn objectKey(self: *Self, a: std.mem.Allocator, key: []const u8) ![]u8 {

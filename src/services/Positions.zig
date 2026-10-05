@@ -7,6 +7,7 @@
 // into the same directory, which is what makes it conflict-free.
 const Self = @This();
 const std = @import("std");
+const meta = @import("../utilities/meta.zig");
 const Config = @import("../config/Config.zig");
 const time = @import("../utilities/time.zig");
 
@@ -375,7 +376,7 @@ pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
         const e = std.json.parseFromSliceLeaky(OpenEntry, a, content, .{ .ignore_unknown_fields = true }) catch continue;
         // pid reuse guard: a reader that hasn't saved in a day isn't one.
         const fresh = time.nowRealSeconds() - e.last_activity < 24 * 3600;
-        const alive = fresh and e.pid > 0 and std.c.kill(e.pid, @enumFromInt(0)) == 0;
+        const alive = fresh and e.pid > 0 and std.c.kill(e.pid, @fromBackingInt(@intCast(0))) == 0;
         if (alive) {
             out.append(allocator, .{
                 .path = allocator.dupe(u8, e.path) catch continue,
@@ -655,7 +656,7 @@ fn hasProgress(v: View) bool {
 
 // Equality of what the reader sees; `touched` is bookkeeping, not view.
 fn viewEql(x: View, y: View) bool {
-    inline for (std.meta.fields(View)) |f| {
+    inline for (comptime meta.fields(View)) |f| {
         if (comptime std.mem.eql(u8, f.name, "touched")) continue;
         if (@field(x, f.name) != @field(y, f.name)) return false;
     }
@@ -786,13 +787,13 @@ fn deviceId(a: std.mem.Allocator, io: std.Io, state: []const u8) []const u8 {
 
 fn toView(pos: Position) View {
     var v = View{};
-    inline for (std.meta.fields(View)) |f| @field(v, f.name) = @field(pos, f.name);
+    inline for (comptime meta.fields(View)) |f| @field(v, f.name) = @field(pos, f.name);
     return v;
 }
 
 fn fromView(v: View) Position {
     var pos = Position{};
-    inline for (std.meta.fields(View)) |f| @field(pos, f.name) = @field(v, f.name);
+    inline for (comptime meta.fields(View)) |f| @field(pos, f.name) = @field(v, f.name);
     return pos;
 }
 
@@ -857,7 +858,7 @@ fn migrateLegacy(a: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
         if (kv.value_ptr.* != .object) continue;
         const obj = kv.value_ptr.object;
         var pos = Position{};
-        inline for (std.meta.fields(View)) |f| {
+        inline for (comptime meta.fields(View)) |f| {
             @field(pos, f.name) = jsonGet(f.type, obj, f.name, @field(pos, f.name));
         }
         const stamp = jsonGet(i64, obj, "last_opened", 0);

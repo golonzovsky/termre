@@ -1,4 +1,5 @@
 const std = @import("std");
+const meta = @import("meta.zig");
 const assert = std.debug.assert;
 const mem = std.mem;
 
@@ -37,7 +38,7 @@ pub fn nodeScope(tree: Tree, node: Node.Index) Node.Scope {
 /// Returns the requested data, as well as the new index which is at the start of the
 /// trailers for the object.
 pub fn extraData(tree: Tree, comptime T: type, index: Extra) struct { data: T, end: Extra } {
-    const fields = std.meta.fields(T);
+    const fields = comptime meta.fields(T);
     var i = @intFromEnum(index);
     var result: T = undefined;
     inline for (fields) |field| {

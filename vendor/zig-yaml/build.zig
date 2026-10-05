@@ -1,5 +1,5 @@
 // kubkon/zig-yaml e5cf8ac (0.3.0), sources only: upstream's build.zig pulls in
-// a spec-test helper that does not compile on Zig 0.16.
+// a spec-test helper that does not compile; ported to Zig 0.17 here.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {

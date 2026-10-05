@@ -41,9 +41,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(basic);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run-basic", "Run the example");
     run_step.dependOn(&run_cmd.step);
 
@@ -60,9 +58,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd_context = b.addRunArtifact(context);
     run_cmd_context.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd_context.addArgs(args);
-    }
+    run_cmd_context.addPassthruArgs();
     const run_step_context = b.step("run-context", "Run the example");
     run_step_context.dependOn(&run_cmd_context.step);
 

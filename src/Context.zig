@@ -162,7 +162,7 @@ pub const Context = struct {
         const doc_key = try document_handler.getDocumentKey(allocator);
         errdefer allocator.free(doc_key);
 
-        const doc_abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch try allocator.dupeZ(u8, path);
+        const doc_abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch try allocator.dupeSentinel(u8, path, 0);
         errdefer allocator.free(doc_abs_path);
 
         var positions = Positions.init(allocator, io, env, config, doc_key);
@@ -896,7 +896,7 @@ pub const Context = struct {
             .png_path => std.Io.Dir.cwd().deleteFile(self.io, enc.data) catch {},
             .shm_rgb => {
                 var name_buf: [64]u8 = undefined;
-                const name = std.fmt.bufPrintZ(&name_buf, "{s}", .{enc.data}) catch return;
+                const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{enc.data}, 0) catch return;
                 _ = std.c.shm_unlink(name.ptr);
             },
             .png_bytes => {},
@@ -954,7 +954,7 @@ pub const Context = struct {
         if (est_f > 0 and @as(usize, @intFromFloat(est_f)) * 3 > self.cache.budget_bytes) return;
 
         const window = 3;
-        var targets: [Prerenderer.slots]?u16 = .{null} ** Prerenderer.slots;
+        var targets: [Prerenderer.slots]?u16 = @splat(null);
         var n: usize = 0;
         const total = self.document_handler.getTotalPages();
 
@@ -1256,7 +1256,7 @@ pub const Context = struct {
     // selection (shown inverted, `H` highlights it), the view scrolls there.
     // Nothing goes to the clipboard.
     fn selectTextOnPage(self: *Self, page: u16, text: []const u8) bool {
-        const needle = self.allocator.dupeZ(u8, text) catch return false;
+        const needle = self.allocator.dupeSentinel(u8, text, 0) catch return false;
         defer self.allocator.free(needle);
         var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
         defer hits.deinit(self.allocator);
@@ -1544,13 +1544,13 @@ pub const Context = struct {
     pub fn exportCropped(self: *Self, arg: []const u8) void {
         var path_buf: [1024]u8 = undefined;
         const out: [:0]const u8 = blk: {
-            if (arg.len > 0) break :blk std.fmt.bufPrintZ(&path_buf, "{s}", .{arg}) catch {
+            if (arg.len > 0) break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}", .{arg}, 0) catch {
                 self.progress_text = " export: path too long ";
                 return;
             };
             const dir = std.fs.path.dirname(self.doc_abs_path) orelse ".";
             const stem = std.fs.path.stem(self.doc_abs_path);
-            break :blk std.fmt.bufPrintZ(&path_buf, "{s}/{s}-cropped.pdf", .{ dir, stem }) catch {
+            break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}-cropped.pdf", .{ dir, stem }, 0) catch {
                 self.progress_text = " export: path too long ";
                 return;
             };
@@ -1571,7 +1571,7 @@ pub const Context = struct {
     // on the same page but relies on the document's own boxes.
     pub fn overrideCropped(self: *Self) void {
         var tmp_buf: [1024]u8 = undefined;
-        const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.override.tmp", .{self.doc_abs_path}) catch {
+        const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}.override.tmp", .{self.doc_abs_path}, 0) catch {
             self.progress_text = " override: path too long ";
             return;
         };
@@ -1730,7 +1730,7 @@ pub const Context = struct {
             file = std.fmt.allocPrintSentinel(a, "{s}/{s}.md", .{ dir, stem }, 0) catch return;
         } else if (std.mem.endsWith(u8, target, ".md")) {
             dir = std.fs.path.dirname(target) orelse "/";
-            file = a.dupeZ(u8, target) catch return;
+            file = a.dupeSentinel(u8, target, 0) catch return;
         } else {
             dir = std.mem.trimEnd(u8, target, "/");
             file = std.fmt.allocPrintSentinel(a, "{s}/{s}.md", .{ dir, stem }, 0) catch return;
@@ -1986,7 +1986,7 @@ pub const Context = struct {
         self.clearSearch();
         if (needle.len == 0) return;
         self.search_needle = try self.allocator.dupe(u8, needle);
-        const needle_z = try self.allocator.dupeZ(u8, needle);
+        const needle_z = try self.allocator.dupeSentinel(u8, needle, 0);
         defer self.allocator.free(needle_z);
 
         const total = self.document_handler.getTotalPages();

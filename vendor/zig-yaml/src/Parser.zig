@@ -1,4 +1,5 @@
 const std = @import("std");
+const meta = @import("meta.zig");
 const assert = std.debug.assert;
 const log = std.log.scoped(.parser);
 const mem = std.mem;
@@ -28,9 +29,7 @@ string_bytes: std.ArrayListUnmanaged(u8) = .empty,
 errors: ErrorBundle.Wip,
 
 pub fn init(gpa: Allocator, source: []const u8) Allocator.Error!Parser {
-    var self: Parser = .{ .source = source, .errors = undefined };
-    try self.errors.init(gpa);
-    return self;
+    return .{ .source = source, .errors = try .init(gpa) };
 }
 
 pub fn deinit(self: *Parser, gpa: Allocator) void {
@@ -110,7 +109,7 @@ fn addString(self: *Parser, gpa: Allocator, string: []const u8) Allocator.Error!
 }
 
 fn addExtra(self: *Parser, gpa: Allocator, extra: anytype) Allocator.Error!u32 {
-    const fields = std.meta.fields(@TypeOf(extra));
+    const fields = comptime meta.fields(@TypeOf(extra));
     try self.extra.ensureUnusedCapacity(gpa, fields.len);
     return self.addExtraAssumeCapacity(extra);
 }
@@ -121,8 +120,8 @@ fn addExtraAssumeCapacity(self: *Parser, extra: anytype) u32 {
     return result;
 }
 
-fn payloadToExtraItems(data: anytype) [@typeInfo(@TypeOf(data)).@"struct".fields.len]u32 {
-    const fields = @typeInfo(@TypeOf(data)).@"struct".fields;
+fn payloadToExtraItems(data: anytype) [@typeInfo(@TypeOf(data)).@"struct".field_names.len]u32 {
+    const fields = comptime meta.fields(@TypeOf(data));
     var result: [fields.len]u32 = undefined;
     inline for (&result, fields) |*val, field| {
         val.* = switch (field.type) {

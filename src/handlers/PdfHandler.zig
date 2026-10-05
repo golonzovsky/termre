@@ -1,6 +1,5 @@
 const Self = @This();
 const std = @import("std");
-const fastb64z = @import("fastb64z");
 const Config = @import("../config/Config.zig");
 pub const types = @import("./types.zig");
 const Utilities = @import("../utilities/Utilities.zig");
@@ -8,11 +7,7 @@ const Markdown = @import("./Markdown.zig");
 
 const time = @import("../utilities/time.zig");
 
-const c = @cImport({
-    @cInclude("fitz-z.h");
-    @cInclude("mupdf/fitz.h");
-    @cInclude("mupdf/pdf.h");
-});
+const c = @import("c");
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -490,7 +485,7 @@ fn exportPixmap(self: *Self, pix: [*c]c.fz_pixmap, width: usize, height: usize, 
     if (self.transfer == .shm) {
         self.png_seq +%= 1;
         var name_buf: [32]u8 = undefined; // macOS shm names cap at 31 chars
-        const name = std.fmt.bufPrintZ(&name_buf, "/tre{x}-{x}", .{ self.session_tag, self.png_seq }) catch
+        const name = std.fmt.bufPrintSentinel(&name_buf, "/tre{x}-{x}", .{ self.session_tag, self.png_seq }, 0) catch
             return types.DocumentError.FailedToRenderPage;
         if (c.fz_pixmap_to_shm_z(self.ctx, pix, name.ptr) != 0) {
             return types.EncodedImage{
@@ -515,7 +510,7 @@ fn exportPixmap(self: *Self, pix: [*c]c.fz_pixmap, width: usize, height: usize, 
             );
             errdefer self.allocator.free(path);
             var pathz_buf: [1024]u8 = undefined;
-            const pathz = std.fmt.bufPrintZ(&pathz_buf, "{s}", .{path}) catch return types.DocumentError.FailedToRenderPage;
+            const pathz = std.fmt.bufPrintSentinel(&pathz_buf, "{s}", .{path}, 0) catch return types.DocumentError.FailedToRenderPage;
             if (c.fz_save_pixmap_png_z(self.ctx, pix, pathz.ptr) == 0) {
                 return types.DocumentError.FailedToRenderPage;
             }
@@ -1140,7 +1135,7 @@ pub fn writePagesText(
 
     // Image dir = dirname(path).
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
-    const image_dir = try self.allocator.dupeZ(u8, if (slash > 0) path[0..slash] else ".");
+    const image_dir = try self.allocator.dupeSentinel(u8, if (slash > 0) path[0..slash] else ".", 0);
     defer self.allocator.free(image_dir);
 
     const rc = c.fz_extract_pages_z(

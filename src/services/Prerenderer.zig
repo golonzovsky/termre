@@ -51,16 +51,16 @@ pub fn init() Self {
         .mutex = .init,
         .cond = .init,
         .quit = false,
-        .req_pages = .{null} ** slots,
+        .req_pages = @splat(null),
         .req_w = 0,
         .req_h = 0,
         .has_req = false,
-        .results = .{null} ** slots,
-        .thumb_reqs = .{null} ** thumb_slots,
+        .results = @splat(null),
+        .thumb_reqs = @splat(null),
         .thumb_w = 0,
         .thumb_h = 0,
         .has_thumb_req = false,
-        .thumb_results = .{null} ** thumb_slots,
+        .thumb_results = @splat(null),
     };
 }
 
@@ -144,7 +144,7 @@ pub fn claimThumbs(self: *Self) [thumb_slots]?*ThumbResult {
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
     const out = self.thumb_results;
-    self.thumb_results = .{null} ** thumb_slots;
+    self.thumb_results = @splat(null);
     return out;
 }
 
@@ -154,7 +154,7 @@ pub fn claim(self: *Self) [slots]?*Result {
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
     const out = self.results;
-    self.results = .{null} ** slots;
+    self.results = @splat(null);
     return out;
 }
 
@@ -182,11 +182,11 @@ fn run(self: *Self) void {
             self.mutex.unlock(io);
             return;
         }
-        const pages = if (self.has_req) self.req_pages else .{null} ** slots;
+        const pages: @TypeOf(self.req_pages) = if (self.has_req) self.req_pages else @splat(null);
         const w = self.req_w;
         const h = self.req_h;
         self.has_req = false;
-        const thumbs = if (self.has_thumb_req) self.thumb_reqs else .{null} ** thumb_slots;
+        const thumbs: @TypeOf(self.thumb_reqs) = if (self.has_thumb_req) self.thumb_reqs else @splat(null);
         const tw = self.thumb_w;
         const th = self.thumb_h;
         self.has_thumb_req = false;

@@ -309,7 +309,7 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
 
     const first_row: u32 = self.scroll_cells / self.cell_h;
     const last_row: u32 = (@as(u32, self.scroll_cells) + self.grid_h + self.cell_h - 1) / self.cell_h;
-    var want: [Prerenderer.thumb_slots]?u16 = .{null} ** Prerenderer.thumb_slots;
+    var want: [Prerenderer.thumb_slots]?u16 = @splat(null);
     var want_n: usize = 0;
 
     var row: u32 = first_row;

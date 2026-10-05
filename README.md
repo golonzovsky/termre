@@ -55,7 +55,7 @@ Tools: `list_books` (what's open and active right now, then recents), `get_outli
 
 ## Build
 
-Requires Zig `0.16.0` (and the Xcode command-line tools on macOS).
+Requires Zig `0.17.0` (and the Xcode command-line tools on macOS).
 
 ```sh
 git clone --recursive https://github.com/golonzovsky/termre.git

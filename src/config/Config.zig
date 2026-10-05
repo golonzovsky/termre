@@ -1,5 +1,6 @@
 const Self = @This();
 const std = @import("std");
+const meta = @import("../utilities/meta.zig");
 const yaml = @import("yaml");
 const Positions = @import("../services/Positions.zig");
 const vaxis = @import("vaxis");
@@ -51,7 +52,7 @@ pub const KeyMap = struct {
         var keymap = KeyMap{};
         if (val != .object) return keymap;
 
-        inline for (std.meta.fields(KeyMap)) |key| {
+        inline for (comptime meta.fields(KeyMap)) |key| {
             @field(keymap, key.name) = parseKeyBinding(val.object, key.name, allocator, @field(
                 keymap,
                 key.name,
@@ -101,7 +102,7 @@ pub const General = struct {
         var general = General{};
         if (val != .object) return general;
 
-        inline for (std.meta.fields(General)) |f| {
+        inline for (comptime meta.fields(General)) |f| {
             // white/black accept hex-string or {rgb} forms, not plain integers.
             const is_color = comptime std.mem.eql(u8, f.name, "white") or std.mem.eql(u8, f.name, "black");
             if (!is_color) {
@@ -513,7 +514,7 @@ fn toSnake(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
 fn parseFields(comptime T: type, val: std.json.Value, allocator: std.mem.Allocator) T {
     var result = T{};
     if (val != .object) return result;
-    inline for (std.meta.fields(T)) |f| {
+    inline for (comptime meta.fields(T)) |f| {
         @field(result, f.name) = parseType(f.type, val.object, f.name, allocator, @field(result, f.name));
     }
     return result;
@@ -528,7 +529,7 @@ fn parseStyle(obj: std.json.ObjectMap, allocator: std.mem.Allocator, fallback: v
     if (val != .object) return fallback;
 
     var style = fallback;
-    inline for (std.meta.fields(vaxis.Cell.Style)) |field| {
+    inline for (comptime meta.fields(vaxis.Cell.Style)) |field| {
         if (val.object.get(field.name)) |field_val| {
             if (comptime std.mem.eql(u8, field.name, "fg") or std.mem.eql(u8, field.name, "bg") or std.mem.eql(u8, field.name, "ul")) {
                 if (parseRGB(field_val, allocator)) |rgb| {

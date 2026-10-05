@@ -30,9 +30,9 @@ const PathDependencyType = struct {
 
 const DependenciesType = struct {
     vaxis: DependencyType,
-    fastb64z: DependencyType,
     fzwatch: PathDependencyType,
     yaml: PathDependencyType,
+    translate_c: DependencyType,
 };
 
 const MetadataType = struct {
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             return;
         }
-        path = try arena.dupeZ(u8, recents[idx].path);
+        path = try arena.dupeSentinel(u8, recents[idx].path, 0);
     } else {
         path = args[1];
         if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {

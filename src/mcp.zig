@@ -54,7 +54,7 @@ const Server = struct {
             path = "";
             const recents = Positions.listRecent(a, self.io, self.env);
             for (recents) |r| {
-                if (r.device.len == 0 and std.ascii.indexOfIgnoreCase(r.path, s) != null) {
+                if (r.device.len == 0 and std.ascii.findIgnoreCase(r.path, s) != null) {
                     path = r.path;
                     break;
                 }
@@ -65,7 +65,7 @@ const Server = struct {
             if (std.mem.eql(u8, b.path, path)) return b;
             self.closeBook();
         }
-        const owned = try self.gpa.dupeZ(u8, path);
+        const owned = try self.gpa.dupeSentinel(u8, path, 0);
         errdefer self.gpa.free(owned);
         var handler = try PdfHandler.init(self.gpa, self.io, owned, null, self.config);
         errdefer handler.deinit();
@@ -443,7 +443,7 @@ fn selectText(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.O
     if (text.len == 0) return error.TextRequired;
     // Check here so the reader never shows "not found".
     var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
-    try book.handler.searchPage(a, @intCast(page - 1), try a.dupeZ(u8, text), &hits);
+    try book.handler.searchPage(a, @intCast(page - 1), try a.dupeSentinel(u8, text, 0), &hits);
     if (hits.items.len == 0) return error.TextNotFoundOnPage;
     const t = try instanceFor(self, a, book, argInt(args, "pid"));
     const cmd = try std.fmt.allocPrint(a, "select {d} {s}", .{ page, text });
@@ -662,7 +662,7 @@ fn chapterMarkdown(self: *Server, a: std.mem.Allocator, book: *Book, args: std.j
     var chosen: ?usize = null;
     if (argStr(args, "title")) |needle| {
         for (entries, 0..) |e, i| {
-            if (std.ascii.indexOfIgnoreCase(e.title, needle) != null) {
+            if (std.ascii.findIgnoreCase(e.title, needle) != null) {
                 chosen = i;
                 break;
             }
@@ -693,7 +693,7 @@ fn searchText(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.O
     _ = self;
     const query = argStr(args, "query") orelse return error.QueryRequired;
     const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse 20, 1, 200));
-    const needle = try a.dupeZ(u8, query);
+    const needle = try a.dupeSentinel(u8, query, 0);
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;

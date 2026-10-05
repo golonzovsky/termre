@@ -234,12 +234,12 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
         if (avail == 0) continue;
 
         // Keep the match visible when the line is wider than the popup.
-        var match_pos = std.ascii.indexOfIgnoreCase(line, needle);
+        var match_pos = std.ascii.findIgnoreCase(line, needle);
         if (match_pos) |pos| {
             if (pos + needle.len > avail) {
                 const shift = pos + needle.len - avail;
                 line = line[@min(shift, line.len)..];
-                match_pos = std.ascii.indexOfIgnoreCase(line, needle);
+                match_pos = std.ascii.findIgnoreCase(line, needle);
             }
         }
         if (line.len > avail) line = line[0..avail];

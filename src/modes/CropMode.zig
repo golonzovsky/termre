@@ -58,7 +58,7 @@ pub fn init(context: *Context) Self {
         .entry_page = dh.getCurrentPageNumber(),
         .entry_pdf_y = 0,
         .drag = null,
-        .bound_cache = .{null} ** 8,
+        .bound_cache = @splat(null),
         .bound_next = 0,
         .status_buf = undefined,
     };
