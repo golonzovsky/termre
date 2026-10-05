@@ -46,7 +46,7 @@ pub const LinuxWatcher = struct {
 
     fn _addFile(self: *LinuxWatcher, path: []const u8) !void {
         var path_buf: [linux.PATH_MAX]u8 = undefined;
-        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+        const path_z = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{path}, 0) catch return error.NameTooLong;
         const rc = linux.inotify_add_watch(
             self.fd,
             path_z.ptr,
