@@ -238,7 +238,7 @@ const no_graphics_msg =
     \\kitty graphics protocol to draw pages.
     \\
     \\Terminals that support it: Ghostty (any), kitty >= 0.19, WezTerm >= 20220319,
-    \\Konsole >= 22.04. Multiplexers: zellij >= 0.45 (inside a supporting terminal),
+    \\Konsole >= 22.04. Multiplexers: Rex, zellij >= 0.45 (inside a supporting terminal),
     \\tmux >= 3.3 with `set -g allow-passthrough on`. Older zellij/tmux and
     \\Terminal.app, iTerm2, Alacritty, foot, VS Code's terminal do not support it.
     \\

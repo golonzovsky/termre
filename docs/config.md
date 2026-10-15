@@ -235,7 +235,7 @@ The `general` section includes various display and timing settings.
 | `zoomMin` | Float | Minimum zoom level allowed |
 | `scrollStep` | Float (pixels) | Distance the viewport moves per scroll keystroke |
 | `detectDpi` | Boolean | Enables pixel-density detection so that 100% zoom = actual size |
-| `shmTransfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support (done automatically inside zellij) |
+| `shmTransfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support (done automatically inside zellij; Rex streams the bytes directly) |
 | `dpi` | Float | Pixel density to use if `detect_dpi` is false, or fallback if detection fails |
 | `retryDelay` | Float (seconds) | Delay before retrying to load a document or render a page |
 | `timeout` | Float (seconds) | Maximum time to keep retrying before giving up on loading a document or rendering a page |

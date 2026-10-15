@@ -149,6 +149,9 @@ pub const Context = struct {
     // Images displaced from the cache; deleted terminal-side after the next
     // render (deleting before would blank their placements for a frame).
     stale_images: std.ArrayList(Cache.CachedImage),
+    // Strip mode: strips currently held by the terminal, oldest first.
+    resident: std.ArrayList(*Cache.Band),
+    resident_px: usize,
     last_save_sig: u64,
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
         const config = try allocator.create(Config);
@@ -212,7 +215,13 @@ pub const Context = struct {
         // our memory or filesystem, so fall back to streaming PNG bytes.
         // zellij (>= 0.45) implements the protocol itself and rejects t=s
         // ("shared memory transfer is not supported") but reads t=t files.
-        if (env.get("SSH_TTY") == null and env.get("SSH_CONNECTION") == null) {
+        // Rex (TERM_PROGRAM=rex) accepts only direct transfers of raw RGB:
+        // t=s and t=t answer "unsupported medium" and PNG "unsupported
+        // format". Stream zlib-deflated raw rows instead.
+        const in_rex = if (env.get("TERM_PROGRAM")) |tp| std.mem.eql(u8, tp, "rex") else false;
+        if (in_rex) {
+            document_handler.setTransfer(.direct_rgb, null);
+        } else if (env.get("SSH_TTY") == null and env.get("SSH_CONNECTION") == null) {
             if (config.general.shm_transfer and env.get("ZELLIJ") == null) {
                 document_handler.setTransfer(.shm, null);
             } else {
@@ -298,6 +307,8 @@ pub const Context = struct {
             .selection_gen = 0,
             .selection_render_ns = 0,
             .stale_images = .empty,
+            .resident = .empty,
+            .resident_px = 0,
             .last_save_sig = 0,
         };
     }
@@ -495,7 +506,10 @@ pub const Context = struct {
         self.selection_hits.deinit(self.allocator);
         if (self.selection_text.len > 0) self.allocator.free(self.selection_text);
         if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
+        self.clearCache();
+        for (self.stale_images.items) |img| self.freeCachedMemory(img);
         self.stale_images.deinit(self.allocator);
+        self.resident.deinit(self.allocator);
         self.allocator.free(self.doc_key);
         self.allocator.free(self.doc_abs_path);
         self.jump_back.deinit(self.allocator);
@@ -603,7 +617,7 @@ pub const Context = struct {
             // The new frame no longer places these; delete them terminal-side
             // so big renders don't accumulate in the terminal's image store.
             if (self.stale_images.items.len > 0) {
-                for (self.stale_images.items) |img| self.vx.freeImage(buffered, img.image.id);
+                for (self.stale_images.items) |img| self.freeCached(buffered, img);
                 try buffered.flush();
                 self.stale_images.clearRetainingCapacity();
             }
@@ -806,16 +820,12 @@ pub const Context = struct {
         );
         defer self.allocator.free(encoded_image.data);
 
-        const image = self.transmitEncoded(encoded_image) catch |err| {
+        var cached = self.transmitEncoded(encoded_image) catch |err| {
             self.deleteEncoded(encoded_image);
             return err;
         };
-
-        const cached = Cache.CachedImage{
-            .image = image,
-            .origin_x = encoded_image.origin_x,
-            .origin_y = encoded_image.origin_y,
-        };
+        cached.origin_x = encoded_image.origin_x;
+        cached.origin_y = encoded_image.origin_y;
         if (self.config.cache.enabled) {
             try self.cache.put(cache_key, cached, self.allocator, &self.stale_images);
         }
@@ -834,7 +844,7 @@ pub const Context = struct {
                 self.deleteEncoded(r.image);
                 continue;
             }
-            const img = self.transmitEncoded(r.image) catch {
+            const img = self.transmitThumb(r.image) catch {
                 self.deleteEncoded(r.image);
                 continue;
             };
@@ -850,17 +860,74 @@ pub const Context = struct {
     pub fn thumbImage(self: *Self, page: u16, max_w: u32, max_h: u32) !vaxis.Image {
         const enc = try self.document_handler.renderThumb(page, max_w, max_h);
         defer self.allocator.free(enc.data);
-        return self.transmitEncoded(enc) catch |err| {
+        return self.transmitThumb(enc) catch |err| {
             self.deleteEncoded(enc);
             return err;
         };
+    }
+
+    fn freeCached(self: *Self, writer: anytype, cached: Cache.CachedImage) void {
+        if (cached.bands.len == 0) {
+            self.vx.freeImage(writer, cached.image.id);
+        } else {
+            for (cached.bands) |*b| self.dropResident(writer, b);
+        }
+        self.freeCachedMemory(cached);
+    }
+
+    fn freeCachedMemory(self: *Self, cached: Cache.CachedImage) void {
+        if (cached.bands.len > 0) self.allocator.free(cached.bands);
+        if (cached.data.len > 0) self.allocator.free(cached.data);
+    }
+
+    fn dropResident(self: *Self, writer: anytype, band: *Cache.Band) void {
+        if (band.id == 0) return;
+        self.vx.freeImage(writer, band.id);
+        band.id = 0;
+        if (std.mem.indexOfScalar(*Cache.Band, self.resident.items, band)) |i| {
+            _ = self.resident.orderedRemove(i);
+            self.resident_px -= band.px;
+        }
+    }
+
+    // Sends a strip if the terminal doesn't hold it, evicting the least
+    // recently shown strips first to stay under the terminal's budget.
+    fn ensureResident(self: *Self, band: *Cache.Band, width: u16, data: []const u8) !void {
+        const writer = self.tty.writer();
+        if (band.id != 0) {
+            if (std.mem.indexOfScalar(*Cache.Band, self.resident.items, band)) |i| {
+                if (i + 1 != self.resident.items.len) {
+                    _ = self.resident.orderedRemove(i);
+                    self.resident.appendAssumeCapacity(band);
+                }
+            }
+            return;
+        }
+        while (self.resident.items.len > 0 and self.resident_px + band.px > PdfHandler.types.direct_rgb_budget_px) {
+            self.dropResident(writer, self.resident.items[0]);
+        }
+        try self.resident.ensureUnusedCapacity(self.allocator, 1);
+        band.id = try self.sendRgbz(data[band.off .. band.off + band.len], width, band.height);
+        self.resident.appendAssumeCapacity(band);
+        self.resident_px += band.px;
+    }
+
+    fn evictAllResident(self: *Self) void {
+        const writer = self.tty.writer();
+        while (self.resident.items.len > 0) self.dropResident(writer, self.resident.items[self.resident.items.len - 1]);
+        writer.flush() catch {};
     }
 
     // Sends a render to the terminal. Locally only a name crosses the tty:
     // a shared-memory object of raw RGB (kitty t=s; the terminal unlinks it)
     // or a PNG temp-file path (t=t; the terminal deletes it). The SSH
     // fallback streams the PNG bytes base64-chunked.
-    fn transmitEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
+    fn transmitEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) !Cache.CachedImage {
+        if (enc.kind == .rgbz_bytes) return self.transmitRgbz(enc);
+        return .{ .image = try self.transmitSingle(enc) };
+    }
+
+    fn transmitSingle(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
         switch (enc.kind) {
             .shm_rgb => return self.vx.transmitLocalImagePath(
                 self.allocator,
@@ -886,7 +953,68 @@ pub const Context = struct {
                 const encoded = std.base64.standard.Encoder.encode(b64, enc.data);
                 return self.vx.transmitPreEncodedImage(self.tty.writer(), encoded, enc.width, enc.height, .png);
             },
+            .rgbz_bytes => unreachable,
         }
+    }
+
+    // Strip mode: nothing crosses the tty yet. The strips stay compressed in
+    // the cache entry and go out as the view reaches them (ensureResident).
+    fn transmitRgbz(self: *Self, enc: PdfHandler.types.EncodedImage) !Cache.CachedImage {
+        const n = std.math.divCeil(usize, enc.height, @max(1, enc.band_h)) catch unreachable;
+        const bands = try self.allocator.alloc(Cache.Band, n);
+        errdefer self.allocator.free(bands);
+        var off: usize = 0;
+        var y: u32 = 0;
+        for (bands) |*b| {
+            if (off + 4 > enc.data.len) return error.CorruptStrips;
+            const len = std.mem.readInt(u32, enc.data[off..][0..4], .little);
+            off += 4;
+            const h: u16 = @intCast(@min(@as(u32, enc.band_h), @as(u32, enc.height) - y));
+            b.* = .{ .y = y, .height = h, .off = @intCast(off), .len = len, .px = @as(u32, enc.width) * h };
+            off += len;
+            y += h;
+        }
+        return .{
+            .image = .{ .id = 0, .width = enc.width, .height = enc.height },
+            .data = try self.allocator.dupe(u8, enc.data),
+            .bands = bands,
+        };
+    }
+
+    // Grid thumbnails: small enough for one strip; sent right away.
+    fn transmitThumb(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
+        if (enc.kind != .rgbz_bytes) return self.transmitSingle(enc);
+        if (enc.data.len < 4) return error.CorruptStrips;
+        const len = std.mem.readInt(u32, enc.data[0..4], .little);
+        const h: u16 = @min(enc.band_h, enc.height);
+        const id = try self.sendRgbz(enc.data[4 .. 4 + len], enc.width, h);
+        return .{ .id = id, .width = enc.width, .height = h };
+    }
+
+    // kitty direct transfer of zlib-deflated raw RGB (`f=24,o=z`), chunked
+    // like vaxis's own streamer; vaxis has no compression option.
+    fn sendRgbz(self: *Self, data: []const u8, width: u16, height: u16) !u32 {
+        if (!self.vx.caps.kitty_graphics) return error.NoGraphicsCapability;
+        const b64 = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(data.len));
+        defer self.allocator.free(b64);
+        const bytes = std.base64.standard.Encoder.encode(b64, data);
+        const id = self.vx.next_img_id;
+        self.vx.next_img_id += 1;
+        const tty = self.tty.writer();
+        const chunk: usize = 4096;
+        if (bytes.len <= chunk) {
+            try tty.print("\x1b_Gf=24,o=z,s={d},v={d},i={d};{s}\x1b\\", .{ width, height, id, bytes });
+        } else {
+            try tty.print("\x1b_Gf=24,o=z,s={d},v={d},i={d},m=1;{s}\x1b\\", .{ width, height, id, bytes[0..chunk] });
+            var n: usize = chunk;
+            while (n < bytes.len) : (n += chunk) {
+                const end: usize = @min(n + chunk, bytes.len);
+                const m: u2 = if (end == bytes.len) 0 else 1;
+                try tty.print("\x1b_Gm={d};{s}\x1b\\", .{ m, bytes[n..end] });
+            }
+        }
+        try tty.flush();
+        return id;
     }
 
     // For renders discarded without being transmitted — the terminal will
@@ -899,7 +1027,7 @@ pub const Context = struct {
                 const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{enc.data}, 0) catch return;
                 _ = std.c.shm_unlink(name.ptr);
             },
-            .png_bytes => {},
+            .png_bytes, .rgbz_bytes => {},
         }
     }
 
@@ -926,15 +1054,13 @@ pub const Context = struct {
                 self.deleteEncoded(r.image);
                 continue;
             }
-            const image = self.transmitEncoded(r.image) catch {
+            var cached = self.transmitEncoded(r.image) catch {
                 self.deleteEncoded(r.image);
                 continue;
             };
-            self.cache.put(r.key, .{
-                .image = image,
-                .origin_x = r.image.origin_x,
-                .origin_y = r.image.origin_y,
-            }, self.allocator, &self.stale_images) catch {};
+            cached.origin_x = r.image.origin_x;
+            cached.origin_y = r.image.origin_y;
+            self.cache.put(r.key, cached, self.allocator, &self.stale_images) catch {};
         }
     }
 
@@ -1001,7 +1127,11 @@ pub const Context = struct {
         const render_cells: u16 = col_cells;
         const render_w_pix: u32 = @as(u32, render_cells) * @as(u32, pix_per_col);
 
-        if (self.modeFlag("hides_page")) return;
+        if (self.modeFlag("hides_page")) {
+            // Grid thumbnails share the terminal's image budget with the strips.
+            self.evictAllResident();
+            return;
+        }
 
         var page_num = self.document_handler.getCurrentPageNumber();
         const total_pages = self.document_handler.getTotalPages();
@@ -1081,33 +1211,9 @@ pub const Context = struct {
                 const clip_w: u32 = if (need_clip_x) render_w_pix else img_w;
                 const clip_x: u32 = if (need_clip_x) @intCast(@max(0, scroll_x)) else 0;
 
-                // Slices are placed at native pixel size (no c=/r= scaling)
-                // and stacked pixel-exact: a page ending mid-row leaves the
-                // next page to start in that same row at a pixel offset.
-                // Scaling the sub-row remainder to fill the row stretched
-                // whatever text sat on the page bottom.
                 const dest_cols: u16 = @intCast(@max(1, std.math.divCeil(u32, clip_w, pix_per_col) catch 1));
-                const y_off: u16 = @intCast(y_pix_used / pix_per_row);
-                const y_sub: u16 = @intCast(y_pix_used % pix_per_row);
-                const dest_rows: u16 = @intCast(@max(1, std.math.divCeil(u32, y_sub + visible_h, pix_per_row) catch 1));
                 const x_off: u16 = if (col_cells > dest_cols) (col_cells - dest_cols) / 2 else 0;
-
-                const child = win.child(.{
-                    .x_off = col_base + x_off,
-                    .y_off = y_off,
-                    .width = dest_cols,
-                    .height = dest_rows,
-                });
-                try img.draw(child, .{
-                    .clip_region = .{
-                        .x = @intCast(clip_x),
-                        .y = @intCast(clip_top),
-                        .width = @intCast(clip_w),
-                        .height = @intCast(visible_h),
-                    },
-                    .pixel_offset = if (y_sub > 0) .{ .x = 0, .y = y_sub } else null,
-                    .z_index = if (self.modeFlag("page_behind_text")) -1 else null,
-                });
+                try self.placePageSlice(win, entry, col_base + x_off, dest_cols, y_pix_used, clip_x, clip_top, clip_w, visible_h, pix_per_row);
                 if (self.visible_pages_len < self.visible_pages.len) {
                     const vp_x_left: u32 = @as(u32, col_base + x_off) * @as(u32, pix_per_col);
                     self.visible_pages[self.visible_pages_len] = .{
@@ -1137,6 +1243,47 @@ pub const Context = struct {
         }
 
         self.requestPrerender(page_num, draw_page, render_w_pix, viewport_h_pix);
+    }
+
+    // A page's visible slice, or the parts of each strip that fall in it.
+    fn placePageSlice(self: *Self, win: vaxis.Window, entry: Cache.CachedImage, x_cell: u16, dest_cols: u16, y_pix: u32, clip_x: u32, clip_y: u32, clip_w: u32, clip_h: u32, pix_per_row: u16) !void {
+        if (entry.bands.len == 0) {
+            return self.placeSlice(win, entry.image, x_cell, dest_cols, y_pix, clip_x, clip_y, clip_w, clip_h, pix_per_row);
+        }
+        for (entry.bands) |*band| {
+            const top = @max(clip_y, band.y);
+            const bot = @min(clip_y + clip_h, band.y + band.height);
+            if (bot <= top) continue;
+            try self.ensureResident(band, entry.image.width, entry.data);
+            const strip: vaxis.Image = .{ .id = band.id, .width = entry.image.width, .height = band.height };
+            try self.placeSlice(win, strip, x_cell, dest_cols, y_pix + (top - clip_y), clip_x, top - band.y, clip_w, bot - top, pix_per_row);
+        }
+    }
+
+    // Slices are placed at native pixel size (no c=/r= scaling) and stacked
+    // pixel-exact: a slice ending mid-row leaves the next to start in that
+    // same row at a pixel offset. Scaling the sub-row remainder to fill the
+    // row stretched whatever text sat on the page bottom.
+    fn placeSlice(self: *Self, win: vaxis.Window, img: vaxis.Image, x_cell: u16, dest_cols: u16, y_pix: u32, clip_x: u32, clip_y: u32, clip_w: u32, clip_h: u32, pix_per_row: u16) !void {
+        const y_off: u16 = @intCast(y_pix / pix_per_row);
+        const y_sub: u16 = @intCast(y_pix % pix_per_row);
+        const dest_rows: u16 = @intCast(@max(1, std.math.divCeil(u32, y_sub + clip_h, pix_per_row) catch 1));
+        const child = win.child(.{
+            .x_off = x_cell,
+            .y_off = y_off,
+            .width = dest_cols,
+            .height = dest_rows,
+        });
+        try img.draw(child, .{
+            .clip_region = .{
+                .x = @intCast(clip_x),
+                .y = @intCast(clip_y),
+                .width = @intCast(clip_w),
+                .height = @intCast(clip_h),
+            },
+            .pixel_offset = if (y_sub > 0) .{ .x = 0, .y = y_sub } else null,
+            .z_index = if (self.modeFlag("page_behind_text")) -1 else null,
+        });
     }
 
     // Maps a mouse cell position to the page and raw PDF coordinates under it.

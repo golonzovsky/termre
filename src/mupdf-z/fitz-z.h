@@ -92,3 +92,6 @@ int fz_pixmap_to_shm_z(fz_context *ctx, fz_pixmap *pix, const char *name);
 fz_pixmap *fz_new_pixmap_rgb_z(fz_context *ctx, fz_irect bbox);
 int fz_run_page_into_z(fz_context *ctx, fz_page *page, fz_matrix ctm, fz_pixmap *pix);
 fz_rect fz_bound_page_z(fz_context *ctx, fz_page *page);
+
+// zlib-deflated packed RGB of pixmap rows y0..y1 (kitty f=24,o=z); malloc'd, NULL on failure.
+unsigned char *fz_pixmap_rgb_deflate_z(fz_context *ctx, fz_pixmap *pix, int y0, int y1, size_t *out_len);

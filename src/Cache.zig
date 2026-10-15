@@ -19,10 +19,18 @@ pub const Key = struct {
     // Manual margins, bit-packed: they change the raster.
     margins: u64,
 };
+// A strip of a page kept compressed app-side; id != 0 while it is resident
+// in the terminal (Context.ensureResident).
+pub const Band = struct { y: u32, height: u16, off: u32, len: u32, px: u32, id: u32 = 0 };
 pub const CachedImage = struct {
+    // Logical page image; with bands only its size is meaningful.
     image: vaxis.Image,
     origin_x: f32 = 0,
     origin_y: f32 = 0,
+    // Strip mode (Rex): compressed strips and where each sits in the page.
+    // Owned by the cache; freed with the entry (Context.freeCached).
+    data: []const u8 = &.{},
+    bands: []Band = &.{},
 };
 
 const Node = struct {

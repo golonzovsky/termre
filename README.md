@@ -5,7 +5,7 @@
   <a href="https://term.re">term.re</a>
 </p>
 
-A PDF reader for terminals with the Kitty graphics protocol (Ghostty, kitty, WezTerm, Konsole; zellij ≥ 0.45). It started as a fork of [fancy-cat](https://github.com/freref/fancy-cat) and grew into a reading tool: continuous scroll, per-book state, marks, highlights, cropping, print export.
+A PDF reader for terminals with the Kitty graphics protocol (Ghostty, kitty, WezTerm, Konsole; Rex and zellij ≥ 0.45 as multiplexers). It started as a fork of [fancy-cat](https://github.com/freref/fancy-cat) and grew into a reading tool: continuous scroll, per-book state, marks, highlights, cropping, print export.
 
 ## Install
 
