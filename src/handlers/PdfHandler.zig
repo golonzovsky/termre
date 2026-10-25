@@ -525,34 +525,6 @@ fn exportPixmap(self: *Self, pix: [*c]c.fz_pixmap, width: usize, height: usize, 
         }
     }
 
-    if (self.transfer == .direct_rgb) {
-        const max_h = @max(1, types.direct_rgb_strip_px / width);
-        const n = std.math.divCeil(usize, height, max_h) catch unreachable;
-        const band_h = std.math.divCeil(usize, height, n) catch unreachable;
-        var data: std.ArrayList(u8) = .empty;
-        errdefer data.deinit(self.allocator);
-        var y: usize = 0;
-        while (y < height) : (y += band_h) {
-            const y1 = @min(height, y + band_h);
-            var zlen: usize = 0;
-            const zptr = c.fz_pixmap_rgb_deflate_z(self.ctx, pix, @intCast(y), @intCast(y1), &zlen) orelse
-                return types.DocumentError.FailedToRenderPage;
-            defer std.c.free(zptr);
-            const len_le = std.mem.nativeToLittle(u32, @intCast(zlen));
-            try data.appendSlice(self.allocator, std.mem.asBytes(&len_le));
-            try data.appendSlice(self.allocator, zptr[0..zlen]);
-        }
-        return types.EncodedImage{
-            .data = try data.toOwnedSlice(self.allocator),
-            .kind = .rgbz_bytes,
-            .band_h = @intCast(band_h),
-            .width = @as(u16, @intCast(width)),
-            .height = @as(u16, @intCast(height)),
-            .origin_x = ox,
-            .origin_y = oy,
-        };
-    }
-
     var png_len: usize = 0;
     const png_ptr = c.fz_pixmap_png_z(self.ctx, pix, &png_len) orelse
         return types.DocumentError.FailedToRenderPage;

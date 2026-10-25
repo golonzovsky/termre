@@ -654,36 +654,3 @@ fz_rect fz_bound_page_z(fz_context *ctx, fz_page *page) {
   fz_catch(ctx) { r = fz_empty_rect; }
   return r;
 }
-
-// Packed RGB rows y0..y1 (stride compacted), zlib-deflated with mupdf's zlib:
-// what a kitty `f=24,o=z` direct transfer carries. malloc'd; caller frees.
-unsigned char *fz_pixmap_rgb_deflate_z(fz_context *ctx, fz_pixmap *pix, int y0, int y1, size_t *out_len) {
-  unsigned char *packed = NULL;
-  unsigned char *out = NULL;
-  *out_len = 0;
-  fz_try(ctx) {
-    int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
-    int n = fz_pixmap_components(ctx, pix);
-    ptrdiff_t stride = fz_pixmap_stride(ctx, pix);
-    unsigned char *samples = fz_pixmap_samples(ctx, pix);
-    if (n < 3) fz_throw(ctx, FZ_ERROR_GENERIC, "pixmap is not RGB");
-    if (y0 < 0 || y1 > h || y0 >= y1) fz_throw(ctx, FZ_ERROR_GENERIC, "bad row range");
-    h = y1 - y0;
-    size_t row = (size_t)w * 3;
-    packed = malloc(row * h);
-    if (!packed) fz_throw(ctx, FZ_ERROR_GENERIC, "oom");
-    for (int y = 0; y < h; y++) {
-      unsigned char *src = samples + (size_t)(y0 + y) * stride, *dst = packed + (size_t)y * row;
-      if (n == 3) memcpy(dst, src, row);
-      else for (int x = 0; x < w; x++, src += n, dst += 3) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; }
-    }
-    size_t clen = 0;
-    unsigned char *z = fz_new_deflated_data(ctx, &clen, packed, row * h, FZ_DEFLATE_DEFAULT);
-    out = malloc(clen);
-    if (out) { memcpy(out, z, clen); *out_len = clen; }
-    fz_free(ctx, z);
-  }
-  fz_always(ctx) { free(packed); }
-  fz_catch(ctx) { free(out); out = NULL; *out_len = 0; }
-  return out;
-}
