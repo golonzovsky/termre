@@ -60,9 +60,8 @@ pub fn finishSelection(ctx: *Context) void {
     // the final selection state.
     dropSelectionEntry(ctx);
     ctx.selection_gen +%= 1;
-    // Shown until the next keypress clears progress_text.
     const msg = std.fmt.bufPrint(&ctx.progress_buf, " copied {d} chars ", .{ctx.selection_text.len}) catch return;
-    ctx.progress_text = msg;
+    ctx.setProgress(msg);
     publishSelection(ctx);
 }
 
@@ -239,7 +238,7 @@ fn commitHighlight(ctx: *Context, page: u16, data: HighlightData, merged_any: bo
         ctx.highlights.items.len,
         if (merged_any) ", merged" else "",
     }) catch return;
-    ctx.progress_text = msg;
+    ctx.setProgress(msg);
 }
 
 pub fn deleteHighlight(ctx: *Context, idx: usize) void {

@@ -7,25 +7,25 @@ pub fn exportCropped(ctx: *Context, arg: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     const out: [:0]const u8 = blk: {
         if (arg.len > 0) break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}", .{arg}, 0) catch {
-            ctx.progress_text = " export: path too long ";
+            ctx.setProgress(" export: path too long ");
             return;
         };
         const dir = std.fs.path.dirname(ctx.doc_abs_path) orelse ".";
         const stem = std.fs.path.stem(ctx.doc_abs_path);
         break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}-cropped.pdf", .{ dir, stem }, 0) catch {
-            ctx.progress_text = " export: path too long ";
+            ctx.setProgress(" export: path too long ");
             return;
         };
     };
     ctx.document_handler.exportCropped(out, false) catch |err| {
-        ctx.progress_text = switch (err) {
+        ctx.setProgress(switch (err) {
             error.NothingToApply => " export: no crop or oddx set ",
             else => " export failed ",
-        };
+        });
         return;
     };
     const msg = std.fmt.bufPrint(&ctx.progress_buf, " exported {s} ", .{out}) catch " exported ";
-    ctx.progress_text = msg;
+    ctx.setProgress(msg);
 }
 
 // `:override` — bake the crop + oddx into the file itself (same /ID, so
@@ -34,21 +34,21 @@ pub fn exportCropped(ctx: *Context, arg: []const u8) void {
 pub fn overrideCropped(ctx: *Context) void {
     var tmp_buf: [1024]u8 = undefined;
     const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}.override.tmp", .{ctx.doc_abs_path}, 0) catch {
-        ctx.progress_text = " override: path too long ";
+        ctx.setProgress(" override: path too long ");
         return;
     };
     const page = ctx.document_handler.getCurrentPageNumber();
     // The save reads the source lazily, so it must go to a temp file and
     // rename over the original rather than write in place.
     ctx.document_handler.exportCropped(tmp, true) catch |err| {
-        ctx.progress_text = switch (err) {
+        ctx.setProgress(switch (err) {
             error.NothingToApply => " override: no crop or oddx set ",
             else => " override failed ",
-        };
+        });
         return;
     };
     std.Io.Dir.renameAbsolute(tmp, ctx.doc_abs_path, ctx.io) catch {
-        ctx.progress_text = " override: rename failed ";
+        ctx.setProgress(" override: rename failed ");
         return;
     };
     // The file carries the geometry now; drop it from the session state.
@@ -61,7 +61,7 @@ pub fn overrideCropped(ctx: *Context) void {
     ctx.clearCache();
     ctx.document_handler.setCurrentPage(page);
     ctx.saveState();
-    ctx.progress_text = " crop baked into file; saved state reset ";
+    ctx.setProgress(" crop baked into file; saved state reset ");
 }
 
 fn exportProgressCallback(ud: ?*anyopaque, current: c_int, total: c_int) callconv(.c) void {
@@ -118,13 +118,13 @@ pub fn exportMarkdown(ctx: *Context, arg: []const u8) void {
         file = std.fmt.allocPrintSentinel(a, "{s}/{s}.md", .{ dir, stem }, 0) catch return;
     }
     std.Io.Dir.cwd().createDirPath(ctx.io, dir) catch {
-        ctx.progress_text = std.fmt.bufPrint(&ctx.progress_buf, " cannot create {s} ", .{dir}) catch null;
+        ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " cannot create {s} ", .{dir}) catch null);
         return;
     };
     const total = ctx.document_handler.getTotalPages();
     ctx.document_handler.writePagesText(0, total, file, exportProgressCallback, ctx, markdownPageHook, ctx) catch |err| {
-        ctx.progress_text = std.fmt.bufPrint(&ctx.progress_buf, " export failed: {s} ", .{@errorName(err)}) catch null;
+        ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " export failed: {s} ", .{@errorName(err)}) catch null);
         return;
     };
-    ctx.progress_text = std.fmt.bufPrint(&ctx.progress_buf, " exported {d} pages: {s} ", .{ total, file }) catch null;
+    ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " exported {d} pages: {s} ", .{ total, file }) catch null);
 }

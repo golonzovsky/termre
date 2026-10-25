@@ -37,6 +37,8 @@ pub const Event = union(enum) {
     control: []u8,
 };
 
+const progress_ttl_ns: i64 = 3 * std.time.ns_per_s;
+
 pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid };
 pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode, grid: GridMode };
 pub const ReloadIndicatorState = enum { idle, reload, watching };
@@ -138,6 +140,7 @@ pub const Context = struct {
     pending_op: ?enum { set_mark, jump_mark, spread_digit },
     progress_text: ?[]const u8,
     progress_buf: [128]u8,
+    progress_since_ns: i64 = 0,
     search_hits: std.ArrayList(PdfHandler.SearchHit),
     search_needle: []u8,
     search_index: usize,
@@ -347,7 +350,7 @@ pub const Context = struct {
         pos_out.touched = self.view_touched;
         // Only a successful write counts as saved; a failed one is retried.
         const ts = self.positions.save(pos_out, self.marks.items, self.highlights.items, self.tombstones.items) catch |err| {
-            if (!self.save_warned) self.progress_text = std.fmt.bufPrint(&self.progress_buf, " state not saved: {s} ", .{@errorName(err)}) catch null;
+            if (!self.save_warned) self.setProgress(std.fmt.bufPrint(&self.progress_buf, " state not saved: {s} ", .{@errorName(err)}) catch null);
             self.save_warned = true;
             return;
         };
@@ -380,9 +383,9 @@ pub const Context = struct {
             const text = std.mem.trim(u8, it.rest(), &std.ascii.whitespace);
             if (text.len == 0) return;
             if (Selection.selectTextOnPage(self, page, text)) {
-                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent selected on p.{d} — H to highlight, Ctrl-O to go back ", .{page_1}) catch null;
+                self.setProgress(std.fmt.bufPrint(&self.progress_buf, " agent selected on p.{d} — H to highlight, Ctrl-O to go back ", .{page_1}) catch null);
             } else {
-                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: text not found on p.{d} ", .{page_1}) catch null;
+                self.setProgress(std.fmt.bufPrint(&self.progress_buf, " agent: text not found on p.{d} ", .{page_1}) catch null);
             }
             return;
         }
@@ -394,7 +397,7 @@ pub const Context = struct {
         } else {
             self.restorePosition(.{ .page = page, .scroll_y = 0, .scroll_x = 0 });
         }
-        self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: p.{d} (Ctrl-O to go back) ", .{page_1}) catch null;
+        self.setProgress(std.fmt.bufPrint(&self.progress_buf, " agent: p.{d} (Ctrl-O to go back) ", .{page_1}) catch null);
     }
 
     fn syncNotify(ctx: *anyopaque, r: Sync.Result) void {
@@ -408,13 +411,13 @@ pub const Context = struct {
                 if (changed) {
                     self.applySynced();
                 } else if (self.sync_manual) {
-                    self.progress_text = " synced: up to date ";
+                    self.setProgress(" synced: up to date ");
                 }
                 self.sync_manual = false;
             },
             .pushed => {},
             .err => |m| {
-                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m.text()}) catch null;
+                self.setProgress(std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m.text()}) catch null);
             },
         }
     }
@@ -437,9 +440,9 @@ pub const Context = struct {
             self.lock_horizontal_scroll = pos.hlock;
             if (pos.grid_zoom >= 12 and pos.grid_zoom <= 64) self.grid_cell_w = pos.grid_zoom;
             self.last_view_ts = pos.last_opened;
-            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " synced: p.{d} from {s} ", .{ pos.page + 1, pos.device }) catch null;
+            self.setProgress(std.fmt.bufPrint(&self.progress_buf, " synced: p.{d} from {s} ", .{ pos.page + 1, pos.device }) catch null);
         } else {
-            self.progress_text = " synced ";
+            self.setProgress(" synced ");
         }
         self.clearCache();
     }
@@ -449,9 +452,9 @@ pub const Context = struct {
             self.sync_manual = true;
             s.requestPull();
             s.requestPush(true);
-            self.progress_text = if (s.allManual()) " syncing (manual backends)… " else " syncing… ";
+            self.setProgress(if (s.allManual()) " syncing (manual backends)… " else " syncing… ");
         } else {
-            self.progress_text = " sync: not configured (see docs/config.md#sync) ";
+            self.setProgress(" sync: not configured (see docs/config.md#sync) ");
         }
     }
 
@@ -573,13 +576,30 @@ pub const Context = struct {
         }
 
         while (!self.should_quit) {
-            try loop.pollEvent();
+            // A status message expires on its own, so while one is showing
+            // the wait for events is a short poll instead of a blocking one.
+            var first: ?Event = null;
+            if (self.progress_text != null) {
+                const deadline = self.progress_since_ns + progress_ttl_ns;
+                while (first == null and time.nowNs() < deadline) {
+                    first = try loop.tryEvent();
+                    if (first == null) time.sleep(30 * std.time.ns_per_ms);
+                }
+                if (first == null) self.progress_text = null;
+            } else {
+                try loop.pollEvent();
+            }
 
             var had_event = false;
+            if (first) |event| {
+                try self.update(event);
+                had_event = true;
+            }
             while (try loop.tryEvent()) |event| {
                 try self.update(event);
                 had_event = true;
             }
+            if (self.progress_text != null and time.nowNs() >= self.progress_since_ns + progress_ttl_ns) self.progress_text = null;
 
             try self.draw();
 
@@ -1281,9 +1301,14 @@ pub const Context = struct {
         self.outline = &.{};
     }
 
+    pub fn setProgress(self: *Self, text: ?[]const u8) void {
+        self.progress_text = text;
+        self.progress_since_ns = time.nowNs();
+    }
+
     pub fn flashProgress(self: *Self, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.bufPrint(&self.progress_buf, fmt, args) catch return;
-        self.progress_text = msg;
+        self.setProgress(msg);
         const win = self.vx.window();
         // This renders mid-update without a full repaint, so every screen cell
         // it leaves in place must still reference live memory. Callers that

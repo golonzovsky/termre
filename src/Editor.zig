@@ -143,7 +143,7 @@ fn spawnEditorAndWait(ctx: *Context, path: [:0]const u8, dir: []const u8, line: 
         .environ_map = ctx.env,
     }) catch |err| {
         restoreAfterEditor(ctx) catch {};
-        ctx.progress_text = std.fmt.bufPrint(&ctx.progress_buf, " cannot run $EDITOR `{s}`: {s} ", .{ editor_raw, @errorName(err) }) catch null;
+        ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " cannot run $EDITOR `{s}`: {s} ", .{ editor_raw, @errorName(err) }) catch null);
         return err;
     };
     _ = child.wait(ctx.io) catch {};
