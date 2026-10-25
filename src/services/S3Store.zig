@@ -58,24 +58,36 @@ pub fn list(self: *Self, a: std.mem.Allocator, prefix: []const u8) ![]Entry {
     defer arena.deinit();
     const ta = arena.allocator();
     const full_prefix = try self.objectKey(ta, prefix);
-    const query = try std.fmt.allocPrint(ta, "list-type=2&prefix={s}", .{try uriEncode(ta, full_prefix, true)});
+    const encoded_prefix = try uriEncode(ta, full_prefix, true);
     const path = try std.fmt.allocPrint(ta, "/{s}", .{self.bucket});
-    const resp = try self.request(ta, "GET", path, query, "");
-    if (resp.status != 200) return statusError(resp.status);
 
     var out: std.ArrayList(Entry) = .empty;
-    var rest = resp.body;
-    while (std.mem.indexOf(u8, rest, "<Key>")) |i| {
-        const after = rest[i + 5 ..];
-        const end = std.mem.indexOf(u8, after, "</Key>") orelse break;
-        const key = after[0..end];
-        // Back to store-relative keys.
-        const rel = if (self.prefix.len > 0 and std.mem.startsWith(u8, key, self.prefix) and key.len > self.prefix.len)
-            key[self.prefix.len + 1 ..]
+    var token: ?[]const u8 = null;
+    while (true) {
+        // Canonical query must be sorted by name.
+        const query = if (token) |t|
+            try std.fmt.allocPrint(ta, "continuation-token={s}&list-type=2&prefix={s}", .{ try uriEncode(ta, t, true), encoded_prefix })
         else
-            key;
-        try out.append(a, .{ .key = try xmlUnescape(a, rel) });
-        rest = after[end..];
+            try std.fmt.allocPrint(ta, "list-type=2&prefix={s}", .{encoded_prefix});
+        const resp = try self.request(ta, "GET", path, query, "");
+        if (resp.status != 200) return statusError(resp.status);
+
+        var rest = resp.body;
+        while (std.mem.indexOf(u8, rest, "<Key>")) |i| {
+            const after = rest[i + 5 ..];
+            const end = std.mem.indexOf(u8, after, "</Key>") orelse break;
+            const key = after[0..end];
+            // Back to store-relative keys.
+            const rel = if (self.prefix.len > 0 and std.mem.startsWith(u8, key, self.prefix) and key.len > self.prefix.len)
+                key[self.prefix.len + 1 ..]
+            else
+                key;
+            try out.append(a, .{ .key = try xmlUnescape(a, rel) });
+            rest = after[end..];
+        }
+
+        if (std.mem.indexOf(u8, resp.body, "<IsTruncated>true</IsTruncated>") == null) break;
+        token = try xmlUnescape(ta, xmlText(resp.body, "NextContinuationToken") orelse break);
     }
     return out.toOwnedSlice(a);
 }
@@ -239,6 +251,16 @@ fn hexDigit(v: u8) u8 {
     return "0123456789ABCDEF"[v];
 }
 
+fn xmlText(body: []const u8, tag: []const u8) ?[]const u8 {
+    var open_buf: [64]u8 = undefined;
+    var close_buf: [64]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{tag}) catch return null;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return null;
+    const start = (std.mem.indexOf(u8, body, open) orelse return null) + open.len;
+    const end = std.mem.indexOfPos(u8, body, start, close) orelse return null;
+    return body[start..end];
+}
+
 fn xmlUnescape(a: std.mem.Allocator, s: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, s, '&') == null) return a.dupe(u8, s);
     var out: std.ArrayList(u8) = .empty;
@@ -290,4 +312,10 @@ test "uriEncode keeps unreserved and encodes slash on request" {
     const q = try uriEncode(a, "a/b", true);
     defer a.free(q);
     try std.testing.expectEqualStrings("a%2Fb", q);
+}
+
+test "xmlText extracts a continuation token" {
+    const body = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=</NextContinuationToken><Key>a</Key></ListBucketResult>";
+    try std.testing.expectEqualStrings("1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=", xmlText(body, "NextContinuationToken").?);
+    try std.testing.expect(xmlText(body, "Missing") == null);
 }

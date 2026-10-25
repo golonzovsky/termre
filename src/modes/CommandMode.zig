@@ -3,6 +3,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
+const Editor = @import("../Editor.zig");
+const Export = @import("../Export.zig");
 
 pub const occupies_bottom_row = true;
 const TextInput = vaxis.widgets.TextInput;
@@ -10,6 +12,7 @@ const TextInput = vaxis.widgets.TextInput;
 context: *Context,
 text_input: TextInput,
 history_prefix: ?[]const u8 = null,
+history_index: isize = -1,
 
 pub fn init(context: *Context) Self {
     return .{
@@ -19,10 +22,13 @@ pub fn init(context: *Context) Self {
 }
 
 pub fn deinit(self: *Self) void {
-    const win = self.context.vx.window();
-    win.hideCursor();
-    self.text_input.deinit();
+    closeTextInput(self.context, &self.text_input);
     if (self.history_prefix) |history_prefix| self.context.allocator.free(history_prefix);
+}
+
+pub fn closeTextInput(ctx: *Context, ti: *TextInput) void {
+    ctx.vx.window().hideCursor();
+    ti.deinit();
 }
 
 pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
@@ -43,7 +49,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
             self.context.history.addToHistory(cmd);
         }
 
-        if (self.context.current_mode == .command) self.context.changeMode(.view);
+        if (self.context.next_mode == null) self.context.changeMode(.view);
         return;
     }
 
@@ -73,24 +79,24 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         const count = @as(isize, @intCast(filtered.items.len));
         if (count > 0) {
             if (key.matches(km.history_back.codepoint, km.history_back.mods)) {
-                if (self.context.history.index == -1) {
-                    self.context.history.index = count - 1;
-                } else if (self.context.history.index > 0) {
-                    self.context.history.index -= 1;
+                if (self.history_index == -1) {
+                    self.history_index = count - 1;
+                } else if (self.history_index > 0) {
+                    self.history_index -= 1;
                 }
             } else if (key.matches(km.history_forward.codepoint, km.history_forward.mods)) {
-                if (self.context.history.index >= 0 and self.context.history.index < count - 1) {
-                    self.context.history.index += 1;
+                if (self.history_index >= 0 and self.history_index < count - 1) {
+                    self.history_index += 1;
                 } else {
-                    self.context.history.index = -1;
+                    self.history_index = -1;
                 }
             }
         }
 
-        const input_to_display = if (self.context.history.index == -1 or count == 0)
+        const input_to_display = if (self.history_index == -1 or count == 0)
             history_prefix
         else
-            filtered.items[@as(usize, @intCast(self.context.history.index))];
+            filtered.items[@as(usize, @intCast(self.history_index))];
 
         self.text_input.buf.clearRetainingCapacity();
         self.text_input.reset();
@@ -103,7 +109,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         self.context.allocator.free(history_prefix);
         self.history_prefix = null;
     }
-    self.context.history.index = -1;
+    self.history_index = -1;
 
     try self.text_input.update(.{ .key_press = key });
 }
@@ -111,7 +117,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
 pub fn drawCommandBar(self: *Self, win: vaxis.Window) void {
     const command_bar = win.child(.{
         .x_off = 0,
-        .y_off = win.height - 1,
+        .y_off = win.height -| 1,
         .width = win.width,
         .height = 1,
     });
@@ -209,11 +215,11 @@ fn handleEdit(self: *Self, cmd: []const u8) bool {
     if (!std.mem.startsWith(u8, cmd, "edit")) return false;
     const rest = std.mem.trim(u8, cmd["edit".len..], &std.ascii.whitespace);
     if (rest.len == 0) {
-        self.context.openCurrentPageInEditor() catch {};
+        Editor.openCurrentPageInEditor(self.context) catch {};
         return true;
     }
     if (std.mem.eql(u8, rest, "c") or std.mem.eql(u8, rest, "chapter")) {
-        self.context.openCurrentChapterInEditor() catch {};
+        Editor.openCurrentChapterInEditor(self.context) catch {};
         return true;
     }
     return false;
@@ -251,7 +257,7 @@ fn handleHLock(self: *Self, cmd: []const u8) bool {
 fn handleMarkdown(self: *Self, cmd: []const u8) bool {
     if (!std.mem.startsWith(u8, cmd, "markdown")) return false;
     const rest = std.mem.trim(u8, cmd["markdown".len..], &std.ascii.whitespace);
-    self.context.exportMarkdown(rest);
+    Export.exportMarkdown(self.context, rest);
     return true;
 }
 
@@ -270,7 +276,6 @@ fn handleSpread(self: *Self, cmd: []const u8) bool {
         const n = std.fmt.parseInt(u8, rest, 10) catch return false;
         self.context.document_handler.setSpreadColumns(n);
     }
-    self.context.resetCurrentPage();
     return true;
 }
 
@@ -278,7 +283,6 @@ fn handleFit(self: *Self, cmd: []const u8) bool {
     if (!std.mem.eql(u8, cmd, "fit")) return false;
     self.context.document_handler.toggleFitWidth();
     self.context.clearCache();
-    self.context.resetCurrentPage();
     return true;
 }
 
@@ -312,7 +316,6 @@ fn handleCrop(self: *Self, cmd: []const u8) bool {
     };
     self.context.document_handler.setMarginCrop(trbl[3], trbl[1], trbl[0], trbl[2]);
     self.context.clearCache();
-    self.context.resetCurrentPage();
     return true;
 }
 
@@ -323,20 +326,19 @@ fn handleAltShift(self: *Self, cmd: []const u8) bool {
     if (rest.len == 0) return false;
     const n = std.fmt.parseInt(i32, rest, 10) catch return false;
     self.context.document_handler.setOddShiftX(n);
-    self.context.resetCurrentPage();
     return true;
 }
 
 fn handleOverride(self: *Self, cmd: []const u8) bool {
     if (!std.mem.eql(u8, cmd, "override")) return false;
-    self.context.overrideCropped();
+    Export.overrideCropped(self.context);
     return true;
 }
 
 fn handleExport(self: *Self, cmd: []const u8) bool {
     if (!std.mem.startsWith(u8, cmd, "export")) return false;
     const rest = std.mem.trim(u8, cmd["export".len..], &std.ascii.whitespace);
-    self.context.exportCropped(rest);
+    Export.exportCropped(self.context, rest);
     return true;
 }
 
@@ -356,7 +358,6 @@ fn handleGoToPage(self: *Self, cmd: []const u8) bool {
     const page_num = (std.fmt.parseInt(u16, cmd, 10) catch return false);
     if (!self.context.document_handler.goToPage(page_num)) return false;
 
-    self.context.resetCurrentPage();
     return true;
 }
 
@@ -366,7 +367,6 @@ fn handleZoom(self: *Self, cmd: []const u8) bool {
     const number_str = cmd[0 .. cmd.len - 1];
     if (std.fmt.parseFloat(f32, number_str)) |percent| {
         self.context.document_handler.setZoom(percent);
-        self.context.resetCurrentPage();
         return true;
     } else |_| {
         return false;
@@ -386,7 +386,6 @@ fn handleScroll(self: *Self, cmd: []const u8) bool {
         const dx: f32 = if (axis == 'x') delta else 0.0;
         const dy: f32 = if (axis == 'y') delta else 0.0;
         self.context.document_handler.offsetScroll(dx, dy);
-        self.context.resetCurrentPage();
         return true;
     } else |_| {
         return false;

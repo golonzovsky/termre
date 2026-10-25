@@ -2,6 +2,9 @@ const Self = @This();
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
+const Selection = @import("../Selection.zig");
+const StatusBar = @import("../StatusBar.zig");
+const Editor = @import("../Editor.zig");
 
 context: *Context,
 
@@ -46,9 +49,9 @@ const bindings = .{
     .{ "search_next", Context.searchNext },
     .{ "search_prev", Context.searchPrev },
     .{ "search_list", enterSearchList },
-    .{ "add_highlight", Context.addHighlightFromSelection },
+    .{ "add_highlight", Selection.addHighlightFromSelection },
     .{ "highlights_mode", enterHighlights },
-    .{ "exit_command_mode", Context.escapeClear },
+    .{ "exit_command_mode", Selection.escapeClear },
 };
 
 pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
@@ -83,7 +86,7 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
                     if (!ctx.lock_horizontal_scroll) ctx.document_handler.offsetScroll(-step, 0);
                 },
                 .left => {
-                    ctx.clearSelection();
+                    Selection.clearSelection(ctx);
                     ctx.selection_anchor = ctx.pdfPointAt(mouse);
                     ctx.selection_dragged = false;
                 },
@@ -96,7 +99,7 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
                     if (ctx.pdfPointAt(mouse)) |head| {
                         if (head.page == anchor.page) {
                             ctx.selection_dragged = true;
-                            ctx.updateSelection(anchor, head);
+                            Selection.updateSelection(ctx, anchor, head);
                         }
                     }
                 }
@@ -105,7 +108,7 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
         .release => {
             if (mouse.button == .left) {
                 if (ctx.selection_dragged and ctx.selection_hits.items.len > 0) {
-                    ctx.finishSelection();
+                    Selection.finishSelection(ctx);
                 } else {
                     ctx.handleLeftClick(mouse) catch {};
                 }
@@ -126,7 +129,6 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
             // `d` already toggled; a digit right after picks the column count.
             if (key.codepoint >= '2' and key.codepoint <= '9') {
                 ctx.document_handler.setSpreadColumns(@intCast(key.codepoint - '0'));
-                ctx.reload_page = true;
                 return;
             }
         } else {
@@ -149,54 +151,46 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
 }
 
 fn nextPage(ctx: *Context) void {
-    if (ctx.document_handler.changePage(1)) ctx.resetCurrentPage();
+    _ = ctx.document_handler.changePage(1);
 }
 
 fn prevPage(ctx: *Context) void {
-    if (ctx.document_handler.changePage(-1)) ctx.resetCurrentPage();
+    _ = ctx.document_handler.changePage(-1);
 }
 
 fn zoomIn(ctx: *Context) void {
     ctx.document_handler.zoomIn();
-    ctx.reload_page = true;
 }
 
 fn zoomOut(ctx: *Context) void {
     ctx.document_handler.zoomOut();
-    ctx.reload_page = true;
 }
 
 fn toggleWidthMode(ctx: *Context) void {
     ctx.document_handler.toggleWidthMode();
-    ctx.reload_page = true;
 }
 
 fn toggleFitWidth(ctx: *Context) void {
     ctx.document_handler.toggleFitWidth();
     ctx.clearCache();
-    ctx.reload_page = true;
 }
 
 fn toggleCrop(ctx: *Context) void {
     ctx.document_handler.toggleCropToContent();
-    ctx.reload_page = true;
 }
 
 fn toggleSpread(ctx: *Context) void {
     ctx.document_handler.toggleSpread();
     ctx.pending_op = .spread_digit;
-    ctx.reload_page = true;
 }
 
 fn toggleStatusBar(ctx: *Context) void {
-    ctx.toggleFullScreen();
+    StatusBar.toggleFullScreen(ctx);
     ctx.document_handler.resetDefaultZoom();
-    ctx.reload_page = true;
 }
 
 fn toggleInvert(ctx: *Context) void {
     ctx.document_handler.toggleColor();
-    ctx.reload_page = true;
 }
 
 fn scrollUp(ctx: *Context) void {
@@ -272,9 +266,9 @@ fn startJumpMark(ctx: *Context) void {
 }
 
 fn openPageInEditor(ctx: *Context) void {
-    ctx.openCurrentPageInEditor() catch {};
+    Editor.openCurrentPageInEditor(ctx) catch {};
 }
 
 fn openChapterInEditor(ctx: *Context) void {
-    ctx.openCurrentChapterInEditor() catch {};
+    Editor.openCurrentChapterInEditor(ctx) catch {};
 }

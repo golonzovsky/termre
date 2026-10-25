@@ -5,6 +5,9 @@ const std = @import("std");
 const Config = @import("config/Config.zig");
 const PdfHandler = @import("handlers/PdfHandler.zig");
 const Positions = @import("services/Positions.zig");
+const Paths = @import("services/Paths.zig");
+const time = @import("utilities/time.zig");
+const fs = @import("utilities/fs.zig");
 
 const protocol_version = "2024-11-05";
 // Workflow guidance for agents (Agent Skills format); installed next to the
@@ -22,6 +25,7 @@ const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
+    paths: Paths,
     config: *Config,
     version: []const u8,
     tmp_dir: []const u8,
@@ -52,7 +56,7 @@ const Server = struct {
         var path: []const u8 = s;
         if (s[0] != '/') {
             path = "";
-            const recents = Positions.listRecent(a, self.io, self.env);
+            const recents = Positions.listRecent(a, self.io, self.paths);
             for (recents) |r| {
                 if (r.device.len == 0 and std.ascii.findIgnoreCase(r.path, s) != null) {
                     path = r.path;
@@ -116,12 +120,7 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
                 var pbuf: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try std.fmt.bufPrint(&pbuf, "{s}/SKILL.md", .{dir});
                 const existed = if (cwd.access(init.io, path, .{})) |_| true else |_| false;
-                if (cwd.createFile(init.io, path, .{})) |file| {
-                    defer file.close(init.io);
-                    var wbuf: [4096]u8 = undefined;
-                    var fw = file.writer(init.io, &wbuf);
-                    fw.interface.writeAll(skill_md) catch {};
-                    fw.interface.flush() catch {};
+                if (fs.writeFileAtomic(init.io, path, skill_md)) |_| {
                     try stdout.print("skill {s}: {s}\n", .{ if (existed) "updated" else "installed", path });
                     try stdout.flush();
                 } else |err| try stderr.print("skill not installed ({s}); `re mcp skill` prints it\n", .{@errorName(err)});
@@ -164,10 +163,13 @@ pub fn run(init: std.process.Init) !void {
     defer gpa.free(tmp_dir);
     std.Io.Dir.cwd().createDirPath(init.io, tmp_dir) catch {};
 
+    const paths = try Paths.init(gpa, init.environ_map, &config);
+    defer paths.deinit(gpa);
     var server = Server{
         .gpa = gpa,
         .io = init.io,
         .env = init.environ_map,
+        .paths = paths,
         .config = &config,
         .version = @import("metadata").version,
         .tmp_dir = tmp_dir,
@@ -223,38 +225,15 @@ fn handle(self: *Server, a: std.mem.Allocator, line: []const u8, out: *std.Io.Wr
     const params: ?std.json.ObjectMap = if (obj.get("params")) |p| (if (p == .object) p.object else null) else null;
 
     if (std.mem.eql(u8, method, "initialize")) {
-        var s = beginResult(out, id) catch return;
-        try s.beginObject();
-        try s.objectField("protocolVersion");
-        try s.write(protocol_version);
-        try s.objectField("capabilities");
-        try s.beginObject();
-        try s.objectField("tools");
-        try s.beginObject();
-        try s.endObject();
-        try s.endObject();
-        try s.objectField("serverInfo");
-        try s.beginObject();
-        try s.objectField("name");
-        try s.write("termre");
-        try s.objectField("version");
-        try s.write(self.version);
-        try s.endObject();
-        try s.endObject();
-        return endResult(&s, out);
+        return writeResult(out, id, .{
+            .protocolVersion = protocol_version,
+            .capabilities = .{ .tools = empty_object },
+            .serverInfo = .{ .name = "termre", .version = self.version },
+        });
     }
     if (is_notification) return; // notifications/initialized, cancelled, ...
-    if (std.mem.eql(u8, method, "ping")) {
-        var s = try beginResult(out, id);
-        try s.beginObject();
-        try s.endObject();
-        return endResult(&s, out);
-    }
-    if (std.mem.eql(u8, method, "tools/list")) {
-        var s = try beginResult(out, id);
-        try writeToolList(&s);
-        return endResult(&s, out);
-    }
+    if (std.mem.eql(u8, method, "ping")) return writeResult(out, id, empty_object);
+    if (std.mem.eql(u8, method, "tools/list")) return writeResult(out, id, .{ .tools = &tools });
     if (std.mem.eql(u8, method, "tools/call")) {
         const p = params orelse return writeError(out, id, -32602, "missing params");
         const name_v = p.get("name") orelse return writeError(out, id, -32602, "missing tool name");
@@ -265,56 +244,20 @@ fn handle(self: *Server, a: std.mem.Allocator, line: []const u8, out: *std.Io.Wr
             is_error = true;
             break :blk try std.fmt.allocPrint(a, "error: {s}", .{@errorName(err)});
         };
-        var s = try beginResult(out, id);
-        try s.beginObject();
-        try s.objectField("content");
-        try s.beginArray();
-        try s.beginObject();
-        try s.objectField("type");
-        try s.write("text");
-        try s.objectField("text");
-        try s.write(text);
-        try s.endObject();
-        try s.endArray();
-        try s.objectField("isError");
-        try s.write(is_error);
-        try s.endObject();
-        return endResult(&s, out);
+        return writeResult(out, id, .{ .content = .{.{ .type = "text", .text = text }}, .isError = is_error });
     }
     return writeError(out, id, -32601, "method not found");
 }
 
-fn beginResult(out: *std.Io.Writer, id: std.json.Value) !std.json.Stringify {
-    var s: std.json.Stringify = .{ .writer = out };
-    try s.beginObject();
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
-    try s.objectField("id");
-    try s.write(id);
-    try s.objectField("result");
-    return s;
-}
+const empty_object = struct {}{};
 
-fn endResult(s: *std.json.Stringify, out: *std.Io.Writer) !void {
-    try s.endObject();
+fn writeResult(out: *std.Io.Writer, id: std.json.Value, result: anytype) !void {
+    try std.json.Stringify.value(.{ .jsonrpc = "2.0", .id = id, .result = result }, .{}, out);
     try out.writeByte('\n');
 }
 
 fn writeError(out: *std.Io.Writer, id: std.json.Value, code: i32, msg: []const u8) !void {
-    var s: std.json.Stringify = .{ .writer = out };
-    try s.beginObject();
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
-    try s.objectField("id");
-    try s.write(id);
-    try s.objectField("error");
-    try s.beginObject();
-    try s.objectField("code");
-    try s.write(code);
-    try s.objectField("message");
-    try s.write(msg);
-    try s.endObject();
-    try s.endObject();
+    try std.json.Stringify.value(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = code, .message = msg } }, .{}, out);
     try out.writeByte('\n');
 }
 
@@ -325,28 +268,12 @@ const Tool = struct {
     description: []const u8,
     // (name, type, description, required)
     params: []const struct { []const u8, []const u8, []const u8, bool },
-};
+    run: union(enum) {
+        plain: *const fn (*Server, std.mem.Allocator) anyerror![]const u8,
+        book: *const fn (*Server, std.mem.Allocator, *Book, std.json.ObjectMap) anyerror![]const u8,
+    },
 
-const book_param = .{ "book", "string", "Absolute path, ~/path, or a substring of a recent book's path (e.g. \"Inference\")", true };
-const book_param_opt = .{ "book", "string", "Like `book` elsewhere; omit for the book currently being read (most recently active open instance)", false };
-
-const tools = [_]Tool{
-    .{ .name = "list_books", .description = "Recently read books with current page; ones read on another device are tagged.", .params = &.{} },
-    .{ .name = "get_outline", .description = "Table of contents with page numbers.", .params = &.{book_param} },
-    .{ .name = "get_pages", .description = "Pages [from, to] (1-based, inclusive) as markdown. Each page is preceded by an `<!-- page N -->` marker; diagrams are written as PNG files.", .params = &.{ book_param, .{ "from", "integer", "First page (1-based)", true }, .{ "to", "integer", "Last page (1-based, inclusive)", true } } },
-    .{ .name = "get_chapter", .description = "A whole top-level chapter as markdown: the one containing `page`, or the first outline entry whose title contains `title`.", .params = &.{ book_param, .{ "page", "integer", "A page inside the chapter (1-based)", false }, .{ "title", "string", "Substring of the chapter title", false } } },
-    .{ .name = "search", .description = "Full-text search; returns page numbers with the matching line.", .params = &.{ book_param, .{ "query", "string", "Text to find", true }, .{ "limit", "integer", "Max hits (default 20)", false } } },
-    .{ .name = "reading_state", .description = "Where the reader is: current page and chapter, whether it is open now, the last text selected with the mouse, marks and highlights (with text). Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
-    .{ .name = "current_page", .description = "The page the reader is on right now — its markdown, plus the current mouse selection and highlights on that page. Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
-    .{ .name = "select_text", .description = "Select a passage in the running reader — ONLY when the user explicitly asks for it. `text` must occur verbatim on `page` (take it from search or get_pages). It is shown selected and scrolled into view; the user can highlight it with H and return with Ctrl-O. Nothing is copied to the clipboard. Same targeting rules as goto_page.", .params = &.{ book_param_opt, .{ "page", "integer", "Page the text is on (1-based)", true }, .{ "text", "string", "Exact text to select (a few words to a sentence)", true }, .{ "pid", "integer", "Instance to use, from list_books", false } } },
-    .{ .name = "goto_page", .description = "Move the running reader to a page (1-based) — ONLY when the user explicitly asks to be taken there; otherwise cite p.N. They can return with Ctrl-O. Needs the book to be open in termre. Omit `book` for the book being read right now; pass `pid` (from list_books) when the same book is open in several splits.", .params = &.{ book_param_opt, .{ "page", "integer", "Page to show (1-based)", true }, .{ "pid", "integer", "Instance to move, from list_books", false } } },
-};
-
-fn writeToolList(s: *std.json.Stringify) !void {
-    try s.beginObject();
-    try s.objectField("tools");
-    try s.beginArray();
-    for (tools) |t| {
+    pub fn jsonStringify(t: Tool, s: *std.json.Stringify) !void {
         try s.beginObject();
         try s.objectField("name");
         try s.write(t.name);
@@ -377,9 +304,22 @@ fn writeToolList(s: *std.json.Stringify) !void {
         try s.endObject();
         try s.endObject();
     }
-    try s.endArray();
-    try s.endObject();
-}
+};
+
+const book_param = .{ "book", "string", "Absolute path, ~/path, or a substring of a recent book's path (e.g. \"Inference\")", true };
+const book_param_opt = .{ "book", "string", "Like `book` elsewhere; omit for the book currently being read (most recently active open instance)", false };
+
+const tools = [_]Tool{
+    .{ .name = "list_books", .run = .{ .plain = listBooks }, .description = "Recently read books with current page; ones read on another device are tagged.", .params = &.{} },
+    .{ .name = "get_outline", .run = .{ .book = outlineText }, .description = "Table of contents with page numbers.", .params = &.{book_param} },
+    .{ .name = "get_pages", .run = .{ .book = getPages }, .description = "Pages [from, to] (1-based, inclusive) as markdown. Each page is preceded by an `<!-- page N -->` marker; diagrams are written as PNG files.", .params = &.{ book_param, .{ "from", "integer", "First page (1-based)", true }, .{ "to", "integer", "Last page (1-based, inclusive)", true } } },
+    .{ .name = "get_chapter", .run = .{ .book = chapterMarkdown }, .description = "A whole top-level chapter as markdown: the one containing `page`, or the first outline entry whose title contains `title`.", .params = &.{ book_param, .{ "page", "integer", "A page inside the chapter (1-based)", false }, .{ "title", "string", "Substring of the chapter title", false } } },
+    .{ .name = "search", .run = .{ .book = searchText }, .description = "Full-text search; returns page numbers with the matching line.", .params = &.{ book_param, .{ "query", "string", "Text to find", true }, .{ "limit", "integer", "Max hits (default 20)", false } } },
+    .{ .name = "reading_state", .run = .{ .book = readingState }, .description = "Where the reader is: current page and chapter, whether it is open now, the last text selected with the mouse, marks and highlights (with text). Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
+    .{ .name = "current_page", .run = .{ .book = currentPage }, .description = "The page the reader is on right now — its markdown, plus the current mouse selection and highlights on that page. Omit `book` for the book being read right now.", .params = &.{book_param_opt} },
+    .{ .name = "select_text", .run = .{ .book = selectText }, .description = "Select a passage in the running reader — ONLY when the user explicitly asks for it. `text` must occur verbatim on `page` (take it from search or get_pages). It is shown selected and scrolled into view; the user can highlight it with H and return with Ctrl-O. Nothing is copied to the clipboard. Same targeting rules as goto_page.", .params = &.{ book_param_opt, .{ "page", "integer", "Page the text is on (1-based)", true }, .{ "text", "string", "Exact text to select (a few words to a sentence)", true }, .{ "pid", "integer", "Instance to use, from list_books", false } } },
+    .{ .name = "goto_page", .run = .{ .book = gotoPage }, .description = "Move the running reader to a page (1-based) — ONLY when the user explicitly asks to be taken there; otherwise cite p.N. They can return with Ctrl-O. Needs the book to be open in termre. Omit `book` for the book being read right now; pass `pid` (from list_books) when the same book is open in several splits.", .params = &.{ book_param_opt, .{ "page", "integer", "Page to show (1-based)", true }, .{ "pid", "integer", "Instance to move, from list_books", false } } },
+};
 
 fn argStr(args: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = args.get(name) orelse return null;
@@ -397,7 +337,13 @@ fn argInt(args: std.json.ObjectMap, name: []const u8) ?i64 {
 }
 
 fn callTool(self: *Server, a: std.mem.Allocator, name: []const u8, args: std.json.ObjectMap) ![]const u8 {
-    if (std.mem.eql(u8, name, "list_books")) return listBooks(self, a);
+    const tool = for (&tools) |*t| {
+        if (std.mem.eql(u8, t.name, name)) break t;
+    } else return error.UnknownTool;
+    const with_book = switch (tool.run) {
+        .plain => |f| return f(self, a),
+        .book => |f| f,
+    };
     var spec = argStr(args, "book") orelse "";
     self.default_note = "";
     if (std.mem.trim(u8, spec, &std.ascii.whitespace).len == 0) {
@@ -407,24 +353,18 @@ fn callTool(self: *Server, a: std.mem.Allocator, name: []const u8, args: std.jso
         }
     }
     const book = try self.openBook(a, spec);
-    if (std.mem.eql(u8, name, "get_outline")) return outlineText(a, book);
-    if (std.mem.eql(u8, name, "get_pages")) {
-        const total: i64 = book.handler.getTotalPages();
-        const from = std.math.clamp(argInt(args, "from") orelse 1, 1, total);
-        const to = std.math.clamp(argInt(args, "to") orelse from, from, total);
-        return pagesMarkdown(self, a, book, @intCast(from - 1), @intCast(to), null);
-    }
-    if (std.mem.eql(u8, name, "get_chapter")) return chapterMarkdown(self, a, book, args);
-    if (std.mem.eql(u8, name, "search")) return searchText(self, a, book, args);
-    if (std.mem.eql(u8, name, "reading_state")) return readingState(self, a, book);
-    if (std.mem.eql(u8, name, "current_page")) return currentPage(self, a, book);
-    if (std.mem.eql(u8, name, "goto_page")) return gotoPage(self, a, book, args);
-    if (std.mem.eql(u8, name, "select_text")) return selectText(self, a, book, args);
-    return error.UnknownTool;
+    return with_book(self, a, book, args);
+}
+
+fn getPages(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.ObjectMap) ![]const u8 {
+    const total: i64 = book.handler.getTotalPages();
+    const from = std.math.clamp(argInt(args, "from") orelse 1, 1, total);
+    const to = std.math.clamp(argInt(args, "to") orelse from, from, total);
+    return pagesMarkdown(self, a, book, @intCast(from - 1), @intCast(to), null);
 }
 
 fn instanceFor(self: *Server, a: std.mem.Allocator, book: *Book, want_pid: ?i64) !Positions.OpenEntry {
-    const open = Positions.listOpen(a, self.io, self.env);
+    const open = Positions.listOpen(a, self.io, self.paths);
     var target: ?Positions.OpenEntry = null;
     for (open) |o| {
         if (!std.mem.eql(u8, o.path, book.path)) continue;
@@ -447,7 +387,7 @@ fn selectText(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.O
     if (hits.items.len == 0) return error.TextNotFoundOnPage;
     const t = try instanceFor(self, a, book, argInt(args, "pid"));
     const cmd = try std.fmt.allocPrint(a, "select {d} {s}", .{ page, text });
-    if (!Positions.sendCommand(self.gpa, self.io, self.env, t.pid, cmd)) return error.CommandNotDelivered;
+    if (!Positions.sendCommand(self.io, self.paths, t.pid, cmd)) return error.CommandNotDelivered;
     return std.fmt.allocPrint(a, "{s}selected on p.{d} of {s} (instance {d}); the reader shows it inverted — H highlights it, Ctrl-O goes back", .{ self.default_note, page, std.fs.path.basename(book.path), t.pid });
 }
 
@@ -457,7 +397,7 @@ fn gotoPage(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.Obj
     if (page < 1 or page > total) return error.PageOutOfRange;
     const t = try instanceFor(self, a, book, argInt(args, "pid"));
     const cmd = try std.fmt.allocPrint(a, "goto {d}", .{page});
-    if (!Positions.sendCommand(self.gpa, self.io, self.env, t.pid, cmd)) return error.CommandNotDelivered;
+    if (!Positions.sendCommand(self.io, self.paths, t.pid, cmd)) return error.CommandNotDelivered;
     return std.fmt.allocPrint(a, "{s}moved {s} (instance {d}) to p.{d}; the reader can go back with Ctrl-O", .{ self.default_note, std.fs.path.basename(book.path), t.pid, page });
 }
 
@@ -466,9 +406,9 @@ const DefaultBook = union(enum) { path: []const u8, ambiguous: []const u8 };
 // With `book` omitted: the single active instance (moved in the last 10
 // minutes), or the only open one. Several candidates -> ask rather than guess.
 fn resolveDefaultBook(self: *Server, a: std.mem.Allocator) !DefaultBook {
-    const open = Positions.listOpen(a, self.io, self.env);
+    const open = Positions.listOpen(a, self.io, self.paths);
     if (open.len == 0) return error.NoBookOpen;
-    const now = nowSeconds();
+    const now = time.nowRealSeconds();
     var active: ?Positions.OpenEntry = null;
     var active_count: usize = 0;
     for (open) |o| {
@@ -503,7 +443,7 @@ fn resolveDefaultBook(self: *Server, a: std.mem.Allocator) !DefaultBook {
 }
 
 fn presenceFor(self: *Server, a: std.mem.Allocator, path: []const u8) ?Positions.OpenEntry {
-    const open = Positions.listOpen(a, self.io, self.env);
+    const open = Positions.listOpen(a, self.io, self.paths);
     var best: ?Positions.OpenEntry = null;
     for (open) |o| {
         if (!std.mem.eql(u8, o.path, path)) continue;
@@ -514,12 +454,12 @@ fn presenceFor(self: *Server, a: std.mem.Allocator, path: []const u8) ?Positions
 
 fn writeSelection(w: *std.Io.Writer, a: std.mem.Allocator, o: Positions.OpenEntry) !void {
     if (o.selection.len == 0) return;
-    try w.print("selected text (p.{d}, {s} ago):\n{s}\n", .{ o.selection_page + 1, ago(a, nowSeconds() - o.selection_at), o.selection });
+    try w.print("selected text (p.{d}, {s} ago):\n{s}\n", .{ o.selection_page + 1, ago(a, time.nowRealSeconds() - o.selection_at), o.selection });
 }
 
-fn currentPage(self: *Server, a: std.mem.Allocator, book: *Book) ![]const u8 {
+fn currentPage(self: *Server, a: std.mem.Allocator, book: *Book, _: std.json.ObjectMap) ![]const u8 {
     const key = try book.handler.getDocumentKey(a);
-    var positions = Positions.init(self.gpa, self.io, self.env, self.config, key);
+    var positions = Positions.init(self.gpa, self.io, self.paths, key);
     defer positions.deinit();
     const pos = positions.getSavedPosition() orelse return error.NeverOpened;
     const total = book.handler.getTotalPages();
@@ -536,7 +476,7 @@ fn currentPage(self: *Server, a: std.mem.Allocator, book: *Book) ![]const u8 {
     if (chapter.len > 0) try w.print(" — {s}", .{chapter});
     try w.writeAll("\n");
     if (presenceFor(self, a, book.path)) |o| {
-        try w.print("open now, {s}\n", .{if (nowSeconds() - o.last_activity < 600) "active" else "idle"});
+        try w.print("open now, {s}\n", .{if (time.nowRealSeconds() - o.last_activity < 600) "active" else "idle"});
         try writeSelection(w, a, o);
     }
     var hls = positions.loadHighlights(a);
@@ -556,9 +496,9 @@ fn currentPage(self: *Server, a: std.mem.Allocator, book: *Book) ![]const u8 {
 // Open instances first (most recently active on top), then the rest of the
 // recents. "active" = the reader moved in the last 10 minutes.
 fn listBooks(self: *Server, a: std.mem.Allocator) ![]const u8 {
-    const recents = Positions.listRecent(a, self.io, self.env);
-    const open = Positions.listOpen(a, self.io, self.env);
-    const now_s = nowSeconds();
+    const recents = Positions.listRecent(a, self.io, self.paths);
+    const open = Positions.listOpen(a, self.io, self.paths);
+    const now_s = time.nowRealSeconds();
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
 
@@ -600,18 +540,12 @@ fn listBooks(self: *Server, a: std.mem.Allocator) ![]const u8 {
     return w.buffered();
 }
 
-fn nowSeconds() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @intCast(ts.sec);
-}
-
 fn ago(a: std.mem.Allocator, secs: i64) []const u8 {
     const s = @max(0, secs);
     return (if (s < 60) std.fmt.allocPrint(a, "{d}s", .{s}) else if (s < 3600) std.fmt.allocPrint(a, "{d}m", .{@divTrunc(s, 60)}) else if (s < 86400) std.fmt.allocPrint(a, "{d}h", .{@divTrunc(s, 3600)}) else std.fmt.allocPrint(a, "{d}d", .{@divTrunc(s, 86400)})) catch "?";
 }
 
-fn outlineText(a: std.mem.Allocator, book: *Book) ![]const u8 {
+fn outlineText(_: *Server, a: std.mem.Allocator, book: *Book, _: std.json.ObjectMap) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     try w.print("{s} — {d} pages\n", .{ std.fs.path.basename(book.path), book.handler.getTotalPages() });
@@ -717,16 +651,16 @@ fn searchText(self: *Server, a: std.mem.Allocator, book: *Book, args: std.json.O
     return w.buffered();
 }
 
-fn readingState(self: *Server, a: std.mem.Allocator, book: *Book) ![]const u8 {
+fn readingState(self: *Server, a: std.mem.Allocator, book: *Book, _: std.json.ObjectMap) ![]const u8 {
     const key = try book.handler.getDocumentKey(a);
-    var positions = Positions.init(self.gpa, self.io, self.env, self.config, key);
+    var positions = Positions.init(self.gpa, self.io, self.paths, key);
     defer positions.deinit();
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     try w.writeAll(self.default_note);
     try w.print("{s} — {d} pages\n", .{ std.fs.path.basename(book.path), book.handler.getTotalPages() });
     if (presenceFor(self, a, book.path)) |o| {
-        const idle = nowSeconds() - o.last_activity;
+        const idle = time.nowRealSeconds() - o.last_activity;
         try w.print("open in termre now — {s}\n", .{if (idle < 600) "active" else "idle"});
         try writeSelection(w, a, o);
     }

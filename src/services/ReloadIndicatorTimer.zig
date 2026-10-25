@@ -7,7 +7,6 @@ const time = @import("../utilities/time.zig");
 
 should_quit: std.atomic.Value(bool),
 pending: std.atomic.Value(bool),
-generation: std.atomic.Value(usize),
 last_change_ns: std.atomic.Value(i64),
 thread: ?std.Thread,
 loop: ?*vaxis.Loop(Event),
@@ -18,7 +17,6 @@ pub fn init(config: *Config) Self {
     return .{
         .should_quit = .init(false),
         .pending = .init(false),
-        .generation = .init(0),
         .last_change_ns = .init(0),
         .thread = null,
         .loop = null,
@@ -52,15 +50,13 @@ fn run(self: *Self) void {
         if (!self.pending.load(.acquire)) continue;
         const elapsed = time.nowNs() - self.last_change_ns.load(.acquire);
         if (elapsed >= @as(i64, @intCast(self.reload_indicator_duration_ns))) {
-            const gen = self.generation.load(.acquire);
-            if (self.loop) |loop| loop.postEvent(.{ .reload_done = gen }) catch {};
+            if (self.loop) |loop| loop.postEvent(.reload_done) catch {};
             self.pending.store(false, .release);
         }
     }
 }
 
 pub fn notifyChange(self: *Self) void {
-    _ = self.generation.fetchAdd(1, .release);
     self.last_change_ns.store(time.nowNs(), .release);
     self.pending.store(true, .release);
 }

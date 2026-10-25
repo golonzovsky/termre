@@ -62,6 +62,7 @@ git clone --recursive https://github.com/golonzovsky/termre.git
 cd termre
 zig build --release=small     # first build compiles mupdf (~minutes)
 mv zig-out/bin/re ~/.local/bin/
+zig build test                # unit tests (no mupdf needed)
 ```
 
 ## License

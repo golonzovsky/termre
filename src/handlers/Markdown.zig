@@ -139,7 +139,9 @@ fn openCodeBlock(self: *Self) !void {
 
 fn closeCodeBlock(self: *Self) void {
     if (!self.in_code_block) return;
-    self.writer.writeAll("```\n\n") catch {};
+    self.writer.writeAll("```\n\n") catch {
+        self.write_failed = true;
+    };
     self.in_code_block = false;
 }
 

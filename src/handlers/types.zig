@@ -19,6 +19,7 @@ pub const DocumentError = error{
     FailedToCreateContext,
     FailedToOpenDocument,
     FailedToRenderPage,
+    PageLoadFailed,
     InvalidPageNumber,
     UnsupportedFileFormat,
 };

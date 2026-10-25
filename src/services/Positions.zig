@@ -7,8 +7,9 @@
 // into the same directory, which is what makes it conflict-free.
 const Self = @This();
 const std = @import("std");
+const fs = @import("../utilities/fs.zig");
 const meta = @import("../utilities/meta.zig");
-const Config = @import("../config/Config.zig");
+const Paths = @import("Paths.zig");
 const time = @import("../utilities/time.zig");
 
 pub const Position = struct {
@@ -123,14 +124,6 @@ const MarkRec = struct {
     updated_at: i64 = 0,
 };
 
-const HlRec = struct {
-    id: u64 = 0,
-    page: u16 = 0,
-    text: []const u8 = "",
-    rects: []const f32 = &.{},
-    created_at: i64 = 0,
-};
-
 const TombRec = struct {
     kind: []const u8 = "",
     letter: []const u8 = "",
@@ -145,7 +138,7 @@ pub const Shard = struct {
     updated_at: i64 = 0,
     view: View = .{},
     marks: []const MarkRec = &.{},
-    highlights: []const HlRec = &.{},
+    highlights: []const Highlight = &.{},
     tombstones: []const TombRec = &.{},
 };
 
@@ -158,35 +151,40 @@ const Merged = struct {
 
 allocator: std.mem.Allocator,
 io: std.Io,
-config: *Config,
+paths: Paths,
 doc_key: []const u8,
 arena: std.heap.ArenaAllocator,
+// Holds `merged`; swapped wholesale on reload so re-merges don't accumulate.
+book_arena: std.heap.ArenaAllocator,
+name: []const u8,
 // "" when no writable state dir could be determined.
 books_dir: []const u8,
 device: []const u8,
 merged: Merged,
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, config: *Config, doc_key: []const u8) Self {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, paths: Paths, doc_key: []const u8) Self {
     var self = Self{
         .allocator = allocator,
         .io = io,
-        .config = config,
+        .paths = paths,
         .doc_key = doc_key,
         .arena = std.heap.ArenaAllocator.init(allocator),
+        .book_arena = std.heap.ArenaAllocator.init(allocator),
+        .name = "",
         .books_dir = "",
         .device = "",
         .merged = .{},
     };
     const a = self.arena.allocator();
-    const state = stateDir(a, env) orelse return self;
-    self.books_dir = std.fmt.allocPrint(a, "{s}/books", .{state}) catch return self;
-    self.device = deviceId(a, io, state);
-    migrateLegacy(a, io, env, state, self.books_dir, self.device);
-    self.merged = self.loadBook(doc_key) catch .{};
+    self.name = safeKey(a, doc_key) catch "";
+    self.books_dir = paths.books;
+    self.device = deviceId(a, io, paths.state);
+    self.merged = self.loadBook(self.book_arena.allocator(), doc_key) catch .{};
     return self;
 }
 
 pub fn deinit(self: *Self) void {
+    self.book_arena.deinit();
     self.arena.deinit();
 }
 
@@ -198,25 +196,26 @@ pub fn booksDir(self: *Self) []const u8 {
     return self.books_dir;
 }
 
-// For callers without a document (the recent-books picker).
-pub fn booksDirFor(a: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
-    const state = stateDir(a, env) orelse return null;
-    return std.fmt.allocPrint(a, "{s}/books", .{state}) catch null;
-}
-
-pub fn deviceIdFor(a: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []const u8 {
-    const state = stateDir(a, env) orelse return "local";
-    return deviceId(a, io, state);
+// For callers without a document (the recent-books picker, `re state`).
+pub fn deviceIdFor(a: std.mem.Allocator, io: std.Io, paths: Paths) []const u8 {
+    return deviceId(a, io, paths.state);
 }
 
 // Directory/object name of this document's shards.
 pub fn bookName(self: *Self) []const u8 {
-    return safeKey(self.arena.allocator(), self.doc_key) catch "";
+    return self.name;
 }
 
 // Re-merges the shards on disk (after a sync pulled other devices' files).
 pub fn reload(self: *Self) void {
-    self.merged = self.loadBook(self.doc_key) catch return;
+    var fresh = std.heap.ArenaAllocator.init(self.allocator);
+    const merged = self.loadBook(fresh.allocator(), self.doc_key) catch {
+        fresh.deinit();
+        return;
+    };
+    self.book_arena.deinit();
+    self.book_arena = fresh;
+    self.merged = merged;
 }
 
 pub fn getSavedPosition(self: *Self) ?Position {
@@ -227,7 +226,7 @@ pub fn getSavedPosition(self: *Self) ?Position {
 pub fn getSavedPositionForKey(self: *Self, alt_key: []const u8) ?Position {
     if (self.merged.view) |v| return v;
     if (self.books_dir.len == 0) return null;
-    const alt = self.loadBook(alt_key) catch return null;
+    const alt = self.loadBook(self.book_arena.allocator(), alt_key) catch return null;
     if (alt.view != null) self.merged = alt;
     return self.merged.view;
 }
@@ -267,26 +266,26 @@ pub fn loadTombstones(self: *Self, allocator: std.mem.Allocator) std.ArrayList(T
 }
 
 // Returns the record's view timestamp: now if the view changed, else the
-// previous one (so opening a book doesn't make its record "newer"); null
+// previous one (so opening a book doesn't make its record "newer"). Fails
 // when nothing could be written, so the caller retries next time.
-pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const Highlight, tombstones: []const Tombstone) ?i64 {
+pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const Highlight, tombstones: []const Tombstone) !i64 {
     const now = time.nowRealSeconds();
-    if (self.books_dir.len == 0) return null;
+    if (self.books_dir.len == 0) return error.NoStateDir;
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const dir = self.bookDir(a, self.doc_key) catch return null;
-    const file_path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, self.device }) catch return null;
+    const dir = try self.bookDir(a, self.doc_key);
+    const file_path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, self.device });
 
     var mine = Shard{
         .device = self.device,
         .path = pos.path,
         .updated_at = now,
         .view = toView(pos),
-        .marks = marksToRecs(a, marks) catch return null,
-        .highlights = hlToRecs(a, highlights) catch return null,
-        .tombstones = tombsToRecs(a, tombstones) catch return null,
+        .marks = try marksToRecs(a, marks),
+        .highlights = try withHighlightIds(a, highlights),
+        .tombstones = try tombsToRecs(a, tombstones),
     };
     mine.view.touched = pos.touched or mine.view.page != 0 or mine.view.scroll_y != 0 or mine.view.scroll_x != 0;
     // Another instance on this device may have saved since we loaded; merge
@@ -296,61 +295,61 @@ pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const
         if (!changed) mine.updated_at = on_disk.updated_at;
         mine.view.touched = mine.view.touched or on_disk.view.touched or changed;
         const shards: [2]Shard = .{ mine, on_disk };
-        const merged = mergeShards(a, &shards) catch return null;
+        const merged = try mergeShards(a, &shards);
         mine.view = toView(merged.view.?);
         mine.updated_at = merged.view.?.last_opened;
-        mine.marks = marksToRecs(a, merged.marks) catch return null;
-        mine.highlights = hlToRecs(a, merged.highlights) catch return null;
-        mine.tombstones = tombsToRecs(a, merged.tombstones) catch return null;
+        mine.marks = try marksToRecs(a, merged.marks);
+        mine.highlights = try withHighlightIds(a, merged.highlights);
+        mine.tombstones = try tombsToRecs(a, merged.tombstones);
     }
 
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(self.io, dir) catch return null;
-    const json_str = std.json.Stringify.valueAlloc(a, mine, .{ .whitespace = .indent_2 }) catch return null;
-    if (!writeAtomic(a, self.io, file_path, json_str)) return null;
+    try cwd.createDirPath(self.io, dir);
+    const json_str = try std.json.Stringify.valueAlloc(a, mine, .{ .whitespace = .indent_2 });
+    try fs.writeFileAtomic(self.io, file_path, json_str);
     return mine.updated_at;
 }
 
-pub fn writePresence(self: *Self, path: []const u8, since: i64, last_activity: i64, sel_text: []const u8, sel_page: u16, sel_at: i64) void {
+pub const Presence = struct {
+    since: i64,
+    last_activity: i64 = 0,
+    sel_text: []const u8 = &.{},
+    sel_page: u16 = 0,
+    sel_at: i64 = 0,
+};
+
+pub fn writePresence(self: *Self, path: []const u8, p: Presence) void {
     if (self.books_dir.len == 0) return;
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const dir = std.fmt.allocPrint(a, "{s}/../open", .{self.books_dir}) catch return;
-    std.Io.Dir.cwd().createDirPath(self.io, dir) catch return;
-    const file = std.fmt.allocPrint(a, "{s}/{d}.json", .{ dir, std.c.getpid() }) catch return;
-    const entry = OpenEntry{ .path = path, .pid = std.c.getpid(), .since = since, .last_activity = last_activity, .selection = sel_text, .selection_page = sel_page, .selection_at = sel_at };
+    std.Io.Dir.cwd().createDirPath(self.io, self.paths.open) catch return;
+    const file = std.fmt.allocPrint(a, "{s}/{d}.json", .{ self.paths.open, std.c.getpid() }) catch return;
+    const entry = OpenEntry{ .path = path, .pid = std.c.getpid(), .since = p.since, .last_activity = p.last_activity, .selection = p.sel_text, .selection_page = p.sel_page, .selection_at = p.sel_at };
     const json_str = std.json.Stringify.valueAlloc(a, entry, .{}) catch return;
-    _ = writeAtomic(a, self.io, file, json_str);
+    _ = writeAtomic(self.io, file, json_str);
 }
 
 pub fn clearPresence(self: *Self) void {
     if (self.books_dir.len == 0) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file = std.fmt.bufPrint(&buf, "{s}/../open/{d}.json", .{ self.books_dir, std.c.getpid() }) catch return;
+    const file = std.fmt.bufPrint(&buf, "{s}/{d}.json", .{ self.paths.open, std.c.getpid() }) catch return;
     std.Io.Dir.cwd().deleteFile(self.io, file) catch {};
 }
 
 // Agent-to-reader command inbox: <state>/open/<pid>.cmd, one command per
 // file, consumed by the instance's control thread.
-pub fn controlPath(a: std.mem.Allocator, env: *std.process.Environ.Map, pid: i32) ?[]u8 {
-    const state = stateDir(a, env) orelse return null;
-    return std.fmt.allocPrint(a, "{s}/open/{d}.cmd", .{ state, pid }) catch null;
-}
-
-pub fn sendCommand(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, pid: i32, command: []const u8) bool {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const path = controlPath(a, env, pid) orelse return false;
-    return writeAtomic(a, io, path, command);
+pub fn sendCommand(io: std.Io, paths: Paths, pid: i32, command: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{d}.cmd", .{ paths.open, pid }) catch return false;
+    return writeAtomic(io, path, command);
 }
 
 // The pending command for this process, if any (the file is removed).
 pub fn takeCommand(self: *Self, allocator: std.mem.Allocator) ?[]u8 {
     if (self.books_dir.len == 0) return null;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}/../open/{d}.cmd", .{ self.books_dir, std.c.getpid() }) catch return null;
+    const path = std.fmt.bufPrint(&buf, "{s}/{d}.cmd", .{ self.paths.open, std.c.getpid() }) catch return null;
     const cwd = std.Io.Dir.cwd();
     const content = cwd.readFileAlloc(self.io, path, allocator, .limited(4096)) catch return null;
     cwd.deleteFile(self.io, path) catch {};
@@ -358,12 +357,11 @@ pub fn takeCommand(self: *Self, allocator: std.mem.Allocator) ?[]u8 {
 }
 
 // Live instances; stale files (dead pids) are removed on the way.
-pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []OpenEntry {
+pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []OpenEntry {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const state = stateDir(a, env) orelse return &.{};
-    const dir_path = std.fmt.allocPrint(a, "{s}/open", .{state}) catch return &.{};
+    const dir_path = paths.open;
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
@@ -397,14 +395,12 @@ pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
 // Every book with a shard, newest first. Prefers this device's path, then any
 // shard whose path exists here, else the newest shard's path tagged with its
 // device (the book is not on this machine).
-pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) []RecentEntry {
+pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []RecentEntry {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const state = stateDir(a, env) orelse return &.{};
-    const books = std.fmt.allocPrint(a, "{s}/books", .{state}) catch return &.{};
-    const device = deviceId(a, io, state);
-    migrateLegacy(a, io, env, state, books, device);
+    const books = paths.books;
+    const device = deviceId(a, io, paths.state);
 
     var out: std.ArrayList(RecentEntry) = .empty;
     const cwd = std.Io.Dir.cwd();
@@ -467,14 +463,12 @@ const BookBundle = struct {
 pub const TransferStats = struct { books: usize = 0, shards: usize = 0 };
 
 // Every shard of every book as one JSON document.
-pub fn exportAll(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, out: *std.Io.Writer) !TransferStats {
+pub fn exportAll(allocator: std.mem.Allocator, io: std.Io, paths: Paths, out: *std.Io.Writer) !TransferStats {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const state = stateDir(a, env) orelse return error.NoStateDir;
-    const books = try std.fmt.allocPrint(a, "{s}/books", .{state});
-    const device = deviceId(a, io, state);
-    migrateLegacy(a, io, env, state, books, device);
+    const books = paths.books;
+    const device = deviceId(a, io, paths.state);
 
     var list: std.ArrayList(BookBundle) = .empty;
     var stats = TransferStats{};
@@ -500,14 +494,11 @@ pub fn exportAll(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Env
 // Merges a bundle into the local shards: each imported shard is merged with
 // the local shard of the same book+device (newest view wins, annotations
 // union with tombstones), so importing is idempotent and never loses work.
-pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, json: []const u8) !TransferStats {
+pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, paths: Paths, json: []const u8) !TransferStats {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const state = stateDir(a, env) orelse return error.NoStateDir;
-    const books = try std.fmt.allocPrint(a, "{s}/books", .{state});
-    const device = deviceId(a, io, state);
-    migrateLegacy(a, io, env, state, books, device);
+    const books = paths.books;
 
     const bundle = try std.json.parseFromSliceLeaky(Bundle, a, json, .{ .ignore_unknown_fields = true });
     const cwd = std.Io.Dir.cwd();
@@ -535,11 +526,11 @@ pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
                 .updated_at = view.last_opened,
                 .view = toView(view),
                 .marks = try marksToRecs(a, merged.marks),
-                .highlights = try hlToRecs(a, merged.highlights),
+                .highlights = try withHighlightIds(a, merged.highlights),
                 .tombstones = try tombsToRecs(a, merged.tombstones),
             };
             const json_str = try std.json.Stringify.valueAlloc(a, out, .{ .whitespace = .indent_2 });
-            if (writeAtomic(a, io, file, json_str)) stats.shards += 1;
+            if (writeAtomic(io, file, json_str)) stats.shards += 1;
         }
         stats.books += 1;
     }
@@ -624,13 +615,8 @@ fn mergeShards(a: std.mem.Allocator, shards: []const Shard) !Merged {
     for (shards) |s| {
         for (s.highlights) |h| {
             if (h.rects.len < 4) continue;
-            const rec = Highlight{
-                .id = if (h.id != 0) h.id else highlightId(h.page, h.rects),
-                .page = h.page,
-                .text = h.text,
-                .rects = h.rects,
-                .created_at = h.created_at,
-            };
+            var rec = h;
+            if (rec.id == 0) rec.id = highlightId(h.page, h.rects);
             var found = false;
             for (hls.items) |*e| {
                 if (e.id == rec.id) {
@@ -676,9 +662,8 @@ fn deletedAt(tombs: []const Tombstone, kind: @FieldType(Tombstone, "kind"), lett
 
 // ---- shard files ---------------------------------------------------------
 
-fn loadBook(self: *Self, key: []const u8) !Merged {
+fn loadBook(self: *Self, a: std.mem.Allocator, key: []const u8) !Merged {
     if (self.books_dir.len == 0) return .{};
-    const a = self.arena.allocator();
     const dir = try self.bookDir(a, key);
     const shards = try readAllShards(a, self.io, dir);
     return mergeShards(a, shards);
@@ -704,18 +689,8 @@ fn readShard(a: std.mem.Allocator, io: std.Io, path: []const u8) ?Shard {
 }
 
 // True on success. Per-process temp name: two instances may save at once.
-fn writeAtomic(a: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) bool {
-    const cwd = std.Io.Dir.cwd();
-    const tmp_path = std.fmt.allocPrint(a, "{s}.{d}.tmp", .{ path, std.c.getpid() }) catch return false;
-    {
-        var file = cwd.createFile(io, tmp_path, .{}) catch return false;
-        defer file.close(io);
-        var buf: [4096]u8 = undefined;
-        var fw = file.writer(io, &buf);
-        fw.interface.writeAll(data) catch return false;
-        fw.interface.flush() catch return false;
-    }
-    std.Io.Dir.renameAbsolute(tmp_path, path, io) catch return false;
+fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) bool {
+    fs.writeFileAtomic(io, path, data) catch return false;
     return true;
 }
 
@@ -736,31 +711,6 @@ fn safeKey(a: std.mem.Allocator, key: []const u8) ![]u8 {
     return out;
 }
 
-// Set from config (`stateDir`) before any state access. Copied into a
-// static buffer: the config that sets it may be freed before it is used.
-var state_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-var state_dir_len: usize = 0;
-
-pub fn setStateDirOverride(dir: []const u8) void {
-    const d = std.mem.trimEnd(u8, dir, "/");
-    if (d.len == 0 or d.len > state_dir_buf.len) return;
-    @memcpy(state_dir_buf[0..d.len], d);
-    state_dir_len = d.len;
-}
-
-pub fn stateDirFor(a: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
-    return stateDir(a, env);
-}
-
-fn stateDir(a: std.mem.Allocator, env: *std.process.Environ.Map) ?[]u8 {
-    if (state_dir_len > 0) return a.dupe(u8, state_dir_buf[0..state_dir_len]) catch null;
-    if (env.get("XDG_STATE_HOME")) |x| {
-        return std.fmt.allocPrint(a, "{s}/termre", .{x}) catch null;
-    }
-    const home = env.get("HOME") orelse return null;
-    return std.fmt.allocPrint(a, "{s}/.local/state/termre", .{home}) catch null;
-}
-
 // Stable per-machine name, minted once: `<hostname>-<4 hex>`.
 fn deviceId(a: std.mem.Allocator, io: std.Io, state: []const u8) []const u8 {
     const cwd = std.Io.Dir.cwd();
@@ -779,7 +729,7 @@ fn deviceId(a: std.mem.Allocator, io: std.Io, state: []const u8) []const u8 {
         if (!std.ascii.isAlphanumeric(c.*) and c.* != '-') c.* = '-';
     }
     cwd.createDirPath(io, state) catch {};
-    _ = writeAtomic(a, io, path, id);
+    _ = writeAtomic(io, path, id);
     return id;
 }
 
@@ -807,11 +757,12 @@ fn marksToRecs(a: std.mem.Allocator, marks: []const Mark) ![]MarkRec {
     return out;
 }
 
-fn hlToRecs(a: std.mem.Allocator, hls: []const Highlight) ![]HlRec {
-    const out = try a.alloc(HlRec, hls.len);
-    for (hls, 0..) |h, i| {
-        out[i] = .{ .id = if (h.id != 0) h.id else highlightId(h.page, h.rects), .page = h.page, .text = h.text, .rects = h.rects, .created_at = h.created_at };
-    }
+// Older records carry id 0; the content hash is the identity on disk.
+fn withHighlightIds(a: std.mem.Allocator, hls: []const Highlight) ![]Highlight {
+    const out = try a.dupe(Highlight, hls);
+    for (out) |*h| if (h.id == 0) {
+        h.id = highlightId(h.page, h.rects);
+    };
     return out;
 }
 
@@ -828,117 +779,120 @@ fn tombsToRecs(a: std.mem.Allocator, tombs: []const Tombstone) ![]TombRec {
     return out;
 }
 
-// ---- legacy positions.json -----------------------------------------------
+const testing = std.testing;
 
-// One-shot: the first run with no books/ directory converts every entry of
-// positions.json (termre, else fancy-cat) into this device's shards. The old
-// file is left in place for older binaries.
-fn migrateLegacy(a: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, state: []const u8, books: []const u8, device: []const u8) void {
-    const cwd = std.Io.Dir.cwd();
-    if (cwd.access(io, books, .{})) |_| return else |_| {}
-    cwd.createDirPath(io, books) catch return;
-
-    const primary = std.fmt.allocPrint(a, "{s}/positions.json", .{state}) catch return;
-    var content: ?[]u8 = cwd.readFileAlloc(io, primary, a, .limited(4 * 1024 * 1024)) catch null;
-    if (content == null) {
-        const legacy: ?[]u8 = if (env.get("XDG_STATE_HOME")) |x|
-            std.fmt.allocPrint(a, "{s}/fancy-cat/positions.json", .{x}) catch null
-        else if (env.get("HOME")) |h|
-            std.fmt.allocPrint(a, "{s}/.local/state/fancy-cat/positions.json", .{h}) catch null
-        else
-            null;
-        if (legacy) |lp| content = cwd.readFileAlloc(io, lp, a, .limited(4 * 1024 * 1024)) catch null;
-    }
-    const raw = content orelse return;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return;
-    if (parsed != .object) return;
-
-    var it = parsed.object.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.* != .object) continue;
-        const obj = kv.value_ptr.object;
-        var pos = Position{};
-        inline for (comptime meta.fields(View)) |f| {
-            @field(pos, f.name) = jsonGet(f.type, obj, f.name, @field(pos, f.name));
-        }
-        const stamp = jsonGet(i64, obj, "last_opened", 0);
-        const shard = Shard{
-            .device = device,
-            .path = jsonGet([]const u8, obj, "path", ""),
-            .updated_at = if (stamp > 0) stamp else time.nowRealSeconds(),
-            .view = toView(pos),
-            .marks = legacyMarks(a, obj, stamp) catch &.{},
-            .highlights = legacyHighlights(a, obj, stamp) catch &.{},
-        };
-        const dir = std.fmt.allocPrint(a, "{s}/{s}", .{ books, safeKey(a, kv.key_ptr.*) catch continue }) catch continue;
-        cwd.createDirPath(io, dir) catch continue;
-        const path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, device }) catch continue;
-        const json_str = std.json.Stringify.valueAlloc(a, shard, .{ .whitespace = .indent_2 }) catch continue;
-        _ = writeAtomic(a, io, path, json_str);
-    }
-}
-
-fn legacyMarks(a: std.mem.Allocator, obj: std.json.ObjectMap, stamp: i64) ![]MarkRec {
-    var out: std.ArrayList(MarkRec) = .empty;
-    const arr = obj.get("marks") orelse return out.items;
-    if (arr != .array) return out.items;
-    for (arr.array.items) |item| {
-        if (item != .object) continue;
-        const letter = jsonGet([]const u8, item.object, "letter", "");
-        if (letter.len == 0) continue;
-        try out.append(a, .{
-            .letter = letter[0..1],
-            .page = jsonGet(u16, item.object, "page", 0),
-            .scroll_x = jsonGet(i32, item.object, "scroll_x", 0),
-            .scroll_y = jsonGet(i32, item.object, "scroll_y", 0),
-            .comment = jsonGet([]const u8, item.object, "comment", ""),
-            .updated_at = stamp,
-        });
-    }
-    return out.items;
-}
-
-fn legacyHighlights(a: std.mem.Allocator, obj: std.json.ObjectMap, stamp: i64) ![]HlRec {
-    var out: std.ArrayList(HlRec) = .empty;
-    const arr = obj.get("highlights") orelse return out.items;
-    if (arr != .array) return out.items;
-    for (arr.array.items) |item| {
-        if (item != .object) continue;
-        const rects_v = item.object.get("rects") orelse continue;
-        if (rects_v != .array) continue;
-        const n = rects_v.array.items.len - (rects_v.array.items.len % 4);
-        if (n == 0) continue;
-        const rects = try a.alloc(f32, n);
-        for (rects_v.array.items[0..n], 0..) |rv, i| {
-            rects[i] = switch (rv) {
-                .float => |f| @floatCast(f),
-                .integer => |iv| @floatFromInt(iv),
-                else => 0,
-            };
-        }
-        const page = jsonGet(u16, item.object, "page", 0);
-        try out.append(a, .{
-            .id = highlightId(page, rects),
-            .page = page,
-            .text = jsonGet([]const u8, item.object, "text", ""),
-            .rects = rects,
-            .created_at = stamp,
-        });
-    }
-    return out.items;
-}
-
-fn jsonGet(comptime T: type, obj: std.json.ObjectMap, name: []const u8, fallback: T) T {
-    const v = obj.get(name) orelse return fallback;
-    return switch (@typeInfo(T)) {
-        .int => if (v == .integer) (std.math.cast(T, v.integer) orelse fallback) else fallback,
-        .float => switch (v) {
-            .float => |f| @floatCast(f),
-            .integer => |i| @floatFromInt(i),
-            else => fallback,
-        },
-        .bool => if (v == .bool) v.bool else fallback,
-        .pointer => if (v == .string) v.string else fallback,
-        else => @compileError("unsupported field type for jsonGet"),
+fn testPaths(a: std.mem.Allocator, state: []const u8) !Paths {
+    return .{
+        .state = try a.dupe(u8, state),
+        .books = try std.fmt.allocPrint(a, "{s}/books", .{state}),
+        .open = try std.fmt.allocPrint(a, "{s}/open", .{state}),
+        .history = try std.fmt.allocPrint(a, "{s}/history", .{state}),
+        .downloads = try std.fmt.allocPrint(a, "{s}/downloads", .{state}),
     };
+}
+
+fn testShard(device: []const u8, updated_at: i64, view: View) Shard {
+    return .{ .device = device, .path = "/b.pdf", .updated_at = updated_at, .view = view };
+}
+
+test "mergeShards: progress beats a newer untouched record, else newest wins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const idle_newer = [_]Shard{ testShard("laptop", 10, .{ .page = 5, .touched = true }), testShard("desk", 20, .{}) };
+    const m = try mergeShards(a, &idle_newer);
+    try testing.expectEqual(@as(u16, 5), m.view.?.page);
+    try testing.expectEqualStrings("laptop", m.view.?.device);
+    try testing.expectEqual(@as(i64, 10), m.view.?.last_opened);
+    const both_moved = [_]Shard{ testShard("laptop", 10, .{ .page = 5, .touched = true }), testShard("desk", 20, .{ .page = 9, .touched = true }) };
+    try testing.expectEqual(@as(u16, 9), (try mergeShards(a, &both_moved)).view.?.page);
+}
+
+test "mergeShards: marks and highlights union; a newer tombstone removes, an older one does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rects = [_]f32{ 1, 2, 3, 4 };
+    const laptop = Shard{
+        .device = "laptop",
+        .updated_at = 10,
+        .marks = &.{ .{ .letter = "a", .page = 1, .updated_at = 5 }, .{ .letter = "c", .page = 7, .updated_at = 10 } },
+        .highlights = &.{ .{ .page = 1, .rects = &rects, .created_at = 5 }, .{ .id = 42, .page = 2, .rects = &rects, .created_at = 5 } },
+        .tombstones = &.{ .{ .kind = "mark", .letter = "b", .deleted_at = 9 }, .{ .kind = "mark", .letter = "c", .deleted_at = 9 }, .{ .kind = "highlight", .id = 42, .deleted_at = 6 } },
+    };
+    const desk = Shard{
+        .device = "desk",
+        .updated_at = 20,
+        .marks = &.{ .{ .letter = "a", .page = 2, .updated_at = 7 }, .{ .letter = "b", .page = 3, .updated_at = 8 } },
+        .highlights = &.{.{ .page = 1, .rects = &rects, .created_at = 6 }},
+    };
+    const m = try mergeShards(a, &.{ laptop, desk });
+    try testing.expectEqual(@as(usize, 2), m.marks.len);
+    try testing.expectEqual(@as(u8, 'a'), m.marks[0].letter);
+    try testing.expectEqual(@as(u16, 2), m.marks[0].page);
+    try testing.expectEqual(@as(u8, 'c'), m.marks[1].letter);
+    try testing.expectEqual(@as(usize, 1), m.highlights.len);
+    try testing.expectEqual(highlightId(1, &rects), m.highlights[0].id);
+    try testing.expectEqual(@as(i64, 6), m.highlights[0].created_at);
+    try testing.expectEqual(@as(usize, 3), m.tombstones.len);
+}
+
+test "viewEql ignores touched; hasProgress" {
+    const v = View{ .page = 3, .zoom = 1.5 };
+    var w = v;
+    w.touched = true;
+    try testing.expect(viewEql(v, w));
+    w.zoom = 2;
+    try testing.expect(!viewEql(v, w));
+    try testing.expect(!hasProgress(.{}));
+    try testing.expect(hasProgress(.{ .scroll_y = 1 }));
+    try testing.expect(hasProgress(.{ .touched = true }));
+}
+
+test "save, load, export and import round-trip through the state dir" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const state1 = try std.fmt.allocPrint(ta, "{s}/one", .{root});
+    defer ta.free(state1);
+    const state2 = try std.fmt.allocPrint(ta, "{s}/two", .{root});
+    defer ta.free(state2);
+    const p1 = try testPaths(ta, state1);
+    defer p1.deinit(ta);
+    const p2 = try testPaths(ta, state2);
+    defer p2.deinit(ta);
+
+    const marks = [_]Mark{.{ .letter = 'a', .page = 2, .scroll_x = 0, .scroll_y = 10, .comment = "note", .updated_at = 5 }};
+    {
+        var p = init(ta, io, p1, "pdf-id:test");
+        defer p.deinit();
+        try testing.expect(p.getSavedPosition() == null);
+        _ = try p.save(.{ .page = 3, .touched = true, .path = "/books/x.pdf" }, &marks, &.{}, &.{});
+    }
+    {
+        var p = init(ta, io, p1, "pdf-id:test");
+        defer p.deinit();
+        try testing.expectEqual(@as(u16, 3), p.getSavedPosition().?.page);
+        try testing.expectEqualStrings("/books/x.pdf", p.getSavedPosition().?.path);
+        var ml = p.loadMarks(ta);
+        defer {
+            for (ml.items) |m| ta.free(m.comment);
+            ml.deinit(ta);
+        }
+        try testing.expectEqual(@as(usize, 1), ml.items.len);
+        try testing.expectEqualStrings("note", ml.items[0].comment);
+    }
+    var out: std.Io.Writer.Allocating = .init(ta);
+    defer out.deinit();
+    const exported = try exportAll(ta, io, p1, &out.writer);
+    try testing.expectEqual(@as(usize, 1), exported.books);
+
+    const imported = try importBundle(ta, io, p2, out.written());
+    try testing.expectEqual(@as(usize, 1), imported.books);
+    var q = init(ta, io, p2, "pdf-id:test");
+    defer q.deinit();
+    try testing.expectEqual(@as(u16, 3), q.getSavedPosition().?.page);
 }

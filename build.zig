@@ -62,7 +62,6 @@ pub fn build(b: *std.Build) void {
     var useVendorMupdf = true;
     const root = b.root.root_dir.path orelse ".";
     const prefix = b.fmt("{s}/mupdf-out", .{root});
-    const location = prefix;
 
     b.root.root_dir.handle.access(b.graph.io, "deps/mupdf/Makefile", .{}) catch |err| {
         if (err == error.FileNotFound) {
@@ -74,34 +73,23 @@ pub fn build(b: *std.Build) void {
     };
     if (useVendorMupdf) patchMupdfContextH(b);
 
-    const allocator = std.heap.page_allocator;
-    var make_args: std.ArrayList([]const u8) = .empty;
-    defer make_args.deinit(allocator);
-
-    make_args.append(allocator, "make") catch unreachable;
-
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    make_args.append(allocator, b.fmt("-j{d}", .{cpu_count})) catch unreachable;
-
-    make_args.append(allocator, "-C") catch unreachable;
-    make_args.append(allocator, b.fmt("{s}/deps/mupdf", .{root})) catch unreachable;
-
-    if (target.result.os.tag == .linux) {
-        make_args.append(allocator, "HAVE_X11=no") catch unreachable;
-        make_args.append(allocator, "HAVE_GLUT=no") catch unreachable;
-    }
-
-    make_args.append(allocator, "XCFLAGS=-w -DTOFU -DTOFU_CJK -DFZ_ENABLE_PDF=1 " ++
-        "-DFZ_ENABLE_XPS=0 -DFZ_ENABLE_SVG=0 -DFZ_ENABLE_CBZ=0 " ++
-        "-DFZ_ENABLE_IMG=0 -DFZ_ENABLE_HTML=0 -DFZ_ENABLE_EPUB=0") catch unreachable;
-    make_args.append(allocator, "tools=no") catch unreachable;
-    make_args.append(allocator, "apps=no") catch unreachable;
-
-    const prefix_arg = b.fmt("prefix={s}", .{prefix});
-    make_args.append(allocator, prefix_arg) catch unreachable;
-    make_args.append(allocator, "install") catch unreachable;
-
-    const mupdf_build_step = b.addSystemCommand(make_args.items);
+    const mupdf_build_step = b.addSystemCommand(&.{
+        "make",
+        b.fmt("-j{d}", .{cpu_count}),
+        "-C",
+        b.fmt("{s}/deps/mupdf", .{root}),
+    });
+    if (target.result.os.tag == .linux) mupdf_build_step.addArgs(&.{ "HAVE_X11=no", "HAVE_GLUT=no" });
+    mupdf_build_step.addArgs(&.{
+        "XCFLAGS=-w -DTOFU -DTOFU_CJK -DFZ_ENABLE_PDF=1 " ++
+            "-DFZ_ENABLE_XPS=0 -DFZ_ENABLE_SVG=0 -DFZ_ENABLE_CBZ=0 " ++
+            "-DFZ_ENABLE_IMG=0 -DFZ_ENABLE_HTML=0 -DFZ_ENABLE_EPUB=0",
+        "tools=no",
+        "apps=no",
+        b.fmt("prefix={s}", .{prefix}),
+        "install",
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -138,9 +126,8 @@ pub fn build(b: *std.Build) void {
 
     if (useVendorMupdf) {
         exe.step.dependOn(&mupdf_build_step.step);
-        addMupdfStatic(exe_mod, b, location);
+        addMupdfStatic(exe_mod, b, prefix);
         b.installArtifact(exe);
-        b.getInstallStep().dependOn(&mupdf_build_step.step);
     } else {
         addMupdfDynamic(exe_mod, target.result);
         b.installArtifact(exe);
@@ -155,7 +142,7 @@ pub fn build(b: *std.Build) void {
     });
     c_mod.addIncludePath(b.path("src/mupdf-z"));
     if (useVendorMupdf) {
-        c_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{location}) });
+        c_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
         c_mod.run.step.dependOn(&mupdf_build_step.step);
     } else if (target.result.os.tag == .macos) {
         c_mod.addIncludePath(.{ .cwd_relative = if (target.result.cpu.arch == .aarch64) "/opt/homebrew/include" else "/usr/local/include" });
@@ -168,4 +155,15 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.addPassthruArgs();
     b.step("run", "Run the app").dependOn(&run_cmd.step);
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.addImport("vaxis", deps.vaxis.module("vaxis"));
+    test_mod.addImport("yaml", deps.yaml.module("yaml"));
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
 }

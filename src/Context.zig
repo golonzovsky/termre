@@ -18,8 +18,11 @@ const Cache = @import("./Cache.zig");
 const ReloadIndicatorTimer = @import("services/ReloadIndicatorTimer.zig");
 const History = @import("services/History.zig");
 const Positions = @import("services/Positions.zig");
+const Paths = @import("services/Paths.zig");
 const Sync = @import("services/Sync.zig");
 const Prerenderer = @import("services/Prerenderer.zig");
+const StatusBar = @import("StatusBar.zig");
+const Selection = @import("Selection.zig");
 const time = @import("utilities/time.zig");
 
 pub const Event = union(enum) {
@@ -27,7 +30,7 @@ pub const Event = union(enum) {
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     file_changed,
-    reload_done: usize,
+    reload_done,
     prerender_ready,
     sync: Sync.Result,
     // From the command inbox (an agent's goto_page); owned, freed by the handler.
@@ -84,19 +87,20 @@ pub const Context = struct {
     tty: vaxis.Tty,
     vx: vaxis.Vaxis,
     document_handler: PdfHandler,
-    page_info_text: []u8,
-    current_page: ?vaxis.Image,
     watcher: ?fzwatch.Watcher,
     watcher_thread: ?std.Thread,
     config: *Config,
     loop: ?*vaxis.Loop(Event),
     current_mode: Mode,
+    next_mode: ?ModeType = null,
+    pending_command_text: ?[]u8 = null,
     history: History,
     positions: Positions,
     doc_key: []u8,
     doc_abs_path: [:0]u8,
+    paths: Paths,
+    status_path: []u8,
     outline: []const PdfHandler.OutlineEntry,
-    reload_page: bool,
     cache: Cache,
     reload_indicator_timer: ReloadIndicatorTimer,
     current_reload_indicator_state: ReloadIndicatorState,
@@ -124,9 +128,10 @@ pub const Context = struct {
     // session; recorded so an opened-but-untouched record can't outrank it.
     view_touched: bool,
     saved_once: bool,
+    save_warned: bool = false,
     control_quit: std.atomic.Value(bool),
     control_thread: ?std.Thread,
-    started_at: i64,
+    presence: Positions.Presence,
     // Timestamp of the view state we last saved or adopted; a pulled view
     // only replaces ours when it is newer than this.
     last_view_ts: i64,
@@ -141,14 +146,8 @@ pub const Context = struct {
     selection_dragged: bool,
     selection_hits: std.ArrayList(PdfHandler.SearchHit),
     selection_text: []u8,
-    last_sel_text: []u8,
-    last_sel_page: u16,
-    last_sel_at: i64,
     selection_gen: u32,
     selection_render_ns: i64,
-    // Images displaced from the cache; deleted terminal-side after the next
-    // render (deleting before would blank their placements for a frame).
-    stale_images: std.ArrayList(Cache.CachedImage),
     last_save_sig: u64,
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, path: [:0]const u8, initial_page: ?u16) !Self {
         const config = try allocator.create(Config);
@@ -164,8 +163,12 @@ pub const Context = struct {
 
         const doc_abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch try allocator.dupeSentinel(u8, path, 0);
         errdefer allocator.free(doc_abs_path);
+        const status_path = try StatusBar.displayPath(allocator, io, env, doc_abs_path);
+        errdefer allocator.free(status_path);
 
-        var positions = Positions.init(allocator, io, env, config, doc_key);
+        const paths = try Paths.init(allocator, env, config);
+        errdefer paths.deinit(allocator);
+        var positions = Positions.init(allocator, io, paths, doc_key);
         errdefer positions.deinit();
         // An explicit page argument overrides only the position; view settings
         // (zoom/crop/spread/...) are always restored, otherwise the next
@@ -186,17 +189,7 @@ pub const Context = struct {
         errdefer tombstones.deinit(allocator);
         const last_view_ts: i64 = if (positions.getSavedPosition()) |p| p.last_opened else 0;
         const sync = makeSync(allocator, io, env, config, &positions);
-        {
-            var flat: std.ArrayList(PdfHandler.SearchHit) = .empty;
-            defer flat.deinit(allocator);
-            for (highlights.items) |h| {
-                var i: usize = 0;
-                while (i + 3 < h.rects.len) : (i += 4) {
-                    flat.append(allocator, .{ .page = h.page, .x0 = h.rects[i], .y0 = h.rects[i + 1], .x1 = h.rects[i + 2], .y1 = h.rects[i + 3] }) catch break;
-                }
-            }
-            document_handler.setHighlightQuads(flat.items);
-        }
+        Selection.applyHighlightQuads(allocator, &document_handler, highlights.items);
 
         var watcher: ?fzwatch.Watcher = null;
         if (config.file_monitor.enabled) {
@@ -231,7 +224,7 @@ pub const Context = struct {
         const buf = try allocator.alloc(u8, 4096);
         const tty = try vaxis.Tty.init(io, buf);
         const reload_indicator_timer = ReloadIndicatorTimer.init(config);
-        const history = History.init(allocator, io, env, config);
+        const history = History.init(allocator, io, paths, config);
 
         return .{
             .allocator = allocator,
@@ -242,8 +235,6 @@ pub const Context = struct {
             .tty = tty,
             .vx = vx,
             .document_handler = document_handler,
-            .page_info_text = &[_]u8{},
-            .current_page = null,
             .watcher = watcher,
             .watcher_thread = null,
             .config = config,
@@ -253,8 +244,9 @@ pub const Context = struct {
             .positions = positions,
             .doc_key = doc_key,
             .doc_abs_path = doc_abs_path,
+            .paths = paths,
+            .status_path = status_path,
             .outline = outline,
-            .reload_page = true,
             // Rex keeps ~128 MiB of raw image bytes per block and silently
             // evicts the oldest beyond that (probed on build 1408).
             .cache = Cache.init(allocator, config.cache.lru_size, @as(usize, if (in_rex) @min(config.cache.budget_mb, 120) else config.cache.budget_mb) * 1024 * 1024),
@@ -282,7 +274,7 @@ pub const Context = struct {
             .saved_once = false,
             .control_quit = .init(false),
             .control_thread = null,
-            .started_at = time.nowRealSeconds(),
+            .presence = .{ .since = time.nowRealSeconds() },
             .last_view_ts = last_view_ts,
             .pending_op = null,
             .progress_text = null,
@@ -295,12 +287,8 @@ pub const Context = struct {
             .selection_dragged = false,
             .selection_hits = .empty,
             .selection_text = &.{},
-            .last_sel_text = &.{},
-            .last_sel_page = 0,
-            .last_sel_at = 0,
             .selection_gen = 0,
             .selection_render_ns = 0,
-            .stale_images = .empty,
             .last_save_sig = 0,
         };
     }
@@ -358,11 +346,15 @@ pub const Context = struct {
         var pos_out = pos;
         pos_out.touched = self.view_touched;
         // Only a successful write counts as saved; a failed one is retried.
-        const ts = self.positions.save(pos_out, self.marks.items, self.highlights.items, self.tombstones.items) orelse return;
+        const ts = self.positions.save(pos_out, self.marks.items, self.highlights.items, self.tombstones.items) catch |err| {
+            if (!self.save_warned) self.progress_text = std.fmt.bufPrint(&self.progress_buf, " state not saved: {s} ", .{@errorName(err)}) catch null;
+            self.save_warned = true;
+            return;
+        };
         self.saved_once = true;
         self.last_save_sig = sig;
         self.last_view_ts = ts;
-        self.positions.writePresence(self.doc_abs_path, self.started_at, pos.last_opened, self.last_sel_text, self.last_sel_page, self.last_sel_at);
+        self.publishPresence(pos.last_opened);
         if (self.sync) |s| s.requestPush(false);
     }
 
@@ -387,12 +379,11 @@ pub const Context = struct {
         if (std.mem.eql(u8, verb, "select")) {
             const text = std.mem.trim(u8, it.rest(), &std.ascii.whitespace);
             if (text.len == 0) return;
-            if (self.selectTextOnPage(page, text)) {
+            if (Selection.selectTextOnPage(self, page, text)) {
                 self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent selected on p.{d} — H to highlight, Ctrl-O to go back ", .{page_1}) catch null;
             } else {
                 self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: text not found on p.{d} ", .{page_1}) catch null;
             }
-            self.reload_page = true;
             return;
         }
         if (!std.mem.eql(u8, verb, "goto")) return;
@@ -401,10 +392,7 @@ pub const Context = struct {
         if (y > 0) {
             self.gotoPagePdfY(page, y);
         } else {
-            self.document_handler.setCurrentPage(page);
-            self.document_handler.setScrollX(0);
-            self.document_handler.setScrollY(0);
-            self.resetCurrentPage();
+            self.restorePosition(.{ .page = page, .scroll_y = 0, .scroll_x = 0 });
         }
         self.progress_text = std.fmt.bufPrint(&self.progress_buf, " agent: p.{d} (Ctrl-O to go back) ", .{page_1}) catch null;
     }
@@ -426,7 +414,7 @@ pub const Context = struct {
             },
             .pushed => {},
             .err => |m| {
-                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m}) catch null;
+                self.progress_text = std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m.text()}) catch null;
             },
         }
     }
@@ -439,7 +427,7 @@ pub const Context = struct {
         self.marks = self.positions.loadMarks(self.allocator);
         self.highlights = self.positions.loadHighlights(self.allocator);
         self.tombstones = self.positions.loadTombstones(self.allocator);
-        self.rebuildHighlightQuads();
+        Selection.rebuildHighlightQuads(self);
         self.last_save_sig = 0;
 
         const pos = self.positions.getSavedPosition() orelse return;
@@ -454,7 +442,6 @@ pub const Context = struct {
             self.progress_text = " synced ";
         }
         self.clearCache();
-        self.reload_page = true;
     }
 
     pub fn syncNow(self: *Self) void {
@@ -473,10 +460,7 @@ pub const Context = struct {
             if (m.comment.len > 0) self.allocator.free(m.comment);
         }
         self.marks.deinit(self.allocator);
-        for (self.highlights.items) |h| {
-            if (h.text.len > 0) self.allocator.free(h.text);
-            if (h.rects.len > 0) self.allocator.free(h.rects);
-        }
+        for (self.highlights.items) |h| Selection.freeHighlight(self, h);
         self.highlights.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
     }
@@ -485,6 +469,7 @@ pub const Context = struct {
         // Before saveState: a mode's deinit may restore document state it
         // borrowed (e.g. crop mode zeroes the margins while active).
         self.deinitCurrentMode();
+        if (self.pending_command_text) |t| self.allocator.free(t);
         self.saveState();
         self.freeAnnotations();
         // A worker stuck in a network call still references this; leaking it
@@ -497,10 +482,10 @@ pub const Context = struct {
         if (self.search_needle.len > 0) self.allocator.free(self.search_needle);
         self.selection_hits.deinit(self.allocator);
         if (self.selection_text.len > 0) self.allocator.free(self.selection_text);
-        if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
-        self.stale_images.deinit(self.allocator);
+        if (self.presence.sel_text.len > 0) self.allocator.free(self.presence.sel_text);
         self.allocator.free(self.doc_key);
         self.allocator.free(self.doc_abs_path);
+        self.allocator.free(self.status_path);
         self.jump_back.deinit(self.allocator);
         self.jump_forward.deinit(self.allocator);
         if (self.watcher) |*w| {
@@ -509,10 +494,9 @@ pub const Context = struct {
             w.deinit();
         }
 
-        if (self.page_info_text.len > 0) self.allocator.free(self.page_info_text);
-
         self.reload_indicator_timer.deinit();
         self.history.deinit();
+        self.paths.deinit(self.allocator);
         self.prerenderer.deinit();
         self.cache.deinit();
         self.document_handler.deinit();
@@ -551,7 +535,7 @@ pub const Context = struct {
         try self.vx.queryTerminal(self.tty.writer(), std.Io.Duration.fromSeconds(1));
         if (!self.vx.caps.kitty_graphics) return error.NoKittyGraphics;
         try self.vx.setMouseMode(self.tty.writer(), true);
-        self.positions.writePresence(self.doc_abs_path, self.started_at, self.started_at, self.last_sel_text, self.last_sel_page, self.last_sel_at);
+        self.publishPresence(self.presence.since);
 
         self.prerenderer.context = self;
         if (self.config.cache.enabled) try self.prerenderer.start();
@@ -605,10 +589,10 @@ pub const Context = struct {
 
             // The new frame no longer places these; delete them terminal-side
             // so big renders don't accumulate in the terminal's image store.
-            if (self.stale_images.items.len > 0) {
-                for (self.stale_images.items) |img| self.vx.freeImage(buffered, img.image.id);
+            const evicted = self.cache.drainEvicted();
+            if (evicted.len > 0) {
+                for (evicted) |img| self.vx.freeImage(buffered, img.image.id);
                 try buffered.flush();
-                self.stale_images.clearRetainingCapacity();
             }
 
             // Persist position/zoom after any state-changing batch — draw() above
@@ -627,17 +611,27 @@ pub const Context = struct {
         }
     }
 
+    // Deferred to the end of the event: the switch deinits the calling mode's
+    // own payload, so applying it inline would leave the caller running on
+    // freed state. The last request in an event wins.
     pub fn changeMode(self: *Self, new_state: ModeType) void {
+        self.next_mode = new_state;
+    }
+
+    fn applyModeChange(self: *Self) void {
+        const new_state = self.next_mode orelse return;
+        self.next_mode = null;
         self.deinitCurrentMode();
         switch (new_state) {
             inline else => |tag| {
                 self.current_mode = @unionInit(Mode, @tagName(tag), @FieldType(Mode, @tagName(tag)).init(self));
             },
         }
-    }
-
-    pub fn resetCurrentPage(self: *Self) void {
-        self.reload_page = true;
+        if (self.pending_command_text) |text| {
+            defer self.allocator.free(text);
+            self.pending_command_text = null;
+            if (new_state == .command) self.current_mode.command.text_input.insertSliceAtCursor(text) catch {};
+        }
     }
 
     // Half the visible viewport, scrolled with a short ease-out animation.
@@ -672,9 +666,6 @@ pub const Context = struct {
         try buffered.flush();
     }
 
-    // Animated zoom: scale the already-transmitted placements around the
-    // viewport center (no renders, ~60ms), then apply the real zoom so the
-    // next draw swaps in a crisp render at the new scale.
     // Half-page jump for list popups, with the same ease-out feel as
     // smoothScrollHalf: `cursor` points at the mode's cursor field and is
     // stepped along the eased path with a redraw per frame.
@@ -727,6 +718,7 @@ pub const Context = struct {
     }
 
     pub fn update(self: *Self, event: Event) !void {
+        defer self.applyModeChange();
         switch (event) {
             .key_press => |key| {
                 self.progress_text = null;
@@ -742,7 +734,6 @@ pub const Context = struct {
             .winsize => |ws| {
                 try self.vx.resize(self.allocator, self.tty.writer(), ws);
                 self.clearCache();
-                self.reload_page = true;
             },
             .sync => |r| self.onSync(r),
             .control => |cmd| {
@@ -754,7 +745,6 @@ pub const Context = struct {
                 self.freeOutline();
                 self.outline = self.document_handler.loadOutline(self.allocator) catch &.{};
                 self.clearCache();
-                self.reload_page = true;
                 if (self.reload_indicator_active) {
                     self.current_reload_indicator_state = .reload;
                     self.reload_indicator_timer.notifyChange();
@@ -809,10 +799,7 @@ pub const Context = struct {
         );
         defer self.allocator.free(encoded_image.data);
 
-        const image = self.transmitEncoded(encoded_image) catch |err| {
-            self.deleteEncoded(encoded_image);
-            return err;
-        };
+        const image = try self.transmitOrDiscard(encoded_image);
 
         const cached = Cache.CachedImage{
             .image = image,
@@ -820,9 +807,18 @@ pub const Context = struct {
             .origin_y = encoded_image.origin_y,
         };
         if (self.config.cache.enabled) {
-            try self.cache.put(cache_key, cached, self.allocator, &self.stale_images);
+            // The render may have fitted the zoom (first draw, fit-width), so
+            // key the entry by the zoom it was actually rendered at.
+            self.cache.put(self.cacheKeyFor(page_number), cached) catch self.discardAfterFrame(cached);
+        } else {
+            self.discardAfterFrame(cached);
         }
         return cached;
+    }
+
+    // The image stays placed for this frame and is deleted terminal-side after it.
+    pub fn discardAfterFrame(self: *Self, cached: Cache.CachedImage) void {
+        self.cache.discard(cached) catch self.vx.freeImage(self.tty.writer(), cached.image.id);
     }
 
     // Delivers finished background thumbs to grid mode (or discards them).
@@ -837,10 +833,7 @@ pub const Context = struct {
                 self.deleteEncoded(r.image);
                 continue;
             }
-            const img = self.transmitEncoded(r.image) catch {
-                self.deleteEncoded(r.image);
-                continue;
-            };
+            const img = self.transmitOrDiscard(r.image) catch continue;
             self.current_mode.grid.putThumb(r.page, img);
         }
     }
@@ -853,6 +846,12 @@ pub const Context = struct {
     pub fn thumbImage(self: *Self, page: u16, max_w: u32, max_h: u32) !vaxis.Image {
         const enc = try self.document_handler.renderThumb(page, max_w, max_h);
         defer self.allocator.free(enc.data);
+        return self.transmitOrDiscard(enc);
+    }
+
+    // A render the terminal never reads keeps its backing file or shm object
+    // unless we remove it.
+    fn transmitOrDiscard(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
         return self.transmitEncoded(enc) catch |err| {
             self.deleteEncoded(enc);
             return err;
@@ -865,23 +864,14 @@ pub const Context = struct {
     // fallback streams the PNG bytes base64-chunked.
     fn transmitEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) !vaxis.Image {
         switch (enc.kind) {
-            .shm_rgb => return self.vx.transmitLocalImagePath(
+            .shm_rgb, .png_path => return self.vx.transmitLocalImagePath(
                 self.allocator,
                 self.tty.writer(),
                 enc.data,
                 enc.width,
                 enc.height,
-                .shared_mem,
-                .rgb,
-            ),
-            .png_path => return self.vx.transmitLocalImagePath(
-                self.allocator,
-                self.tty.writer(),
-                enc.data,
-                enc.width,
-                enc.height,
-                .temp_file,
-                .png,
+                if (enc.kind == .shm_rgb) .shared_mem else .temp_file,
+                if (enc.kind == .shm_rgb) .rgb else .png,
             ),
             .png_bytes => {
                 const b64 = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(enc.data.len));
@@ -892,25 +882,15 @@ pub const Context = struct {
         }
     }
 
-    // For renders discarded without being transmitted — the terminal will
-    // never read (and so never clean up) their backing file or shm object.
     pub fn deleteEncoded(self: *Self, enc: PdfHandler.types.EncodedImage) void {
-        switch (enc.kind) {
-            .png_path => std.Io.Dir.cwd().deleteFile(self.io, enc.data) catch {},
-            .shm_rgb => {
-                var name_buf: [64]u8 = undefined;
-                const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{enc.data}, 0) catch return;
-                _ = std.c.shm_unlink(name.ptr);
-            },
-            .png_bytes => {},
-        }
+        PdfHandler.Exporter.delete(self.io, enc);
     }
 
     // Empties the render cache and queues the displaced terminal-side images
     // for deletion after the next render.
     pub fn clearCache(self: *Self) void {
         _ = self.cache_gen.fetchAdd(1, .monotonic);
-        self.cache.clearInto(self.allocator, &self.stale_images);
+        self.cache.clear() catch {};
     }
 
     // Pulls finished background renders in, transmitting them to the terminal
@@ -929,15 +909,13 @@ pub const Context = struct {
                 self.deleteEncoded(r.image);
                 continue;
             }
-            const image = self.transmitEncoded(r.image) catch {
-                self.deleteEncoded(r.image);
-                continue;
-            };
-            self.cache.put(r.key, .{
+            const image = self.transmitOrDiscard(r.image) catch continue;
+            const cached = Cache.CachedImage{
                 .image = image,
                 .origin_x = r.image.origin_x,
                 .origin_y = r.image.origin_y,
-            }, self.allocator, &self.stale_images) catch {};
+            };
+            self.cache.put(r.key, cached) catch self.discardAfterFrame(cached);
         }
     }
 
@@ -946,6 +924,9 @@ pub const Context = struct {
     // up to ±3 pages (forward-biased, since reading is mostly forward) so fast
     // flipping stays cache-warm. Uncached targets only.
     fn requestPrerender(self: *Self, top_page: u16, next_page: u16, w: u32, h: u32) void {
+        // Neighbors render at the current zoom, not refitted to the viewport.
+        _ = w;
+        _ = h;
         if (!self.config.cache.enabled) return;
         const zoom = self.document_handler.getActiveZoom();
         if (zoom <= 0) return;
@@ -957,27 +938,30 @@ pub const Context = struct {
         if (est_f > 0 and @as(usize, @intFromFloat(est_f)) * 3 > self.cache.budget_bytes) return;
 
         const window = 3;
-        var targets: [Prerenderer.slots]?u16 = @splat(null);
+        var jobs: [Prerenderer.slots]?Prerenderer.Job = @splat(null);
         var n: usize = 0;
         const total = self.document_handler.getTotalPages();
 
+        // Key and render inputs are built here, on the main thread, so the
+        // worker never reads view state.
         var fwd: u32 = next_page;
-        while (fwd < @min(@as(u32, next_page) + window, total) and n < targets.len) : (fwd += 1) {
-            if (!self.cache.contains(self.cacheKeyFor(@intCast(fwd)))) {
-                targets[n] = @intCast(fwd);
-                n += 1;
-            }
+        while (fwd < @min(@as(u32, next_page) + window, total) and n < jobs.len) : (fwd += 1) {
+            const key = self.cacheKeyFor(@intCast(fwd));
+            if (self.cache.contains(key)) continue;
+            const params = self.document_handler.prerenderParams(self.allocator, key.page) catch continue;
+            jobs[n] = .{ .key = key, .params = params };
+            n += 1;
         }
         var back: u16 = 1;
-        while (back <= window and top_page >= back and n < targets.len) : (back += 1) {
-            const p = top_page - back;
-            if (!self.cache.contains(self.cacheKeyFor(p))) {
-                targets[n] = p;
-                n += 1;
-            }
+        while (back <= window and top_page >= back and n < jobs.len) : (back += 1) {
+            const key = self.cacheKeyFor(top_page - back);
+            if (self.cache.contains(key)) continue;
+            const params = self.document_handler.prerenderParams(self.allocator, key.page) catch continue;
+            jobs[n] = .{ .key = key, .params = params };
+            n += 1;
         }
         if (n == 0) return;
-        self.prerenderer.request(targets, w, h);
+        self.prerenderer.request(jobs);
     }
 
     pub fn drawCurrentPage(self: *Self, win: vaxis.Window) !void {
@@ -1001,8 +985,7 @@ pub const Context = struct {
         // full column width (flush — no gutter) and may straddle the column break.
         const columns: u16 = self.document_handler.getSpreadColumns();
         const col_cells: u16 = win.width / columns;
-        const render_cells: u16 = col_cells;
-        const render_w_pix: u32 = @as(u32, render_cells) * @as(u32, pix_per_col);
+        const render_w_pix: u32 = @as(u32, col_cells) * @as(u32, pix_per_col);
 
         if (self.modeFlag("hides_page")) return;
 
@@ -1045,8 +1028,6 @@ pub const Context = struct {
         self.document_handler.setCurrentPage(page_num);
         self.document_handler.setScrollY(scroll_y);
         self.document_handler.clampScrollX(render_w_pix);
-        self.current_page = cur.image;
-        self.reload_page = false;
 
         const scroll_x = self.document_handler.getScrollX();
         var draw_page = page_num;
@@ -1174,240 +1155,14 @@ pub const Context = struct {
         self.followLink(target);
     }
 
-    fn selectionPage(self: *Self) ?u16 {
+    pub fn selectionPage(self: *Self) ?u16 {
         if (self.selection_hits.items.len == 0) return null;
         return self.selection_hits.items[0].page;
     }
 
-    // Drops the current selection-generation cache entry. Stale generations
-    // would otherwise squat in the LRU and evict prerendered neighbor pages.
-    fn dropSelectionEntry(self: *Self) void {
-        const sp = self.selectionPage() orelse return;
-        if (self.cache.take(self.cacheKeyFor(sp))) |old| {
-            self.stale_images.append(self.allocator, old) catch {};
-        }
-    }
-
-    pub fn updateSelection(self: *Self, anchor: PagePoint, head: PagePoint) void {
-        self.selection_hits.clearRetainingCapacity();
-        if (self.selection_text.len > 0) {
-            self.allocator.free(self.selection_text);
-            self.selection_text = &.{};
-        }
-        self.selection_text = self.document_handler.selectText(
-            self.allocator,
-            anchor.page,
-            anchor.x,
-            anchor.y,
-            head.x,
-            head.y,
-            &self.selection_hits,
-        ) catch &.{};
-        self.document_handler.setSelectionQuads(self.selection_hits.items);
-        // Each re-render at high zoom is a multi-MB image transmit; during a
-        // drag, refresh the visual at most a few times per second. The state
-        // above is always current, so the release still copies exact text.
-        const now = time.nowNs();
-        if (now - self.selection_render_ns >= 250 * std.time.ns_per_ms) {
-            self.selection_render_ns = now;
-            self.dropSelectionEntry();
-            self.selection_gen +%= 1;
-            self.reload_page = true;
-        }
-    }
-
-    pub fn clearSelection(self: *Self) void {
-        if (self.selection_hits.items.len == 0 and self.selection_text.len == 0) return;
-        self.dropSelectionEntry();
-        self.selection_hits.clearRetainingCapacity();
-        if (self.selection_text.len > 0) {
-            self.allocator.free(self.selection_text);
-            self.selection_text = &.{};
-        }
-        self.document_handler.setSelectionQuads(&.{});
-        self.reload_page = true;
-    }
-
-    pub fn finishSelection(self: *Self) void {
-        if (self.selection_text.len == 0) return;
-        const w = self.tty.writer();
-        self.vx.copyToSystemClipboard(w, self.selection_text, self.allocator) catch {};
-        w.flush() catch {};
-        // The throttle above may have skipped the last drag updates; render
-        // the final selection state.
-        self.dropSelectionEntry();
-        self.selection_gen +%= 1;
-        self.reload_page = true;
-        // Shown until the next keypress clears progress_text.
-        const msg = std.fmt.bufPrint(&self.progress_buf, " copied {d} chars ", .{self.selection_text.len}) catch return;
-        self.progress_text = msg;
-        self.publishSelection();
-    }
-
-    // For `re mcp` (current_page / reading_state show the selection).
-    fn publishSelection(self: *Self) void {
-        if (self.allocator.dupe(u8, self.selection_text)) |copy| {
-            if (self.last_sel_text.len > 0) self.allocator.free(self.last_sel_text);
-            self.last_sel_text = copy;
-            self.last_sel_page = if (self.selection_hits.items.len > 0) self.selection_hits.items[0].page else self.document_handler.getCurrentPageNumber();
-            self.last_sel_at = time.nowRealSeconds();
-            self.positions.writePresence(self.doc_abs_path, self.started_at, self.last_sel_at, self.last_sel_text, self.last_sel_page, self.last_sel_at);
-        } else |_| {}
-    }
-
-    // An agent's `select`: every occurrence of `text` on the page becomes the
-    // selection (shown inverted, `H` highlights it), the view scrolls there.
-    // Nothing goes to the clipboard.
-    fn selectTextOnPage(self: *Self, page: u16, text: []const u8) bool {
-        const needle = self.allocator.dupeSentinel(u8, text, 0) catch return false;
-        defer self.allocator.free(needle);
-        var hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
-        defer hits.deinit(self.allocator);
-        self.document_handler.searchPage(self.allocator, page, needle, &hits) catch return false;
-        if (hits.items.len == 0) return false;
-        self.clearSelection();
-        self.selection_hits.appendSlice(self.allocator, hits.items) catch return false;
-        self.selection_text = self.allocator.dupe(u8, text) catch &.{};
-        self.selection_anchor = null;
-        self.selection_dragged = false;
-        self.document_handler.setSelectionQuads(self.selection_hits.items);
-        self.dropSelectionEntry();
-        self.selection_gen +%= 1;
-        self.pushJump();
-        self.gotoPagePdfY(page, hits.items[0].y0);
-        self.publishSelection();
-        return true;
-    }
-
-    fn rebuildHighlightQuads(self: *Self) void {
-        var flat: std.ArrayList(PdfHandler.SearchHit) = .empty;
-        defer flat.deinit(self.allocator);
-        for (self.highlights.items) |h| {
-            var i: usize = 0;
-            while (i + 3 < h.rects.len) : (i += 4) {
-                flat.append(self.allocator, .{ .page = h.page, .x0 = h.rects[i], .y0 = h.rects[i + 1], .x1 = h.rects[i + 2], .y1 = h.rects[i + 3] }) catch break;
-            }
-        }
-        self.document_handler.setHighlightQuads(flat.items);
-    }
-
-    fn rectsOverlap(a: []const f32, b: []const f32) bool {
-        var i: usize = 0;
-        while (i + 3 < a.len) : (i += 4) {
-            var j: usize = 0;
-            while (j + 3 < b.len) : (j += 4) {
-                if (a[i] < b[j + 2] and b[j] < a[i + 2] and a[i + 1] < b[j + 3] and b[j + 1] < a[i + 3]) return true;
-            }
-        }
-        return false;
-    }
-
-    pub fn addHighlightFromSelection(self: *Self) void {
-        if (self.selection_hits.items.len == 0) return;
-        const page = self.selection_hits.items[0].page;
-
-        var collected: std.ArrayList(f32) = .empty;
-        defer collected.deinit(self.allocator);
-        for (self.selection_hits.items) |q| {
-            collected.appendSlice(self.allocator, &.{ q.x0, q.y0, q.x1, q.y1 }) catch return;
-        }
-
-        // Absorb every existing highlight on this page that overlaps the
-        // growing union (re-scanning so chains of overlaps merge too).
-        var merged_any = false;
-        var scan_again = true;
-        while (scan_again) {
-            scan_again = false;
-            var i: usize = 0;
-            while (i < self.highlights.items.len) : (i += 1) {
-                const h = self.highlights.items[i];
-                if (h.page != page or !rectsOverlap(h.rects, collected.items)) continue;
-                collected.appendSlice(self.allocator, h.rects) catch return;
-                self.tombstones.append(self.allocator, .{ .kind = .highlight, .id = h.id, .deleted_at = time.nowRealSeconds() }) catch {};
-                if (h.text.len > 0) self.allocator.free(h.text);
-                if (h.rects.len > 0) self.allocator.free(h.rects);
-                _ = self.highlights.orderedRemove(i);
-                merged_any = true;
-                scan_again = true;
-                break;
-            }
-        }
-
-        var text: []const u8 = "";
-        var rects: []f32 = &.{};
-        if (merged_any) {
-            // Re-select from the union's first to last point in reading order:
-            // exact merged text plus clean per-line quads.
-            var first: [2]f32 = .{ collected.items[0], (collected.items[1] + collected.items[3]) / 2 };
-            var last: [2]f32 = .{ collected.items[2], (collected.items[1] + collected.items[3]) / 2 };
-            var i: usize = 4;
-            while (i + 3 < collected.items.len) : (i += 4) {
-                const cy = (collected.items[i + 1] + collected.items[i + 3]) / 2;
-                if (cy < first[1] or (cy == first[1] and collected.items[i] < first[0])) first = .{ collected.items[i], cy };
-                if (cy > last[1] or (cy == last[1] and collected.items[i + 2] > last[0])) last = .{ collected.items[i + 2], cy };
-            }
-            var merged_hits: std.ArrayList(PdfHandler.SearchHit) = .empty;
-            defer merged_hits.deinit(self.allocator);
-            const merged_text = self.document_handler.selectText(
-                self.allocator,
-                page,
-                first[0] + 1,
-                first[1],
-                last[0] - 1,
-                last[1],
-                &merged_hits,
-            ) catch &.{};
-            if (merged_hits.items.len > 0) {
-                rects = self.allocator.alloc(f32, merged_hits.items.len * 4) catch return;
-                for (merged_hits.items, 0..) |q, qi| {
-                    rects[qi * 4] = q.x0;
-                    rects[qi * 4 + 1] = q.y0;
-                    rects[qi * 4 + 2] = q.x1;
-                    rects[qi * 4 + 3] = q.y1;
-                }
-                text = merged_text;
-            } else {
-                // Re-selection failed (e.g. non-text region): keep the raw union.
-                if (merged_text.len > 0) self.allocator.free(merged_text);
-                rects = self.allocator.dupe(f32, collected.items) catch return;
-                text = self.allocator.dupe(u8, self.selection_text) catch "";
-            }
-        } else {
-            rects = self.allocator.dupe(f32, collected.items) catch return;
-            text = self.allocator.dupe(u8, self.selection_text) catch "";
-        }
-
-        self.highlights.append(self.allocator, .{
-            .id = Positions.highlightId(page, rects),
-            .page = page,
-            .text = text,
-            .rects = rects,
-            .created_at = time.nowRealSeconds(),
-        }) catch {
-            self.allocator.free(rects);
-            if (text.len > 0) self.allocator.free(@constCast(text));
-            return;
-        };
-        self.clearSelection();
-        self.rebuildHighlightQuads();
-        self.clearCache();
-        self.reload_page = true;
-        const msg = std.fmt.bufPrint(&self.progress_buf, " highlighted ({d} total{s}) ", .{
-            self.highlights.items.len,
-            if (merged_any) ", merged" else "",
-        }) catch return;
-        self.progress_text = msg;
-    }
-
-    pub fn deleteHighlight(self: *Self, idx: usize) void {
-        if (idx >= self.highlights.items.len) return;
-        const h = self.highlights.orderedRemove(idx);
-        self.tombstones.append(self.allocator, .{ .kind = .highlight, .id = h.id, .deleted_at = time.nowRealSeconds() }) catch {};
-        if (h.text.len > 0) self.allocator.free(h.text);
-        if (h.rects.len > 0) self.allocator.free(h.rects);
-        self.rebuildHighlightQuads();
-        self.clearCache();
-        self.reload_page = true;
+    pub fn publishPresence(self: *Self, last_activity: i64) void {
+        self.presence.last_activity = last_activity;
+        self.positions.writePresence(self.doc_abs_path, self.presence);
     }
 
     // Jump to `page` scrolled so pdf_y sits near the viewport top.
@@ -1415,34 +1170,15 @@ pub const Context = struct {
         self.document_handler.setCurrentPage(page);
         self.document_handler.setScrollY(0);
         self.document_handler.setPendingScrollPdfY(pdf_y);
-        self.resetCurrentPage();
-    }
-
-    pub fn jumpToHighlight(self: *Self, idx: usize) void {
-        if (idx >= self.highlights.items.len) return;
-        const h = self.highlights.items[idx];
-        self.pushJump();
-        self.gotoPagePdfY(h.page, if (h.rects.len >= 2) h.rects[1] else 0);
-    }
-
-    // Esc in view mode: drop the selection first; a second Esc clears search.
-    pub fn escapeClear(self: *Self) void {
-        if (self.selection_hits.items.len > 0) {
-            self.clearSelection();
-            return;
-        }
-        self.clearSearch();
     }
 
     // Does not take ownership of a .uri target; the caller frees it.
     pub fn followLink(self: *Self, target: PdfHandler.LinkTarget) void {
         switch (target) {
             .page => |dest| {
+                if (dest.num >= self.document_handler.getTotalPages()) return;
                 self.pushJump();
-                _ = self.document_handler.goToPage(dest.num + 1);
-                self.document_handler.setScrollY(0);
-                self.document_handler.setPendingScrollPdfY(dest.y);
-                self.resetCurrentPage();
+                self.gotoPagePdfY(dest.num, dest.y);
             },
             .uri => |uri| {
                 _ = std.process.spawn(self.io, .{
@@ -1488,7 +1224,6 @@ pub const Context = struct {
         self.document_handler.setCurrentPage(pos.page);
         self.document_handler.setScrollY(pos.scroll_y);
         self.document_handler.setScrollX(pos.scroll_x);
-        self.resetCurrentPage();
     }
 
     pub fn setMark(self: *Self, letter: u8) void {
@@ -1522,10 +1257,7 @@ pub const Context = struct {
             if (m.letter == letter) {
                 if (m.page < self.document_handler.getTotalPages()) {
                     self.pushJump();
-                    self.document_handler.setCurrentPage(m.page);
-                    self.document_handler.setScrollX(m.scroll_x);
-                    self.document_handler.setScrollY(m.scroll_y);
-                    self.resetCurrentPage();
+                    self.restorePosition(.{ .page = m.page, .scroll_y = m.scroll_y, .scroll_x = m.scroll_x });
                 }
                 return;
             }
@@ -1543,130 +1275,13 @@ pub const Context = struct {
         }
     }
 
-    // `:export [path]` — cropped/aligned copy of the PDF for printing.
-    pub fn exportCropped(self: *Self, arg: []const u8) void {
-        var path_buf: [1024]u8 = undefined;
-        const out: [:0]const u8 = blk: {
-            if (arg.len > 0) break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}", .{arg}, 0) catch {
-                self.progress_text = " export: path too long ";
-                return;
-            };
-            const dir = std.fs.path.dirname(self.doc_abs_path) orelse ".";
-            const stem = std.fs.path.stem(self.doc_abs_path);
-            break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}-cropped.pdf", .{ dir, stem }, 0) catch {
-                self.progress_text = " export: path too long ";
-                return;
-            };
-        };
-        self.document_handler.exportCropped(out, false) catch |err| {
-            self.progress_text = switch (err) {
-                error.NothingToApply => " export: no crop or oddx set ",
-                else => " export failed ",
-            };
-            return;
-        };
-        const msg = std.fmt.bufPrint(&self.progress_buf, " exported {s} ", .{out}) catch " exported ";
-        self.progress_text = msg;
-    }
-
-    // `:override` — bake the crop + oddx into the file itself (same /ID, so
-    // saved state stays attached), then reset that state: the next open lands
-    // on the same page but relies on the document's own boxes.
-    pub fn overrideCropped(self: *Self) void {
-        var tmp_buf: [1024]u8 = undefined;
-        const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}.override.tmp", .{self.doc_abs_path}, 0) catch {
-            self.progress_text = " override: path too long ";
-            return;
-        };
-        const page = self.document_handler.getCurrentPageNumber();
-        // The save reads the source lazily, so it must go to a temp file and
-        // rename over the original rather than write in place.
-        self.document_handler.exportCropped(tmp, true) catch |err| {
-            self.progress_text = switch (err) {
-                error.NothingToApply => " override: no crop or oddx set ",
-                else => " override failed ",
-            };
-            return;
-        };
-        std.Io.Dir.renameAbsolute(tmp, self.doc_abs_path, self.io) catch {
-            self.progress_text = " override: rename failed ";
-            return;
-        };
-        // The file carries the geometry now; drop it from the session state.
-        if (self.document_handler.getCropToContent()) self.document_handler.toggleCropToContent();
-        self.document_handler.setMarginCrop(0, 0, 0, 0);
-        self.document_handler.setOddShiftX(0);
-        self.document_handler.reloadDocument() catch {};
-        self.freeOutline();
-        self.outline = self.document_handler.loadOutline(self.allocator) catch &.{};
-        self.clearCache();
-        self.document_handler.setCurrentPage(page);
-        self.resetCurrentPage();
-        self.saveState();
-        self.progress_text = " crop baked into file; saved state reset ";
-    }
-
-    pub fn openCurrentPageInEditor(self: *Self) !void {
-        const page = self.document_handler.getCurrentPageNumber();
-        const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-page{d}", .{ pid, page + 1 });
-        defer self.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/page{d}.md", .{ dir, page + 1 }, 0);
-        defer self.allocator.free(path);
-
-        std.Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch {};
-        try self.document_handler.writePageText(page, path);
-        try self.spawnEditorAndWait(path, dir, null);
-    }
-
-    fn freeOutline(self: *Self) void {
+    pub fn freeOutline(self: *Self) void {
         for (self.outline) |e| self.allocator.free(e.title);
         if (self.outline.len > 0) self.allocator.free(self.outline);
         self.outline = &.{};
     }
 
-    // Title of the deepest outline entry at or before `page` ("current section").
-    pub fn chapterFor(self: *Self, page: u16) []const u8 {
-        var title: []const u8 = "";
-        for (self.outline) |e| {
-            if (e.page > page) break;
-            title = e.title;
-        }
-        return title;
-    }
-
-    fn currentChapterRange(self: *Self, current_page: u16) struct { start: u16, end: u16 } {
-        const total = self.document_handler.getTotalPages();
-        const entries = self.outline;
-        if (entries.len == 0) return .{ .start = current_page, .end = current_page + 1 };
-
-        var min_depth: u8 = 255;
-        for (entries) |e| {
-            if (e.depth < min_depth) min_depth = e.depth;
-        }
-
-        var start: u16 = 0;
-        var end: u16 = total;
-        var found = false;
-        for (entries, 0..) |e, i| {
-            if (e.depth != min_depth) continue;
-            if (e.page <= current_page) {
-                start = e.page;
-                found = true;
-                end = total;
-                for (entries[i + 1 ..]) |next_e| {
-                    if (next_e.depth == min_depth) {
-                        end = next_e.page;
-                        break;
-                    }
-                }
-            } else break;
-        }
-        if (!found) return .{ .start = current_page, .end = current_page + 1 };
-        return .{ .start = start, .end = end };
-    }
-
-    fn flashProgress(self: *Self, comptime fmt: []const u8, args: anytype) void {
+    pub fn flashProgress(self: *Self, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.bufPrint(&self.progress_buf, fmt, args) catch return;
         self.progress_text = msg;
         const win = self.vx.window();
@@ -1674,209 +1289,16 @@ pub const Context = struct {
         // it leaves in place must still reference live memory. Callers that
         // freed text backing on-screen cells (e.g. TextInput's toOwnedSlice)
         // must repaint those cells before triggering a flash.
-        self.drawStatusBar(win) catch return;
+        StatusBar.drawStatusBar(self, win) catch return;
         var w = self.tty.writer();
         self.vx.render(w) catch return;
         w.flush() catch return;
     }
 
-    fn progressCallback(ud: ?*anyopaque, current: c_int, total: c_int) callconv(.c) void {
-        const self = @as(*Self, @ptrCast(@alignCast(ud.?)));
-        self.flashProgress(" Rendering chapter {d}/{d} ", .{ current, total });
-    }
-
-    fn exportProgressCallback(ud: ?*anyopaque, current: c_int, total: c_int) callconv(.c) void {
-        const self = @as(*Self, @ptrCast(@alignCast(ud.?)));
-        self.flashProgress(" Exporting page {d}/{d} ", .{ current, total });
-    }
-
-    // Chapter headings from the outline plus an invisible page marker, so an
-    // agent reading the export can cite pages that map back to `:N` here.
-    fn markdownPageHook(ctx: *anyopaque, page: u16, w: *std.Io.Writer) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        if (page == 0) {
-            try w.print("# {s}\n\nSource: `{s}` — {d} pages, exported by termre. `<!-- page N -->` markers precede each page.\n\n", .{
-                std.fs.path.stem(self.doc_abs_path),
-                self.doc_abs_path,
-                self.document_handler.getTotalPages(),
-            });
-        }
-        for (self.outline) |e| {
-            if (e.page != page) continue;
-            const level: usize = @min(@as(usize, e.depth) + 2, 6);
-            try w.splatByteAll('#', level);
-            try w.print(" {s}\n\n", .{e.title});
-        }
-        try w.print("<!-- page {d} -->\n\n", .{page + 1});
-    }
-
-    // `:markdown [path]` — the whole book as one markdown file with images
-    // beside it. Default: <book dir>/<stem>-md/<stem>.md; a path ending in
-    // .md is the file, anything else is the directory (relative to the book).
-    pub fn exportMarkdown(self: *Self, arg: []const u8) void {
-        const stem = std.fs.path.stem(self.doc_abs_path);
-        const book_dir = std.fs.path.dirname(self.doc_abs_path) orelse "/";
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var target = std.mem.trim(u8, arg, &std.ascii.whitespace);
-        if (std.mem.startsWith(u8, target, "~/")) {
-            if (self.env.get("HOME")) |home| target = std.fmt.allocPrint(a, "{s}/{s}", .{ home, target[2..] }) catch return;
-        }
-        if (target.len > 0 and target[0] != '/') target = std.fmt.allocPrint(a, "{s}/{s}", .{ book_dir, target }) catch return;
-
-        var dir: []const u8 = undefined;
-        var file: [:0]const u8 = undefined;
-        if (target.len == 0) {
-            dir = std.fmt.allocPrint(a, "{s}/{s}-md", .{ book_dir, stem }) catch return;
-            file = std.fmt.allocPrintSentinel(a, "{s}/{s}.md", .{ dir, stem }, 0) catch return;
-        } else if (std.mem.endsWith(u8, target, ".md")) {
-            dir = std.fs.path.dirname(target) orelse "/";
-            file = a.dupeSentinel(u8, target, 0) catch return;
-        } else {
-            dir = std.mem.trimEnd(u8, target, "/");
-            file = std.fmt.allocPrintSentinel(a, "{s}/{s}.md", .{ dir, stem }, 0) catch return;
-        }
-        std.Io.Dir.cwd().createDirPath(self.io, dir) catch {
-            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " cannot create {s} ", .{dir}) catch null;
-            return;
-        };
-        const total = self.document_handler.getTotalPages();
-        self.document_handler.writePagesText(0, total, file, exportProgressCallback, self, markdownPageHook, self) catch |err| {
-            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " export failed: {s} ", .{@errorName(err)}) catch null;
-            return;
-        };
-        self.progress_text = std.fmt.bufPrint(&self.progress_buf, " exported {d} pages: {s} ", .{ total, file }) catch null;
-    }
-
-    fn extractRangeToEditor(self: *Self, dir: []const u8, name: []const u8, start: u16, end: u16) !void {
-        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{s}", .{ dir, name }, 0);
-        defer self.allocator.free(path);
-
-        std.Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch {};
-        try self.document_handler.writePagesText(start, end, path, progressCallback, self, null, null);
-        self.progress_text = null;
-        try self.spawnEditorAndWait(path, dir, null);
-    }
-
-    pub fn openCurrentChapterInEditor(self: *Self) !void {
-        const page = self.document_handler.getCurrentPageNumber();
-        const range = self.currentChapterRange(page);
-        const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-chap-{d}-{d}", .{ pid, range.start + 1, range.end });
-        defer self.allocator.free(dir);
-        const name = try std.fmt.allocPrint(self.allocator, "chap-{d}-{d}.md", .{ range.start + 1, range.end });
-        defer self.allocator.free(name);
-
-        try self.extractRangeToEditor(dir, name, range.start, range.end);
-    }
-
-    pub fn openOutlineInEditor(self: *Self, selected_index: ?usize) !void {
-        const entries = self.outline;
-        if (entries.len == 0) return;
-
-        const pid = std.c.getpid();
-        const dir = try std.fmt.allocPrint(self.allocator, "/tmp/termre-{d}-toc", .{pid});
-        defer self.allocator.free(dir);
-        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/toc.md", .{dir}, 0);
-        defer self.allocator.free(path);
-
-        std.Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch {};
-        {
-            var file = try std.Io.Dir.createFileAbsolute(self.io, path, .{});
-            defer file.close(self.io);
-            var buf: [4096]u8 = undefined;
-            var fw = file.writer(self.io, &buf);
-            const w = &fw.interface;
-            try w.writeAll("# Table of Contents\n\n");
-            for (entries) |e| {
-                var k: usize = 0;
-                while (k < @as(usize, e.depth) * 2) : (k += 1) try w.writeByte(' ');
-                try w.print("- {s}  (p.{d})\n", .{ e.title, e.page + 1 });
-            }
-            try w.flush();
-        }
-        const line: ?usize = if (selected_index) |i| i + 3 else null; // header is 2 lines; entries start at line 3
-        try self.spawnEditorAndWait(path, dir, line);
-    }
-
-    fn spawnEditorAndWait(self: *Self, path: [:0]const u8, dir: []const u8, line: ?usize) !void {
-        const editor_raw = self.env.get("EDITOR") orelse self.env.get("VISUAL") orelse "vim";
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.allocator);
-        var it = std.mem.tokenizeAny(u8, editor_raw, &std.ascii.whitespace);
-        while (it.next()) |tok| try argv.append(self.allocator, tok);
-
-        // Jump vim-family editors to a specific line (e.g. the TOC's selected
-        // chapter). `+N` is understood by vi/vim/nvim/nano/emacs; skip it for
-        // others (e.g. `code` would treat `+N` as a filename).
-        var line_buf: ?[]u8 = null;
-        defer if (line_buf) |lb| self.allocator.free(lb);
-        if (line) |n| {
-            if (argv.items.len > 0) {
-                const base = std.fs.path.basename(argv.items[0]);
-                const is_vi = std.mem.eql(u8, base, "vim") or std.mem.eql(u8, base, "nvim") or
-                    std.mem.eql(u8, base, "vi") or std.mem.eql(u8, base, "nano") or
-                    std.mem.eql(u8, base, "emacs") or std.mem.eql(u8, base, "emacsclient");
-                if (is_vi) {
-                    line_buf = try std.fmt.allocPrint(self.allocator, "+{d}", .{n});
-                    try argv.append(self.allocator, line_buf.?);
-                }
-            }
-        }
-        try argv.append(self.allocator, path);
-
-        // Everything fallible is done; now hand the terminal over. Release the
-        // tty so the editor can read stdin — otherwise the vaxis input thread
-        // keeps consuming keystrokes from underneath the editor.
-        var writer = self.tty.writer();
-        try self.vx.setMouseMode(writer, false);
-        try self.vx.exitAltScreen(writer);
-        try writer.flush();
-        if (self.loop) |loop| loop.stop();
-
-        var child = std.process.spawn(self.io, .{
-            .argv = argv.items,
-            .environ_map = self.env,
-        }) catch |err| {
-            self.restoreAfterEditor() catch {};
-            self.progress_text = std.fmt.bufPrint(&self.progress_buf, " cannot run $EDITOR `{s}`: {s} ", .{ editor_raw, @errorName(err) }) catch null;
-            return err;
-        };
-        _ = child.wait(self.io) catch {};
-
-        // Clean up the per-extract directory and everything inside it.
-        const last_slash = std.mem.lastIndexOfScalar(u8, dir, '/') orelse 0;
-        const parent = dir[0..last_slash];
-        const leaf = dir[last_slash + 1 ..];
-        if (std.Io.Dir.openDirAbsolute(self.io, parent, .{})) |opened_parent| {
-            var parent_dir = opened_parent;
-            defer parent_dir.close(self.io);
-            parent_dir.deleteTree(self.io, leaf) catch {};
-        } else |_| {}
-
-        try self.restoreAfterEditor();
-    }
-
-    fn restoreAfterEditor(self: *Self) !void {
-        var writer = self.tty.writer();
-        if (self.loop) |loop| try loop.start();
-        try self.vx.enterAltScreen(writer);
-        // Re-measure: the alt screen was torn down and rebuilt while the editor
-        // owned the tty, so screen.width_pix/height_pix are stale. Without this
-        // the fit-zoom renders slightly small until the next SIGWINCH. Mirrors
-        // the startup query; must run after loop.start() (input thread alive).
-        try self.vx.queryTerminal(writer, std.Io.Duration.fromSeconds(1));
-        try self.vx.setMouseMode(writer, true);
-        try writer.flush();
-        self.clearCache();
-        self.reload_page = true;
-    }
-
     pub fn enterCommandWithText(self: *Self, text: []const u8) void {
+        if (self.pending_command_text) |old| self.allocator.free(old);
+        self.pending_command_text = self.allocator.dupe(u8, text) catch null;
         self.changeMode(.command);
-        self.current_mode.command.text_input.insertSliceAtCursor(text) catch {};
     }
 
     pub fn setMarkComment(self: *Self, letter: u8, comment: []const u8) !void {
@@ -1887,101 +1309,6 @@ pub const Context = struct {
                 m.updated_at = time.nowRealSeconds();
                 return;
             }
-        }
-    }
-
-    pub fn drawStatusBar(self: *Self, win: vaxis.Window) !void {
-        const arena = self.arena.allocator();
-        defer _ = self.arena.reset(.retain_capacity);
-
-        const status_bar = win.child(.{
-            .x_off = 0,
-            .y_off = win.height -| 1,
-            .width = win.width,
-            .height = 1,
-        });
-
-        if (self.progress_text) |text| {
-            status_bar.fill(vaxis.Cell{ .style = self.config.status_bar.style });
-            _ = status_bar.print(&.{.{ .text = text, .style = self.config.status_bar.style }}, .{ .col_offset = 0 });
-            return;
-        }
-
-        // Expand all items into styled sub-items
-        var expanded_items: std.ArrayList(Config.StatusBar.StyledItem) = .empty;
-
-        for (self.config.status_bar.items) |item| {
-            const styled = switch (item) {
-                .styled => |styled| styled,
-                .mode_aware => |mode_aware| switch (self.current_mode) {
-                    .command => mode_aware.command,
-                    else => mode_aware.view,
-                },
-                .reload_aware => |reload_aware| switch (self.current_reload_indicator_state) {
-                    .idle => reload_aware.idle,
-                    .reload => reload_aware.reload,
-                    .watching => reload_aware.watching,
-                },
-            };
-            try expandPlaceholders(arena, &expanded_items, styled);
-        }
-
-        const items = expanded_items.items;
-
-        // Find the separator
-        var separator_index: usize = items.len;
-        for (items, 0..) |item, i| {
-            if (std.mem.eql(u8, item.text, Config.StatusBar.SEPARATOR)) {
-                separator_index = i;
-                break;
-            }
-        }
-
-        if (separator_index < items.len) {
-            status_bar.fill(vaxis.Cell{ .style = items[separator_index].style });
-        } else {
-            status_bar.fill(vaxis.Cell{ .style = self.config.status_bar.style });
-        }
-
-        // Left side
-        var left_col: usize = 0;
-        for (0..separator_index) |i| {
-            try self.drawStatusText(status_bar, items[i], &left_col, true, arena);
-        }
-
-        // Right side
-        if (items.len > 0 and separator_index < items.len - 1) {
-            var right_col: usize = win.width;
-            for (0..(items.len - separator_index - 1)) |j| {
-                try self.drawStatusText(status_bar, items[items.len - 1 - j], &right_col, false, arena);
-            }
-        }
-    }
-
-    fn expandPlaceholders(arena: std.mem.Allocator, list: *std.ArrayList(Config.StatusBar.StyledItem), styled_text: Config.StatusBar.StyledItem) !void {
-        const text = styled_text.text;
-        var last_index: usize = 0;
-
-        while (last_index < text.len) {
-            const open = std.mem.indexOfScalarPos(u8, text, last_index, '<') orelse {
-                if (last_index < text.len) {
-                    try list.append(arena, .{ .text = text[last_index..], .style = styled_text.style });
-                }
-                break;
-            };
-
-            if (open > last_index) {
-                try list.append(arena, .{ .text = text[last_index..open], .style = styled_text.style });
-            }
-
-            const close = std.mem.indexOfScalarPos(u8, text, open, '>') orelse {
-                try list.append(arena, .{ .text = text[open..], .style = styled_text.style });
-                break;
-            };
-
-            try list.append(arena, .{ .text = text[open .. close + 1], .style = styled_text.style });
-
-            last_index = close + 1;
         }
     }
 
@@ -2003,7 +1330,6 @@ pub const Context = struct {
         self.progress_text = null;
         self.document_handler.setSearchHighlights(self.search_hits.items);
         self.clearCache();
-        self.reload_page = true;
         if (self.search_hits.items.len == 0) return;
 
         const cur = self.document_handler.getCurrentPageNumber();
@@ -2027,16 +1353,12 @@ pub const Context = struct {
         }
         self.search_index = 0;
         self.clearCache();
-        self.reload_page = true;
     }
 
     pub fn gotoHit(self: *Self, index: usize) void {
         const h = self.search_hits.items[index];
         self.pushJump();
-        self.document_handler.setCurrentPage(h.page);
-        self.document_handler.setScrollY(0);
-        self.document_handler.setPendingScrollPdfY(h.y0);
-        self.resetCurrentPage();
+        self.gotoPagePdfY(h.page, h.y0);
     }
 
     pub fn searchNext(self: *Self) void {
@@ -2053,88 +1375,8 @@ pub const Context = struct {
         self.gotoHit(self.search_index);
     }
 
-    fn stripDirPrefix(path: []const u8, dir: []const u8) ?[]const u8 {
-        if (!std.mem.startsWith(u8, path, dir)) return null;
-        var rel = path[dir.len..];
-        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-        return rel;
-    }
-
-    fn drawStatusText(self: *Self, status_bar: vaxis.Window, item: Config.StatusBar.StyledItem, col_offset: *usize, left_aligned: bool, allocator: std.mem.Allocator) !void {
-        var text = item.text;
-
-        if (std.mem.eql(u8, text, Config.StatusBar.PATH)) {
-            const cwd_dir = std.Io.Dir.cwd();
-            const cwd = try cwd_dir.realPathFileAlloc(self.io, ".", allocator);
-            defer allocator.free(cwd);
-
-            const full_path = try cwd_dir.realPathFileAlloc(self.io, self.document_handler.getPath(), allocator);
-            defer allocator.free(full_path);
-
-            if (stripDirPrefix(full_path, cwd)) |rel| {
-                text = try allocator.dupe(u8, rel);
-            } else if (self.env.get("HOME")) |home| {
-                if (stripDirPrefix(full_path, home)) |rel| {
-                    text = try std.fmt.allocPrint(allocator, "~/{s}", .{rel});
-                } else {
-                    text = try allocator.dupe(u8, full_path);
-                }
-            } else {
-                text = try allocator.dupe(u8, full_path);
-            }
-        } else if (std.mem.eql(u8, text, Config.StatusBar.PAGE)) {
-            text = try std.fmt.allocPrint(allocator, "{}", .{self.document_handler.getCurrentPageNumber() + 1});
-        } else if (std.mem.eql(u8, text, Config.StatusBar.TOTAL_PAGES)) {
-            text = try std.fmt.allocPrint(allocator, "{}", .{self.document_handler.getTotalPages()});
-        } else if (std.mem.eql(u8, text, Config.StatusBar.SEPARATOR)) {
-            text = "";
-        } else if (std.mem.eql(u8, text, Config.StatusBar.HLOCK)) {
-            text = if (self.lock_horizontal_scroll) " HLOCK " else "";
-        } else if (std.mem.eql(u8, text, Config.StatusBar.FIT)) {
-            text = if (self.document_handler.getFitWidth()) " FIT " else "";
-        } else if (std.mem.eql(u8, text, Config.StatusBar.ODDX)) {
-            const oddx = self.document_handler.getOddShiftX();
-            text = if (oddx != 0)
-                try std.fmt.allocPrint(allocator, " ODDX {d} ", .{oddx})
-            else
-                "";
-        } else if (std.mem.eql(u8, text, Config.StatusBar.CROP)) {
-            // CSS order (T R B L), matching what :crop accepts.
-            text = if (self.document_handler.cropInfo()) |ci|
-                try std.fmt.allocPrint(allocator, " CROP{s} {d:.0} {d:.0} {d:.0} {d:.0} ", .{
-                    if (ci.auto) "*" else "", ci.top, ci.right, ci.bottom, ci.left,
-                })
-            else
-                "";
-        } else if (std.mem.eql(u8, text, Config.StatusBar.CHAPTER)) {
-            text = self.chapterFor(self.document_handler.getCurrentPageNumber());
-        } else if (std.mem.eql(u8, text, Config.StatusBar.PERCENT)) {
-            const total = self.document_handler.getTotalPages();
-            const pct = if (total > 0) (@as(u32, self.document_handler.getCurrentPageNumber()) + 1) * 100 / total else 0;
-            text = try std.fmt.allocPrint(allocator, "{d}", .{pct});
-        } else if (std.mem.eql(u8, text, Config.StatusBar.SEARCH)) {
-            text = if (self.search_hits.items.len > 0)
-                try std.fmt.allocPrint(allocator, " {d}/{d} {s} ", .{ self.search_index + 1, self.search_hits.items.len, self.search_needle })
-            else
-                "";
-        }
-
-        const width = vaxis.gwidth.gwidth(text, .wcwidth);
-
-        if (!left_aligned) {
-            if (width > col_offset.*) return; // doesn't fit; skip the item
-            col_offset.* -= width;
-        }
-
-        _ = status_bar.print(
-            &.{.{ .text = text, .style = item.style }},
-            .{ .col_offset = @intCast(col_offset.*) },
-        );
-
-        if (left_aligned) col_offset.* += width;
-    }
-
     pub fn draw(self: *Self) !void {
+        _ = self.arena.reset(.retain_capacity);
         const win = self.vx.window();
         win.clear();
 
@@ -2145,7 +1387,7 @@ pub const Context = struct {
         } else if (self.current_mode == .search) {
             self.current_mode.search.drawSearchBar(win);
         } else if (self.config.status_bar.enabled) {
-            try self.drawStatusBar(win);
+            try StatusBar.drawStatusBar(self, win);
         }
         switch (self.current_mode) {
             inline else => |*m| {
@@ -2154,16 +1396,17 @@ pub const Context = struct {
         }
     }
 
+    // Scratch memory for one frame; reset at the top of draw().
+    pub fn frameAlloc(self: *Self) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
     // Reads a mode's comptime trait flag (e.g. `pub const hides_page = true;`)
     // so modes declare their behavior instead of Context keeping per-mode lists.
     fn modeFlag(self: *Self, comptime flag: []const u8) bool {
         return switch (self.current_mode) {
             inline else => |*m| comptime if (@hasDecl(@TypeOf(m.*), flag)) @field(@TypeOf(m.*), flag) else false,
         };
-    }
-
-    pub fn toggleFullScreen(self: *Self) void {
-        self.config.status_bar.enabled = !self.config.status_bar.enabled;
     }
 };
 

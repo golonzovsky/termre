@@ -3,6 +3,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
+const StatusBar = @import("../StatusBar.zig");
 const Prerenderer = @import("../services/Prerenderer.zig");
 const time = @import("../utilities/time.zig");
 
@@ -15,11 +16,10 @@ selected: u16,
 scroll_cells: u16,
 // Grid zoom: desired cell width in terminal cells (i/o adjust it).
 target_cell_w: u16,
-// Session cache page → transmitted image; dumped into stale_images whenever
+// Session cache page → transmitted image; handed to discardAfterFrame whenever
 // thumb size or page rendering (colorize/crop) changes, and on exit.
 thumbs: std.AutoHashMap(u16, vaxis.Image),
 // Labels printed each frame live here until the next draw.
-draw_arena: std.heap.ArenaAllocator,
 // Geometry from the last layout(); valid after the first draw.
 cols: u16,
 cell_w: u16,
@@ -37,7 +37,6 @@ pub fn init(context: *Context) Self {
         .scroll_cells = 0,
         .target_cell_w = context.grid_cell_w,
         .thumbs = std.AutoHashMap(u16, vaxis.Image).init(context.allocator),
-        .draw_arena = std.heap.ArenaAllocator.init(context.allocator),
         .cols = 1,
         .cell_w = 24,
         .cell_h = 2,
@@ -52,11 +51,7 @@ pub fn init(context: *Context) Self {
 fn dumpThumbs(self: *Self) void {
     var it = self.thumbs.valueIterator();
     while (it.next()) |img| {
-        self.context.stale_images.append(self.context.allocator, .{
-            .image = img.*,
-            .origin_x = 0,
-            .origin_y = 0,
-        }) catch {};
+        self.context.discardAfterFrame(.{ .image = img.*, .origin_x = 0, .origin_y = 0 });
     }
     self.thumbs.clearRetainingCapacity();
 }
@@ -64,7 +59,6 @@ fn dumpThumbs(self: *Self) void {
 pub fn deinit(self: *Self) void {
     self.dumpThumbs();
     self.thumbs.deinit();
-    self.draw_arena.deinit();
 }
 
 fn totalRows(self: *Self) u32 {
@@ -83,7 +77,6 @@ fn jump(self: *Self) void {
     ctx.document_handler.setCurrentPage(self.selected);
     ctx.document_handler.setScrollY(0);
     ctx.document_handler.setScrollX(0);
-    ctx.resetCurrentPage();
     ctx.changeMode(.view);
 }
 
@@ -172,7 +165,6 @@ fn zoomGrid(self: *Self, delta: i32) void {
 // Thumbs bake colorize/crop into the raster; re-render after such toggles.
 fn refreshThumbs(self: *Self) void {
     self.dumpThumbs();
-    self.context.reload_page = true;
 }
 
 pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
@@ -210,7 +202,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         return self.refreshThumbs();
     }
     if (key.matches(km.full_screen.codepoint, km.full_screen.mods)) {
-        self.context.toggleFullScreen();
+        StatusBar.toggleFullScreen(self.context);
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) self.jump();
@@ -302,8 +294,7 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
         self.centerSelected();
     }
 
-    _ = self.draw_arena.reset(.retain_capacity);
-    const a = self.draw_arena.allocator();
+    const a = self.context.frameAlloc();
     const label_style = vaxis.Cell.Style{ .fg = .{ .rgb = .{ 180, 180, 180 } } };
     const sel_style = vaxis.Cell.Style{ .fg = .{ .rgb = .{ 255, 215, 0 } }, .bold = true, .reverse = true };
 
@@ -396,10 +387,6 @@ pub fn wantsThumb(self: *Self, page: u16, max_w: u32) bool {
 
 pub fn putThumb(self: *Self, page: u16, img: vaxis.Image) void {
     self.thumbs.put(page, img) catch {
-        self.context.stale_images.append(self.context.allocator, .{
-            .image = img,
-            .origin_x = 0,
-            .origin_y = 0,
-        }) catch {};
+        self.context.discardAfterFrame(.{ .image = img, .origin_x = 0, .origin_y = 0 });
     };
 }

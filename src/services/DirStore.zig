@@ -3,6 +3,7 @@
 // the sync engine is tested against.
 const Self = @This();
 const std = @import("std");
+const fs = @import("../utilities/fs.zig");
 const Entry = @import("Store.zig").Entry;
 
 io: std.Io,
@@ -47,18 +48,6 @@ pub fn get(self: *Self, a: std.mem.Allocator, key: []const u8) !?[]u8 {
 
 pub fn put(self: *Self, key: []const u8, data: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var buf2: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.root, key });
-    const tmp = try std.fmt.bufPrint(&buf2, "{s}.tmp", .{path});
-    const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |d| try cwd.createDirPath(self.io, d);
-    {
-        var file = try cwd.createFile(self.io, tmp, .{});
-        defer file.close(self.io);
-        var wbuf: [4096]u8 = undefined;
-        var fw = file.writer(self.io, &wbuf);
-        try fw.interface.writeAll(data);
-        try fw.interface.flush();
-    }
-    try std.Io.Dir.renameAbsolute(tmp, path, self.io);
+    try fs.writeFileAtomic(self.io, path, data);
 }

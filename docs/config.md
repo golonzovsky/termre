@@ -64,6 +64,16 @@ keyMap:
     key: up
   historyForward:
     key: down
+  listTop:
+    key: g
+  listBottom:
+    key: G
+  listSelect:
+    key: enter
+  listDelete:
+    key: d
+  listEdit:
+    key: r
 fileMonitor:
   enabled: true
   latency: 0.1
@@ -156,6 +166,10 @@ The `keyMap` section defines keybindings for various actions.
 | `executeCommand` | Execute the entered command |
 | `historyBack` | Go back one command in history |
 | `historyForward` | Go forward one command in history |
+| `listTop` / `listBottom` | Jump to the first / last entry in a list popup (TOC, marks, search, highlights) |
+| `listSelect` | Jump to the selected list entry |
+| `listDelete` | Delete the selected mark / highlight |
+| `listEdit` | Rename the selected mark |
 
 ### Keybindings
 

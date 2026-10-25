@@ -4,17 +4,28 @@
 // `notify`, called on the worker thread.
 const Self = @This();
 const std = @import("std");
+const fs = @import("../utilities/fs.zig");
 const Store = @import("Store.zig").Store;
 const StoreMod = @import("Store.zig");
 const Config = @import("../config/Config.zig");
 const time = @import("../utilities/time.zig");
 const parseDuration = @import("../utilities/duration.zig").parse;
 
+// By value: the worker thread owns no buffer the main thread could read later.
+pub const ErrText = struct {
+    buf: [120]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn text(self: *const ErrText) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 pub const Result = union(enum) {
     // true when at least one remote shard was new or changed locally.
     pulled: bool,
     pushed,
-    err: []const u8,
+    err: ErrText,
 };
 
 pub const Notify = *const fn (ctx: *anyopaque, result: Result) void;
@@ -68,7 +79,6 @@ push_seq: std.atomic.Value(u32) = .init(0),
 push_now: std.atomic.Value(bool) = .init(false),
 quit: std.atomic.Value(bool) = .init(false),
 done: std.atomic.Value(bool) = .init(false),
-err_buf: [160]u8 = undefined,
 
 pub fn create(allocator: std.mem.Allocator, io: std.Io, backends: []Backend, books_dir: []const u8, book: []const u8, device: []const u8) !*Self {
     const self = try allocator.create(Self);
@@ -156,7 +166,7 @@ pub fn pullAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_di
         if (cwd.access(io, local_path, .{})) |_| continue else |_| {}
         const data = (try store.get(a, e.key)) orelse continue;
         try cwd.createDirPath(io, std.fs.path.dirname(local_path).?);
-        try writeAtomic(a, io, local_path, data);
+        try fs.writeFileAtomic(io, local_path, data);
     }
 }
 
@@ -215,7 +225,7 @@ fn worker(self: *Self) void {
             };
             if (!due) continue;
             b.seen_seq = seq;
-            self.report(self.pushBackend(b));
+            if (self.pushBackend(b)) self.report(.pushed) else |e| self.reportBackendError(b, e);
             b.last_push = time.nowNs();
         }
         if (quitting) break;
@@ -224,21 +234,24 @@ fn worker(self: *Self) void {
     self.done.store(true, .release);
 }
 
-fn report(self: *Self, r: anyerror!Result) void {
+fn report(self: *Self, r: Result) void {
     // After stop() the event loop may be gone; results of the flush are dropped.
     if (self.quit.load(.acquire)) return;
-    if (r) |ok| {
-        self.notify(self.notify_ctx, ok);
-    } else |e| {
-        const msg = std.fmt.bufPrint(&self.err_buf, "{s}", .{@errorName(e)}) catch "error";
-        self.notify(self.notify_ctx, .{ .err = msg });
-    }
+    self.notify(self.notify_ctx, r);
 }
 
 fn reportBackendError(self: *Self, b: *Backend, e: anyerror) void {
-    if (self.quit.load(.acquire)) return;
-    const msg = std.fmt.bufPrint(&self.err_buf, "{s}: {s}", .{ b.name(), @errorName(e) }) catch "error";
-    self.notify(self.notify_ctx, .{ .err = msg });
+    var msg: ErrText = .{};
+    const reason = switch (b.store) {
+        .git => |*g| g.reason(),
+        else => "",
+    };
+    const text = if (reason.len > 0)
+        std.fmt.bufPrint(&msg.buf, "{s}: {s} ({s})", .{ b.name(), @errorName(e), reason }) catch &msg.buf
+    else
+        std.fmt.bufPrint(&msg.buf, "{s}: {s}", .{ b.name(), @errorName(e) }) catch &msg.buf;
+    msg.len = @intCast(text.len);
+    self.report(.{ .err = msg });
 }
 
 fn pullBackends(self: *Self, include_manual: bool) void {
@@ -272,28 +285,21 @@ fn pull(self: *Self, store: *Store) !bool {
             if (std.mem.eql(u8, existing, data)) continue;
         }
         try cwd.createDirPath(self.io, local_dir);
-        try writeAtomic(a, self.io, local_path, data);
+        try fs.writeFileAtomic(self.io, local_path, data);
         changed = true;
     }
     return changed;
 }
 
-fn pushBackend(self: *Self, b: *Backend) !Result {
+fn pushBackend(self: *Self, b: *Backend) !void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const local_path = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ self.books_dir, self.book, self.device });
-    const data = std.Io.Dir.cwd().readFileAlloc(self.io, local_path, a, .limited(4 * 1024 * 1024)) catch return .pushed;
+    const data = std.Io.Dir.cwd().readFileAlloc(self.io, local_path, a, .limited(4 * 1024 * 1024)) catch return;
     const key = try std.fmt.allocPrint(a, "books/{s}/{s}.json", .{ self.book, self.device });
-    b.store.put(key, data) catch |e| {
-        self.reportBackendError(b, e);
-        return error.SyncFailed;
-    };
-    b.store.flush() catch |e| {
-        self.reportBackendError(b, e);
-        return error.SyncFailed;
-    };
-    return .pushed;
+    try b.store.put(key, data);
+    try b.store.flush();
 }
 
 // Uploads this device's record of every book (`re state sync`).
@@ -316,18 +322,4 @@ pub fn pushAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_di
     }
     try store.flush();
     return n;
-}
-
-fn writeAtomic(a: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{path});
-    {
-        var file = try cwd.createFile(io, tmp, .{});
-        defer file.close(io);
-        var buf: [4096]u8 = undefined;
-        var fw = file.writer(io, &buf);
-        try fw.interface.writeAll(data);
-        try fw.interface.flush();
-    }
-    try std.Io.Dir.renameAbsolute(tmp, path, io);
 }

@@ -4,11 +4,12 @@ const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
 const CommandMode = @import("CommandMode.zig");
+const ListView = @import("ListView.zig");
+const theme = ListView.theme;
 
 pub const hides_page = true;
 
 context: *Context,
-draw_arena: std.heap.ArenaAllocator,
 
 const Line = struct {
     header: bool = false,
@@ -29,13 +30,10 @@ const cmd_lines = blk: {
 pub fn init(context: *Context) Self {
     return .{
         .context = context,
-        .draw_arena = std.heap.ArenaAllocator.init(context.allocator),
     };
 }
 
-pub fn deinit(self: *Self) void {
-    self.draw_arena.deinit();
-}
+pub fn deinit(_: *Self) void {}
 
 pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     _ = key;
@@ -131,6 +129,15 @@ fn buildKeyLines(self: *Self, a: std.mem.Allocator) []const Line {
     add(a, &lines, .{ .keys = fmtKey(a, km.toc_mode), .label = "table of contents" });
     add(a, &lines, .{ .keys = fmtKey(a, km.grid_mode), .label = "page grid" });
 
+    add(a, &lines, .{ .header = true, .label = "Lists (TOC, marks, search, highlights)" });
+    add(a, &lines, .{ .keys = two(a, fmtKey(a, km.scroll_up), fmtKey(a, km.scroll_down)), .label = "move cursor (or arrows)" });
+    add(a, &lines, .{ .keys = two(a, fmtKey(a, km.list_top), fmtKey(a, km.list_bottom)), .label = "first / last entry" });
+    add(a, &lines, .{ .keys = fmtKey(a, km.list_select), .label = "jump to entry" });
+    add(a, &lines, .{ .keys = fmtKey(a, km.list_delete), .label = "delete mark / highlight" });
+    add(a, &lines, .{ .keys = fmtKey(a, km.list_edit), .label = "rename mark" });
+    add(a, &lines, .{ .keys = two(a, fmtKey(a, km.scroll_left), fmtKey(a, km.scroll_right)), .label = "TOC: fold / unfold" });
+    add(a, &lines, .{ .keys = "H L Spc", .label = "TOC: fold level, toggle" });
+
     add(a, &lines, .{ .header = true, .label = "Editor & links" });
     add(a, &lines, .{ .keys = fmtKey(a, km.open_in_editor), .label = "page in $EDITOR" });
     add(a, &lines, .{ .keys = fmtKey(a, km.open_chapter_in_editor), .label = "chapter in $EDITOR" });
@@ -170,40 +177,14 @@ fn drawColumn(popup: vaxis.Window, lines: []const Line, base_x: u16, key_w: u16,
 }
 
 pub fn draw(self: *Self, win: vaxis.Window) void {
-    _ = self.draw_arena.reset(.retain_capacity);
-    const a = self.draw_arena.allocator();
+    const a = self.context.frameAlloc();
     const key_lines = self.buildKeyLines(a);
 
     const right_base: u16 = 37;
-    const w: u16 = @min(@as(u16, win.width -| 4), right_base + cmd_key_w + cmd_label_w + 1);
-    const content_h: u16 = @intCast(@max(key_lines.len, cmd_lines.len) + 3);
-    const max_h: u16 = @min(content_h, @as(u16, @intCast(@as(usize, win.height) -| 2)));
-    const x_off = (win.width -| w) / 2;
-    const y_off = (win.height -| max_h) / 2;
+    const p = ListView.layout(win, @max(key_lines.len, cmd_lines.len) + 1, right_base + cmd_key_w + cmd_label_w + 1);
+    p.title(" Help — any key to close ", theme.head);
 
-    const bg = vaxis.Cell.Style{
-        .bg = .{ .rgb = .{ 30, 30, 40 } },
-        .fg = .{ .rgb = .{ 230, 230, 230 } },
-    };
-    const head = vaxis.Cell.Style{
-        .bg = .{ .rgb = .{ 30, 30, 40 } },
-        .fg = .{ .rgb = .{ 130, 170, 255 } },
-        .bold = true,
-    };
-    const key_style = vaxis.Cell.Style{
-        .bg = .{ .rgb = .{ 30, 30, 40 } },
-        .fg = .{ .rgb = .{ 230, 200, 110 } },
-        .bold = true,
-    };
-
-    const popup = win.child(.{ .x_off = x_off, .y_off = y_off, .width = w, .height = max_h });
-    popup.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = bg });
-
-    _ = popup.print(
-        &.{.{ .text = " Help — any key to close ", .style = head }},
-        .{ .row_offset = 0, .col_offset = 1, .wrap = .none },
-    );
-
-    drawColumn(popup, key_lines, 1, 9, max_h, bg, head, key_style);
-    if (w > right_base + 8) drawColumn(popup, &cmd_lines, right_base, cmd_key_w, max_h, bg, head, key_style);
+    const popup = p.win;
+    drawColumn(popup, key_lines, 1, 9, popup.height, theme.bg, theme.head, theme.accent_bold);
+    if (popup.width > right_base + 8) drawColumn(popup, &cmd_lines, right_base, cmd_key_w, popup.height, theme.bg, theme.head, theme.accent_bold);
 }

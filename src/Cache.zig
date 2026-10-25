@@ -42,6 +42,10 @@ lru_size: u16,
 // page) when exceeded. Entry count alone doesn't bound bytes at high zoom.
 budget_bytes: usize,
 total_bytes: usize,
+// Images displaced from the cache (and one-frame discards); the main loop
+// drains and deletes them terminal-side after the next render, since
+// deleting before would blank their placements for a frame.
+evicted: std.ArrayList(CachedImage),
 
 pub fn init(allocator: std.mem.Allocator, lru_size: u16, budget_bytes: usize) Self {
     return .{
@@ -52,6 +56,7 @@ pub fn init(allocator: std.mem.Allocator, lru_size: u16, budget_bytes: usize) Se
         .lru_size = lru_size,
         .budget_bytes = budget_bytes,
         .total_bytes = 0,
+        .evicted = .empty,
     };
 }
 
@@ -68,16 +73,15 @@ pub fn deinit(self: *Self) void {
     }
 
     self.map.deinit();
+    self.evicted.deinit(self.allocator);
 }
 
-// Empties the cache, handing the displaced images to the caller, which owns
-// freeing them terminal-side (deferred until after the next render to avoid
-// flicker).
-pub fn clearInto(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(CachedImage)) void {
+pub fn clear(self: *Self) !void {
+    try self.evicted.ensureUnusedCapacity(self.allocator, self.map.count());
     var current = self.head;
     while (current) |node| {
         const next = node.next;
-        out.append(allocator, node.value) catch {};
+        self.evicted.appendAssumeCapacity(node.value);
         self.allocator.destroy(node);
         current = next;
     }
@@ -86,6 +90,17 @@ pub fn clearInto(self: *Self, allocator: std.mem.Allocator, out: *std.ArrayList(
     self.head = null;
     self.tail = null;
     self.total_bytes = 0;
+}
+
+// Queues an image that was never cached for deletion after the next render.
+pub fn discard(self: *Self, image: CachedImage) !void {
+    try self.evicted.append(self.allocator, image);
+}
+
+// The slice is valid until the next cache mutation.
+pub fn drainEvicted(self: *Self) []const CachedImage {
+    defer self.evicted.clearRetainingCapacity();
+    return self.evicted.items;
 }
 
 pub fn contains(self: *Self, key: Key) bool {
@@ -99,12 +114,11 @@ pub fn get(self: *Self, key: Key) ?CachedImage {
 }
 
 // Inserts and evicts from the LRU tail until both the entry count and the
-// byte budget hold; displaced images land in `evicted` and the caller owns
-// freeing them terminal-side.
-pub fn put(self: *Self, key: Key, image: CachedImage, gpa: std.mem.Allocator, evicted: *std.ArrayList(CachedImage)) !void {
+// byte budget hold. An existing key keeps its image; the new one is evicted.
+pub fn put(self: *Self, key: Key, image: CachedImage) !void {
     if (self.map.get(key)) |node| {
         self.moveToFront(node);
-        return;
+        return self.discard(image);
     }
 
     const new_node = try self.allocator.create(Node);
@@ -123,31 +137,19 @@ pub fn put(self: *Self, key: Key, image: CachedImage, gpa: std.mem.Allocator, ev
         (self.map.count() > self.lru_size or self.total_bytes > self.budget_bytes))
     {
         const tail_node = self.tail orelse break;
-        evicted.append(gpa, tail_node.value) catch break;
-        _ = self.remove(tail_node.key);
+        self.remove(tail_node.key) catch break;
     }
 }
 
-// Removes an entry, returning it so the caller can free its terminal-side image.
-pub fn take(self: *Self, key: Key) ?CachedImage {
-    const node = self.map.get(key) orelse return null;
-    const value = node.value;
-    self.total_bytes -= cost(value);
-    _ = self.map.remove(key);
-    self.removeNode(node);
-    self.allocator.destroy(node);
-    return value;
-}
-
-fn remove(self: *Self, key: Key) bool {
-    const node = self.map.get(key) orelse return false;
+// Removes an entry, queueing its image for deletion after the next render.
+// On OOM the entry stays cached rather than leaking terminal-side.
+pub fn remove(self: *Self, key: Key) !void {
+    const node = self.map.get(key) orelse return;
+    try self.evicted.append(self.allocator, node.value);
     self.total_bytes -= cost(node.value);
     _ = self.map.remove(key);
-
     self.removeNode(node);
     self.allocator.destroy(node);
-
-    return true;
 }
 
 fn addToFront(self: *Self, node: *Node) void {

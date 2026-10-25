@@ -1,12 +1,22 @@
 //! Background page prerenderer. A single worker thread renders neighbor pages
-//! (mupdf + base64 — the expensive part) so page crossings hit the cache.
-//! The kitty transmit must stay on the main thread: finished results are
-//! parked here and the main loop claims them on the `prerender_ready` event.
+//! (mupdf + encode — the expensive part) so page crossings hit the cache.
+//! The main thread builds each job (cache key + RenderParams) from its view
+//! state; the worker touches only Document.render. The kitty transmit must
+//! stay on the main thread: finished results are parked here and the main
+//! loop claims them on the `prerender_ready` event.
 const Self = @This();
 const std = @import("std");
 const Cache = @import("../Cache.zig");
-const types = @import("../handlers/types.zig");
+const PdfHandler = @import("../handlers/PdfHandler.zig");
+const Exporter = PdfHandler.Exporter;
+const types = PdfHandler.types;
 const Context = @import("../Context.zig").Context;
+
+// Quad slices in `params` are owned by the job (see PdfHandler.freeParams).
+pub const Job = struct {
+    key: Cache.Key,
+    params: PdfHandler.RenderParams,
+};
 
 pub const Result = struct {
     key: Cache.Key,
@@ -23,6 +33,39 @@ pub const ThumbResult = struct {
 
 pub const thumb_slots = 24;
 
+// Fixed-capacity handoff from the worker to the main thread. Caller holds the
+// mutex for park/claim.
+fn Mailbox(comptime T: type, comptime n: usize) type {
+    return struct {
+        slots: [n]?*T = @splat(null),
+
+        // Parks into the first free slot, or evicts the oldest (slot 0) and
+        // shifts down when full, so the newest result is always kept.
+        fn park(self: *@This(), owner: *Self, result: *T) void {
+            for (&self.slots) |*slot| {
+                if (slot.* == null) {
+                    slot.* = result;
+                    return;
+                }
+            }
+            owner.freeResult(self.slots[0].?);
+            var i: usize = 0;
+            while (i + 1 < n) : (i += 1) self.slots[i] = self.slots[i + 1];
+            self.slots[n - 1] = result;
+        }
+
+        // Hands parked results to the caller, which takes ownership.
+        fn claim(self: *@This()) [n]?*T {
+            defer self.slots = @splat(null);
+            return self.slots;
+        }
+
+        fn freeAll(self: *@This(), owner: *Self) void {
+            for (self.claim()) |slot| if (slot) |r| owner.freeResult(r);
+        }
+    };
+}
+
 // Render-ahead window: up to this many neighbor pages (e.g. +1..+3, -1..-3)
 // are prerendered per request. render_mutex serializes the actual renders, so
 // the worker just churns through them in priority order in the background.
@@ -33,16 +76,13 @@ thread: ?std.Thread,
 mutex: std.Io.Mutex,
 cond: std.Io.Condition,
 quit: bool,
-req_pages: [slots]?u16,
-req_w: u32,
-req_h: u32,
+req_jobs: [slots]?Job,
 has_req: bool,
-results: [slots]?*Result,
+results: Mailbox(Result, slots),
 thumb_reqs: [thumb_slots]?u16,
-thumb_w: u32,
-thumb_h: u32,
+thumb_params: ?PdfHandler.RenderParams,
 has_thumb_req: bool,
-thumb_results: [thumb_slots]?*ThumbResult,
+thumb_results: Mailbox(ThumbResult, thumb_slots),
 
 pub fn init() Self {
     return .{
@@ -51,16 +91,13 @@ pub fn init() Self {
         .mutex = .init,
         .cond = .init,
         .quit = false,
-        .req_pages = @splat(null),
-        .req_w = 0,
-        .req_h = 0,
+        .req_jobs = @splat(null),
         .has_req = false,
-        .results = @splat(null),
+        .results = .{},
         .thumb_reqs = @splat(null),
-        .thumb_w = 0,
-        .thumb_h = 0,
+        .thumb_params = null,
         .has_thumb_req = false,
-        .thumb_results = @splat(null),
+        .thumb_results = .{},
     };
 }
 
@@ -84,56 +121,58 @@ pub fn stop(self: *Self) void {
 
 pub fn deinit(self: *Self) void {
     self.stop();
-    for (&self.results) |*slot| {
-        if (slot.*) |r| {
-            self.freeResult(r);
-            slot.* = null;
-        }
-    }
-    for (&self.thumb_results) |*slot| {
-        if (slot.*) |r| {
-            self.freeThumb(r);
-            slot.* = null;
-        }
+    self.results.freeAll(self);
+    self.thumb_results.freeAll(self);
+    self.freeJobs(&self.req_jobs);
+    self.freeThumbParams();
+}
+
+fn freeJobs(self: *Self, jobs: *[slots]?Job) void {
+    for (jobs) |*slot| {
+        if (slot.*) |j| PdfHandler.freeParams(self.context.allocator, j.params);
+        slot.* = null;
     }
 }
 
-fn freeResult(self: *Self, r: *Result) void {
+fn freeThumbParams(self: *Self) void {
+    if (self.thumb_params) |p| PdfHandler.freeParams(self.context.allocator, p);
+    self.thumb_params = null;
+}
+
+fn freeResult(self: *Self, r: anytype) void {
     const a = self.context.allocator;
     // Never transmitted: the terminal won't clean up its backing store.
-    self.context.deleteEncoded(r.image);
+    Exporter.delete(self.context.io, r.image);
     a.free(r.image.data);
     a.destroy(r);
 }
 
-fn freeThumb(self: *Self, r: *ThumbResult) void {
-    const a = self.context.allocator;
-    self.context.deleteEncoded(r.image);
-    a.free(r.image.data);
-    a.destroy(r);
-}
-
-// Latest request wins; pending older requests are coalesced away.
-pub fn request(self: *Self, pages: [slots]?u16, w: u32, h: u32) void {
-    if (self.thread == null) return;
+// Latest request wins; pending older requests are coalesced away. Takes
+// ownership of the jobs' params.
+pub fn request(self: *Self, jobs: [slots]?Job) void {
+    var incoming = jobs;
+    if (self.thread == null) {
+        self.freeJobs(&incoming);
+        return;
+    }
     const io = self.context.io;
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
-    self.req_pages = pages;
-    self.req_w = w;
-    self.req_h = h;
+    self.freeJobs(&self.req_jobs);
+    self.req_jobs = incoming;
     self.has_req = true;
     self.cond.signal(io);
 }
 
 pub fn requestThumbs(self: *Self, pages: [thumb_slots]?u16, w: u32, h: u32) bool {
     if (self.thread == null) return false;
+    const params = self.context.document_handler.thumbParams(self.context.allocator, w, h) catch return false;
     const io = self.context.io;
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
+    self.freeThumbParams();
     self.thumb_reqs = pages;
-    self.thumb_w = w;
-    self.thumb_h = h;
+    self.thumb_params = params;
     self.has_thumb_req = true;
     self.cond.signal(io);
     return true;
@@ -143,38 +182,19 @@ pub fn claimThumbs(self: *Self) [thumb_slots]?*ThumbResult {
     const io = self.context.io;
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
-    const out = self.thumb_results;
-    self.thumb_results = @splat(null);
-    return out;
+    return self.thumb_results.claim();
 }
 
-// Hands finished renders to the caller, which takes ownership.
 pub fn claim(self: *Self) [slots]?*Result {
     const io = self.context.io;
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
-    const out = self.results;
-    self.results = @splat(null);
-    return out;
-}
-
-// Caller holds the mutex. Parks into the first free slot, or evicts the oldest
-// (slot 0) and shifts down when full, so the newest result is always kept.
-fn park(self: *Self, result: *Result) void {
-    for (&self.results) |*slot| {
-        if (slot.* == null) {
-            slot.* = result;
-            return;
-        }
-    }
-    self.freeResult(self.results[0].?);
-    var i: usize = 0;
-    while (i + 1 < slots) : (i += 1) self.results[i] = self.results[i + 1];
-    self.results[slots - 1] = result;
+    return self.results.claim();
 }
 
 fn run(self: *Self) void {
     const io = self.context.io;
+    const doc = &self.context.document_handler.doc;
     while (true) {
         self.mutex.lockUncancelable(io);
         while (!self.quit and !self.has_req and !self.has_thumb_req) self.cond.waitUncancelable(io, &self.mutex);
@@ -182,28 +202,33 @@ fn run(self: *Self) void {
             self.mutex.unlock(io);
             return;
         }
-        const pages: @TypeOf(self.req_pages) = if (self.has_req) self.req_pages else @splat(null);
-        const w = self.req_w;
-        const h = self.req_h;
+        var jobs: [slots]?Job = @splat(null);
+        if (self.has_req) {
+            jobs = self.req_jobs;
+            self.req_jobs = @splat(null);
+        }
         self.has_req = false;
-        const thumbs: @TypeOf(self.thumb_reqs) = if (self.has_thumb_req) self.thumb_reqs else @splat(null);
-        const tw = self.thumb_w;
-        const th = self.thumb_h;
+        var thumbs: [thumb_slots]?u16 = @splat(null);
+        var thumb_params: ?PdfHandler.RenderParams = null;
+        if (self.has_thumb_req) {
+            thumbs = self.thumb_reqs;
+            thumb_params = self.thumb_params;
+            self.thumb_params = null;
+        }
         self.has_thumb_req = false;
         self.mutex.unlock(io);
+        defer self.freeJobs(&jobs);
+        defer if (thumb_params) |p| PdfHandler.freeParams(self.context.allocator, p);
 
-        for (pages) |maybe_page| {
-            const page = maybe_page orelse continue;
-            const gen = self.context.cache_gen.load(.monotonic);
-            const encoded = self.context.document_handler.renderPage(page, w, h) catch continue;
-            var key = self.context.cacheKeyFor(page);
-            key.gen = gen; // a clear during the render makes this result stale
+        for (jobs) |maybe_job| {
+            const job = maybe_job orelse continue;
+            const encoded = doc.render(job.key.page, job.params) catch continue;
             const result = self.context.allocator.create(Result) catch {
-                self.context.deleteEncoded(encoded);
+                Exporter.delete(io, encoded);
                 self.context.allocator.free(encoded.data);
                 continue;
             };
-            result.* = .{ .key = key, .image = encoded };
+            result.* = .{ .key = job.key, .image = encoded };
 
             self.mutex.lockUncancelable(io);
             if (self.quit) {
@@ -211,39 +236,33 @@ fn run(self: *Self) void {
                 self.freeResult(result);
                 return;
             }
-            self.park(result);
+            self.results.park(self, result);
+            // A newer request arrived mid-batch: drop the rest of this one.
+            const superseded = self.has_req;
             self.mutex.unlock(io);
 
             if (self.context.loop) |loop| loop.postEvent(.prerender_ready) catch {};
+            if (superseded) break;
         }
 
+        const tp = thumb_params orelse continue;
         for (thumbs) |maybe_page| {
             const page = maybe_page orelse continue;
-            const encoded = self.context.document_handler.renderThumb(page, tw, th) catch continue;
+            const encoded = doc.renderOnce(page, tp) catch continue;
             const result = self.context.allocator.create(ThumbResult) catch {
-                self.context.deleteEncoded(encoded);
+                Exporter.delete(io, encoded);
                 self.context.allocator.free(encoded.data);
                 continue;
             };
-            result.* = .{ .page = page, .max_w = tw, .image = encoded };
+            result.* = .{ .page = page, .max_w = tp.scale.fit.w, .image = encoded };
 
             self.mutex.lockUncancelable(io);
             if (self.quit) {
                 self.mutex.unlock(io);
-                self.freeThumb(result);
+                self.freeResult(result);
                 return;
             }
-            for (&self.thumb_results) |*slot| {
-                if (slot.* == null) {
-                    slot.* = result;
-                    break;
-                }
-            } else {
-                self.freeThumb(self.thumb_results[0].?);
-                var i: usize = 0;
-                while (i + 1 < thumb_slots) : (i += 1) self.thumb_results[i] = self.thumb_results[i + 1];
-                self.thumb_results[thumb_slots - 1] = result;
-            }
+            self.thumb_results.park(self, result);
             self.mutex.unlock(io);
 
             if (self.context.loop) |loop| loop.postEvent(.prerender_ready) catch {};

@@ -80,11 +80,9 @@ pub fn init(context: *Context) Self {
         if (self.prev_auto) dh.toggleCropToContent();
         dh.setMarginCrop(0, 0, 0, 0);
         context.clearCache();
-        context.resetCurrentPage();
     }
     if (self.prev_oddx != 0) {
         dh.setOddShiftX(0);
-        context.resetCurrentPage();
     }
     return self;
 }
@@ -112,11 +110,9 @@ pub fn deinit(self: *Self) void {
             dh.setMarginCrop(self.prev[0], self.prev[1], self.prev[2], self.prev[3]);
             if (self.prev_auto) dh.toggleCropToContent();
             self.context.clearCache();
-            self.context.resetCurrentPage();
         }
         if (dh.getOddShiftX() != self.prev_oddx) {
             dh.setOddShiftX(self.prev_oddx);
-            self.context.resetCurrentPage();
         }
     }
     // Scrolling inside the preview is never kept: return to where reading was.
@@ -134,7 +130,6 @@ fn apply(self: *Self) void {
     if (!unchanged or self.hadCrop()) {
         dh.setMarginCrop(self.left, self.right, self.top, self.bottom);
         self.context.clearCache();
-        self.context.resetCurrentPage();
     }
     self.context.changeMode(.view);
 }
@@ -154,12 +149,10 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     }
     if (key.matches(km.zoom_in.codepoint, km.zoom_in.mods)) {
         self.context.document_handler.zoomIn();
-        self.context.reload_page = true;
         return;
     }
     if (key.matches(km.zoom_out.codepoint, km.zoom_out.mods)) {
         self.context.document_handler.zoomOut();
-        self.context.reload_page = true;
         return;
     }
     if (key.matches(km.execute_command.codepoint, km.execute_command.mods) or
@@ -175,11 +168,9 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
         .press => switch (mouse.button) {
             .wheel_up => if (mouse.mods.ctrl or mouse.mods.alt) {
                 ctx.document_handler.zoomIn();
-                ctx.reload_page = true;
             } else ctx.document_handler.scrollY(ctx.config.general.scroll_step / 4.0),
             .wheel_down => if (mouse.mods.ctrl or mouse.mods.alt) {
                 ctx.document_handler.zoomOut();
-                ctx.reload_page = true;
             } else ctx.document_handler.scrollY(-ctx.config.general.scroll_step / 4.0),
             .left => {
                 const pt = ctx.pdfPointAt(mouse) orelse return;

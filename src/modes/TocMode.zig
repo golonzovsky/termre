@@ -3,7 +3,9 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
+const Editor = @import("../Editor.zig");
 const PdfHandler = @import("../handlers/PdfHandler.zig");
+const ListView = @import("ListView.zig");
 
 pub const hides_page = true;
 
@@ -11,10 +13,8 @@ context: *Context,
 entries: []const PdfHandler.OutlineEntry,
 visible: std.ArrayList(usize),
 expanded: std.AutoHashMap(usize, void),
-cursor: usize,
-top: usize,
+list: ListView,
 manual_top: bool = false,
-draw_arena: std.heap.ArenaAllocator,
 
 pub fn init(context: *Context) Self {
     const entries: []const PdfHandler.OutlineEntry =
@@ -25,9 +25,7 @@ pub fn init(context: *Context) Self {
         .entries = entries,
         .visible = .empty,
         .expanded = std.AutoHashMap(usize, void).init(context.allocator),
-        .cursor = 0,
-        .top = 0,
-        .draw_arena = std.heap.ArenaAllocator.init(context.allocator),
+        .list = .{},
     };
 
     self.autoExpandToCurrentPage();
@@ -37,7 +35,6 @@ pub fn init(context: *Context) Self {
 }
 
 pub fn deinit(self: *Self) void {
-    self.draw_arena.deinit();
     self.visible.deinit(self.context.allocator);
     self.expanded.deinit();
     const a = self.context.allocator;
@@ -87,35 +84,35 @@ fn rebuildVisible(self: *Self) !void {
 
 fn setCursorNearCurrentPage(self: *Self) void {
     const cur_page = self.context.document_handler.getCurrentPageNumber();
-    self.cursor = 0;
+    self.list.cursor = 0;
     for (self.visible.items, 0..) |entry_idx, vi| {
         if (self.entries[entry_idx].page > cur_page) break;
-        self.cursor = vi;
+        self.list.cursor = vi;
     }
 }
 
 pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     // Any key resumes cursor-follows-view auto-scroll (wheel-only sticks).
     self.manual_top = false;
-    if (key.matches(km.exit_command_mode.codepoint, km.exit_command_mode.mods) or
-        key.matches(km.toc_mode.codepoint, km.toc_mode.mods))
-    {
-        self.context.changeMode(.view);
+    const ctx = self.context;
+    if (key.matches(km.toc_mode.codepoint, km.toc_mode.mods)) {
+        ctx.changeMode(.view);
         return;
     }
-    if (self.visible.items.len == 0) {
-        self.context.changeMode(.view);
-        return;
+    switch (self.list.handleKey(ctx, key, km, self.visible.items.len)) {
+        .close => {
+            ctx.changeMode(.view);
+            return;
+        },
+        .moved => return,
+        .confirm => {
+            const e = self.entries[self.visible.items[self.list.cursor]];
+            ctx.changeMode(.view);
+            ctx.followLink(.{ .page = .{ .num = e.page, .y = e.y } });
+            return;
+        },
+        .none => {},
     }
-    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-        if (self.cursor > 0) self.cursor -= 1;
-        return;
-    }
-    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-        if (self.cursor + 1 < self.visible.items.len) self.cursor += 1;
-        return;
-    }
-    if (self.context.handleListHalfPage(key, &self.cursor, self.visible.items.len)) return;
     if (key.matches('L', .{})) {
         self.expandOneLevel();
         return;
@@ -124,19 +121,11 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         self.collapseOneLevel();
         return;
     }
-    if (key.matches('g', .{})) {
-        self.cursor = 0;
-        return;
-    }
-    if (key.matches('G', .{})) {
-        self.cursor = self.visible.items.len - 1;
-        return;
-    }
-    if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
+    if (key.matches(vaxis.Key.right, .{}) or key.matches(km.scroll_right.codepoint, km.scroll_right.mods)) {
         self.expandCurrent();
         return;
     }
-    if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
+    if (key.matches(vaxis.Key.left, .{}) or key.matches(km.scroll_left.codepoint, km.scroll_left.mods)) {
         self.collapseCurrent();
         return;
     }
@@ -145,13 +134,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         return;
     }
     if (key.matches(km.open_in_editor.codepoint, km.open_in_editor.mods)) {
-        self.context.openOutlineInEditor(self.currentEntryIdx()) catch {};
-        return;
-    }
-    if (key.matches(vaxis.Key.enter, .{})) {
-        const e = self.entries[self.visible.items[self.cursor]];
-        self.context.changeMode(.view);
-        self.context.followLink(.{ .page = .{ .num = e.page, .y = e.y } });
+        Editor.openOutlineInEditor(ctx, self.currentEntryIdx()) catch {};
         return;
     }
 }
@@ -162,12 +145,12 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
     const step: usize = 3;
     switch (mouse.button) {
         .wheel_up => {
-            self.top -|= step;
+            self.list.top -|= step;
             self.manual_top = true;
         },
         .wheel_down => {
             const max_top = self.visible.items.len -| 1;
-            self.top = @min(self.top + step, max_top);
+            self.list.top = @min(self.list.top + step, max_top);
             self.manual_top = true;
         },
         else => {},
@@ -175,8 +158,8 @@ pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
 }
 
 fn expandCurrent(self: *Self) void {
-    if (self.cursor >= self.visible.items.len) return;
-    const idx = self.visible.items[self.cursor];
+    if (self.list.cursor >= self.visible.items.len) return;
+    const idx = self.visible.items[self.list.cursor];
     if (!self.hasChildren(idx)) return;
     if (self.expanded.contains(idx)) return;
     self.expanded.put(idx, {}) catch return;
@@ -185,7 +168,7 @@ fn expandCurrent(self: *Self) void {
 }
 
 fn currentEntryIdx(self: *Self) ?usize {
-    if (self.cursor < self.visible.items.len) return self.visible.items[self.cursor];
+    if (self.list.cursor < self.visible.items.len) return self.visible.items[self.list.cursor];
     return null;
 }
 
@@ -265,8 +248,8 @@ fn refindCursorOrAncestor(self: *Self, entry_idx: usize) void {
 }
 
 fn toggleCurrent(self: *Self) void {
-    if (self.cursor >= self.visible.items.len) return;
-    const idx = self.visible.items[self.cursor];
+    if (self.list.cursor >= self.visible.items.len) return;
+    const idx = self.visible.items[self.list.cursor];
     if (!self.hasChildren(idx)) return;
     if (self.expanded.contains(idx)) {
         _ = self.expanded.remove(idx);
@@ -279,11 +262,11 @@ fn toggleCurrent(self: *Self) void {
 
 fn refindCursor(self: *Self, entry_idx: usize) void {
     if (self.visibleIndexOf(entry_idx)) |i| {
-        self.cursor = i;
+        self.list.cursor = i;
         return;
     }
-    if (self.visible.items.len > 0 and self.cursor >= self.visible.items.len) {
-        self.cursor = self.visible.items.len - 1;
+    if (self.visible.items.len > 0 and self.list.cursor >= self.visible.items.len) {
+        self.list.cursor = self.visible.items.len - 1;
     }
 }
 
@@ -315,20 +298,15 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
     const list_h: usize = if (h > 2) @intCast(h - 2) else 0;
     if (list_h == 0) return;
 
-    if (!self.manual_top) {
-        if (self.cursor < self.top) self.top = self.cursor;
-        if (self.cursor >= self.top + list_h) self.top = self.cursor + 1 - list_h;
-    }
+    if (!self.manual_top) self.list.scrollToCursor(list_h);
 
-    _ = self.draw_arena.reset(.retain_capacity);
-    const a = self.draw_arena.allocator();
+    const a = self.context.frameAlloc();
 
-    var i: usize = 0;
-    while (i < list_h and self.top + i < self.visible.items.len) : (i += 1) {
-        const vi = self.top + i;
-        const entry_idx = self.visible.items[vi];
+    var it = self.list.rows(self.visible.items.len, list_h, 2);
+    while (it.next()) |r| {
+        const entry_idx = self.visible.items[r.idx];
         const e = self.entries[entry_idx];
-        const style = if (vi == self.cursor) sel_style else row_style;
+        const style = if (r.selected) sel_style else row_style;
         const prefix_n: usize = @as(usize, e.depth) * 2;
         const prefix = a.alloc(u8, prefix_n) catch continue;
         @memset(prefix, ' ');
@@ -337,10 +315,9 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
         else
             "  ";
         const line = std.fmt.allocPrint(a, "{s}{s}{s}  (p.{d})", .{ prefix, marker, e.title, e.page + 1 }) catch continue;
-        const row: u16 = @intCast(2 + i);
         _ = popup.print(
             &.{.{ .text = line, .style = style }},
-            .{ .row_offset = row, .col_offset = 1, .wrap = .none },
+            .{ .row_offset = r.row, .col_offset = 1, .wrap = .none },
         );
     }
 }

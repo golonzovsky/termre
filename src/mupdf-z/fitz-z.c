@@ -227,6 +227,8 @@ static void extract_flush_pending(fz_context *ctx, extract_state *st) {
   fz_pixmap *pix = NULL;
   fz_device *dev = NULL;
   int saved_ok = 0;
+  fz_var(pix);
+  fz_var(dev);
   fz_try(ctx) {
     float scale = st->scale > 0 ? st->scale : 4.0f;
     fz_matrix ctm = fz_pre_translate(fz_scale(scale, scale), -r.x0, -r.y0);
@@ -302,6 +304,8 @@ int fz_extract_pages_z(
       if (on_progress) on_progress(progress_userdata, p - start_page, total);
       fz_page *page = NULL;
       fz_stext_page *stext = NULL;
+      fz_var(page);
+      fz_var(stext);
       fz_try(ctx) {
         page = fz_load_page(ctx, doc, p);
         stext = fz_new_stext_page_from_page(ctx, page, &opts);
@@ -338,6 +342,7 @@ int fz_page_content_bbox_z(fz_context *ctx, fz_page *page, fz_rect *out) {
   int ok = 0;
   fz_device *dev = NULL;
   fz_rect bbox = fz_empty_rect;
+  fz_var(dev);
   fz_try(ctx) {
     dev = fz_new_bbox_device(ctx, &bbox);
     fz_run_page(ctx, page, dev, fz_identity, NULL);
@@ -354,6 +359,8 @@ int fz_page_text_bbox_z(fz_context *ctx, fz_document *doc, int page_number, fz_r
   int ok = 0;
   fz_page *page = NULL;
   fz_stext_page *st = NULL;
+  fz_var(page);
+  fz_var(st);
   fz_try(ctx) {
     page = fz_load_page(ctx, doc, page_number);
     fz_rect pb = fz_bound_page(ctx, page);
@@ -422,6 +429,8 @@ int fz_line_text_at_z(fz_context *ctx, fz_document *doc, int page_number, float 
   int written = 0;
   fz_page *page = NULL;
   fz_stext_page *st = NULL;
+  fz_var(page);
+  fz_var(st);
   fz_try(ctx) {
     page = fz_load_page(ctx, doc, page_number);
     fz_stext_options opts = {0};
@@ -457,6 +466,9 @@ int fz_selection_z(fz_context *ctx, fz_document *doc, int page_number,
   fz_page *page = NULL;
   fz_stext_page *st = NULL;
   char *sel = NULL;
+  fz_var(page);
+  fz_var(st);
+  fz_var(sel);
   *quad_count = 0;
   fz_try(ctx) {
     page = fz_load_page(ctx, doc, page_number);
@@ -500,6 +512,8 @@ int fz_save_pixmap_png_z(fz_context *ctx, fz_pixmap *pix, const char *path) {
 unsigned char *fz_pixmap_png_z(fz_context *ctx, fz_pixmap *pix, size_t *out_len) {
   fz_buffer *buf = NULL;
   unsigned char *out = NULL;
+  fz_var(buf);
+  fz_var(out);
   *out_len = 0;
   fz_try(ctx) {
     buf = fz_new_buffer_from_pixmap_as_png(ctx, pix, fz_default_color_params);

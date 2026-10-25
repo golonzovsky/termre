@@ -14,6 +14,8 @@ dir: []const u8,
 remote: []const u8,
 files: DirStore,
 dirty: bool = false,
+reason_buf: [120]u8 = undefined,
+reason_len: u8 = 0,
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, dir: []const u8, remote: []const u8) Self {
     return .{ .allocator = allocator, .io = io, .env = env, .dir = dir, .remote = remote, .files = DirStore.init(io, dir) };
@@ -21,8 +23,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
 
 pub fn deinit(_: *Self) void {}
 
-pub fn manual(_: *Self) bool {
-    return true;
+// Last stderr line of the most recent failed command; empty when none.
+pub fn reason(self: *const Self) []const u8 {
+    return self.reason_buf[0..self.reason_len];
 }
 
 // A listing is what every pull starts with: bring the repo up to date first.
@@ -97,7 +100,19 @@ fn hasUpstream(self: *Self) bool {
 }
 
 fn git(self: *Self, args: []const []const u8, fail: anyerror) !void {
-    if (!self.gitOk(args)) return fail;
+    var buf: [4096]u8 = undefined;
+    const stderr = self.run(self.dir, args, &buf) orelse return;
+    self.reason_len = 0;
+    var lines = std.mem.splitBackwardsScalar(u8, stderr, '\n');
+    while (lines.next()) |l| {
+        const line = std.mem.trim(u8, l, " \t\r");
+        if (line.len == 0) continue;
+        const n = @min(line.len, self.reason_buf.len);
+        @memcpy(self.reason_buf[0..n], line[0..n]);
+        self.reason_len = @intCast(n);
+        break;
+    }
+    return fail;
 }
 
 // Runs git inside our folder; true on exit 0.
@@ -106,9 +121,14 @@ fn gitOk(self: *Self, args: []const []const u8) bool {
 }
 
 fn gitOkIn(self: *Self, dir: []const u8, args: []const []const u8) bool {
+    return self.run(dir, args, &.{}) == null;
+}
+
+// null on exit 0, else the stderr that fit in `err` (empty when git could not run).
+fn run(self: *Self, dir: []const u8, args: []const []const u8, err: []u8) ?[]const u8 {
     var argv: [16][]const u8 = undefined;
     argv[0] = "git";
-    if (args.len + 1 > argv.len) return false;
+    if (args.len + 1 > argv.len) return err[0..0];
     for (args, 0..) |arg, i| argv[i + 1] = arg;
     var child = std.process.spawn(self.io, .{
         .argv = argv[0 .. args.len + 1],
@@ -116,8 +136,13 @@ fn gitOkIn(self: *Self, dir: []const u8, args: []const []const u8) bool {
         .cwd = .{ .path = dir },
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return false;
-    const term = child.wait(self.io) catch return false;
-    return term == .exited and term.exited == 0;
+        .stderr = .pipe,
+    }) catch return err[0..0];
+    var rbuf: [1024]u8 = undefined;
+    var stderr = child.stderr.?.reader(self.io, &rbuf);
+    const n = stderr.interface.readSliceShort(err) catch 0;
+    _ = stderr.interface.discardRemaining() catch {};
+    const term = child.wait(self.io) catch return err[0..n];
+    if (term == .exited and term.exited == 0) return null;
+    return err[0..n];
 }

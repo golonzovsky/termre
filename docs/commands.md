@@ -45,6 +45,9 @@ non-obvious ones:
 - `j`/`k` scroll a step and wheel/trackpad scrolls; `Ctrl+D`/`Ctrl+U` scroll
   half a page with a short smooth animation (in the TOC and the marks / search /
   highlights popups they jump the list half a screen)
+- list popups (TOC, marks, search, highlights) share one key set: `j`/`k` or
+  arrows move, `g`/`G` first/last, `Enter` jumps, `d` deletes a mark/highlight,
+  `r` renames a mark, Esc closes (`keyMap.list*` to rebind)
 - `i`/`o` zoom in/out (default step 10% per press; set `general.zoom_step` to
   change, e.g. `1.25` for the old coarser feel)
 - `c` interactive crop: drag the four crop lines with the mouse (cropped parts

@@ -44,15 +44,6 @@ pub const Store = union(enum) {
         }
     }
 
-    // Manual stores act only on explicit `:sync` / `re state sync`, never
-    // on page turns, open, or quit.
-    pub fn manual(self: *Store) bool {
-        return switch (self.*) {
-            .git => true,
-            else => false,
-        };
-    }
-
     pub fn deinit(self: *Store) void {
         switch (self.*) {
             inline else => |*s| s.deinit(),

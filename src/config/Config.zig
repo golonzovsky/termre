@@ -1,8 +1,8 @@
 const Self = @This();
 const std = @import("std");
+const fs = @import("../utilities/fs.zig");
 const meta = @import("../utilities/meta.zig");
 const yaml = @import("yaml");
-const Positions = @import("../services/Positions.zig");
 const vaxis = @import("vaxis");
 
 pub const KeyMap = struct {
@@ -47,19 +47,18 @@ pub const KeyMap = struct {
     search_list: vaxis.Key = .{ .codepoint = 'S' },
     add_highlight: vaxis.Key = .{ .codepoint = 'H' },
     highlights_mode: vaxis.Key = .{ .codepoint = 'V' },
+    list_top: vaxis.Key = .{ .codepoint = 'g' },
+    list_bottom: vaxis.Key = .{ .codepoint = 'G' },
+    list_select: vaxis.Key = .{ .codepoint = vaxis.Key.enter },
+    list_delete: vaxis.Key = .{ .codepoint = 'd' },
+    list_edit: vaxis.Key = .{ .codepoint = 'r' },
 
     pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) KeyMap {
-        var keymap = KeyMap{};
-        if (val != .object) return keymap;
+        return parseFields(KeyMap, val, allocator);
+    }
 
-        inline for (comptime meta.fields(KeyMap)) |key| {
-            @field(keymap, key.name) = parseKeyBinding(val.object, key.name, allocator, @field(
-                keymap,
-                key.name,
-            ));
-        }
-
-        return keymap;
+    pub fn parseField(comptime name: []const u8, obj: std.json.ObjectMap, allocator: std.mem.Allocator, fallback: vaxis.Key) vaxis.Key {
+        return parseKeyBinding(obj, name, allocator, fallback);
     }
 };
 
@@ -99,25 +98,16 @@ pub const General = struct {
     history: u32 = 1000,
 
     pub fn parse(val: std.json.Value, allocator: std.mem.Allocator) General {
-        var general = General{};
-        if (val != .object) return general;
+        return parseFields(General, val, allocator);
+    }
 
-        inline for (comptime meta.fields(General)) |f| {
-            // white/black accept hex-string or {rgb} forms, not plain integers.
-            const is_color = comptime std.mem.eql(u8, f.name, "white") or std.mem.eql(u8, f.name, "black");
-            if (!is_color) {
-                @field(general, f.name) = parseType(f.type, val.object, f.name, allocator, @field(general, f.name));
-            }
+    // white/black accept hex-string or {rgb} forms, not plain integers.
+    pub fn parseField(comptime name: []const u8, obj: std.json.ObjectMap, allocator: std.mem.Allocator, fallback: anytype) @TypeOf(fallback) {
+        if (comptime std.mem.eql(u8, name, "white") or std.mem.eql(u8, name, "black")) {
+            const raw = obj.get(name) orelse return fallback;
+            return if (parseRGB(raw, allocator)) |rgb| rgbToInt(rgb) else fallback;
         }
-
-        if (val.object.get("white")) |white| {
-            if (parseRGB(white, allocator)) |rgb| general.white = rgbToInt(rgb);
-        }
-        if (val.object.get("black")) |black| {
-            if (parseRGB(black, allocator)) |rgb| general.black = rgbToInt(rgb);
-        }
-
-        return general;
+        return parseType(@TypeOf(fallback), obj, name, allocator, fallback);
     }
 };
 
@@ -326,15 +316,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     defer allocator.free(cfg_path);
     const content: ?[]u8 = cwd.readFileAlloc(io, cfg_path, allocator, .limited(1024 * 1024)) catch null;
     if (content == null) {
-        cwd.createDirPath(io, dir) catch {};
-        const path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
-        defer allocator.free(path);
-        const file = cwd.createFile(io, path, .{}) catch return self;
-        defer file.close(io);
-        var wbuf: [4096]u8 = undefined;
-        var fw = file.writer(io, &wbuf);
-        fw.interface.writeAll(template) catch {};
-        fw.interface.flush() catch {};
+        fs.writeFileAtomic(io, cfg_path, template) catch {};
         return self;
     }
     defer allocator.free(content.?);
@@ -344,42 +326,24 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     var root: std.json.Value = parseYaml(arena_allocator, content.?) catch return self;
     if (root != .object) return self;
     normalizeKeys(arena_allocator, &root.object) catch return self;
-    const parsed = struct { value: std.json.Value }{ .value = root };
 
-    if (parsed.value.object.get("key_map")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
-    if (parsed.value.object.get("file_monitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);
-    if (parsed.value.object.get("general")) |general| self.general = General.parse(general, arena_allocator);
-    if (parsed.value.object.get("status_bar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
-    if (parsed.value.object.get("cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
-    if (parsed.value.object.get("sync")) |sync| self.sync = parseSync(sync, arena_allocator);
-    if (parsed.value.object.get("download_dir")) |dd| {
+    if (root.object.get("key_map")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
+    if (root.object.get("file_monitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);
+    if (root.object.get("general")) |general| self.general = General.parse(general, arena_allocator);
+    if (root.object.get("status_bar")) |status_bar| self.status_bar = StatusBar.parse(status_bar, arena_allocator);
+    if (root.object.get("cache")) |cache| self.cache = Cache.parse(cache, arena_allocator);
+    if (root.object.get("sync")) |sync| self.sync = parseSync(sync, arena_allocator);
+    if (root.object.get("download_dir")) |dd| {
         if (dd == .string) self.download_dir = arena_allocator.dupe(u8, dd.string) catch "";
     }
-    if (parsed.value.object.get("state_dir")) |sd| {
+    if (root.object.get("state_dir")) |sd| {
         if (sd == .string) self.state_dir = arena_allocator.dupe(u8, sd.string) catch "";
     }
-    if (self.state_dir.len > 0) {
-        if (std.mem.startsWith(u8, self.state_dir, "~/")) {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, self.state_dir[2..] })) |full| Positions.setStateDirOverride(full) else |_| {}
-        } else Positions.setStateDirOverride(self.state_dir);
-    }
-
     return self;
 }
 
 pub fn deinit(self: *Self) void {
     self.arena.deinit();
-}
-
-pub fn downloadDir(self: *Self, a: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
-    const home = env.get("HOME") orelse "";
-    if (self.download_dir.len > 0) {
-        if (std.mem.startsWith(u8, self.download_dir, "~/")) return std.fmt.allocPrint(a, "{s}/{s}", .{ home, self.download_dir[2..] });
-        return self.download_dir;
-    }
-    const state = Positions.stateDirFor(a, env) orelse return error.NoStateDir;
-    return std.fmt.allocPrint(a, "{s}/downloads", .{state});
 }
 
 fn parseKeyBinding(obj: std.json.ObjectMap, name: []const u8, allocator: std.mem.Allocator, fallback: vaxis.Key) vaxis.Key {
@@ -420,7 +384,6 @@ fn parseType(comptime T: type, obj: std.json.ObjectMap, key: []const u8, allocat
     return fallback;
 }
 
-// Fills every field of T from the JSON object, keeping the default on miss/mismatch.
 // zig-yaml (e5cf8ac) folds a trailing `# comment` into the value before it;
 // drop such comments (outside quotes) before parsing.
 fn stripTrailingComments(arena: std.mem.Allocator, source: []const u8) ![]const u8 {
@@ -461,6 +424,8 @@ fn yamlToJson(arena: std.mem.Allocator, v: yaml.Yaml.Value) !std.json.Value {
         .boolean => |b| return .{ .bool = b },
         .scalar => |s| {
             if (std.mem.eql(u8, s, "null") or std.mem.eql(u8, s, "~")) return .null;
+            if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
             if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .integer = i } else |_| {}
             if (s.len > 0 and (std.ascii.isDigit(s[0]) or s[0] == '-' or s[0] == '.')) {
                 if (std.fmt.parseFloat(f64, s)) |f| return .{ .float = f } else |_| {}
@@ -511,11 +476,17 @@ fn toSnake(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
     return out.toOwnedSlice(arena);
 }
 
+// Fills every field of T from the JSON object, keeping the default on miss/mismatch.
+// A `parseField(name, obj, allocator, fallback)` decl on T takes over per field.
 fn parseFields(comptime T: type, val: std.json.Value, allocator: std.mem.Allocator) T {
     var result = T{};
     if (val != .object) return result;
     inline for (comptime meta.fields(T)) |f| {
-        @field(result, f.name) = parseType(f.type, val.object, f.name, allocator, @field(result, f.name));
+        const fallback = @field(result, f.name);
+        @field(result, f.name) = if (@hasDecl(T, "parseField"))
+            T.parseField(f.name, val.object, allocator, fallback)
+        else
+            parseType(f.type, val.object, f.name, allocator, fallback);
     }
     return result;
 }

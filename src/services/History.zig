@@ -1,31 +1,26 @@
 const Self = @This();
 const std = @import("std");
+const fs = @import("../utilities/fs.zig");
 const Config = @import("../config/Config.zig");
+const Paths = @import("Paths.zig");
 
 allocator: std.mem.Allocator,
 io: std.Io,
 config: *Config,
 items: std.ArrayList([]const u8),
-index: isize,
 path: []u8,
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, config: *Config) Self {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, paths: Paths, config: *Config) Self {
     var self = Self{
         .allocator = allocator,
         .io = io,
         .config = config,
         .items = .empty,
-        .index = -1,
         .path = "",
     };
 
     if (config.general.history <= 0) return self;
-
-    const home = env.get("HOME") orelse return self;
-
-    if (env.get("XDG_STATE_HOME")) |x| {
-        self.path = std.fmt.allocPrint(allocator, "{s}/termre/history", .{x}) catch return self;
-    } else self.path = std.fmt.allocPrint(allocator, "{s}/.local/state/termre/history", .{home}) catch return self;
+    self.path = allocator.dupe(u8, paths.history) catch return self;
 
     const cwd = std.Io.Dir.cwd();
     const content = cwd.readFileAlloc(io, self.path, allocator, .limited(1024 * 1024)) catch return self;
@@ -52,19 +47,14 @@ pub fn deinit(self: *Self) void {
         if (self.path.len > 0) self.allocator.free(self.path);
     }
 
-    const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.dirname(self.path)) |dir| cwd.createDirPath(self.io, dir) catch {};
-    var file = cwd.createFile(self.io, self.path, .{}) catch return;
-    defer file.close(self.io);
-
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(self.io, &buf);
-    const w = &fw.interface;
+    if (self.path.len == 0) return;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
     for (self.items.items) |cmd| {
-        w.writeAll(cmd) catch continue;
-        w.writeAll("\n") catch continue;
+        out.appendSlice(self.allocator, cmd) catch return;
+        out.append(self.allocator, '\n') catch return;
     }
-    w.flush() catch {};
+    fs.writeFileAtomic(self.io, self.path, out.items) catch {};
 }
 
 pub fn addToHistory(self: *Self, cmd: []const u8) void {
@@ -88,6 +78,4 @@ pub fn addToHistory(self: *Self, cmd: []const u8) void {
         const removed = self.items.orderedRemove(0);
         self.allocator.free(removed);
     }
-
-    self.index = -1;
 }

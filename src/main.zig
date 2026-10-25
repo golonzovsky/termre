@@ -4,6 +4,8 @@ const Context = @import("Context.zig").Context;
 const Positions = @import("services/Positions.zig");
 const Config = @import("config/Config.zig");
 const Sync = @import("services/Sync.zig");
+const Paths = @import("services/Paths.zig");
+const fs = @import("utilities/fs.zig");
 
 // Must live in the root file to take effect: restores the terminal (exits alt
 // screen, disables mouse reporting) before printing a panic trace, so crashes
@@ -13,38 +15,7 @@ pub const panic = vaxis.panic_handler;
 // Dependencies (vaxis, zig-yaml) log at debug level; keep the tty clean.
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-// Types for build.zig.zon
-// For now metadata is only used in main.zig, but can move it to types.zig if needed eleswhere
-// This wont be necessary once https://github.com/ziglang/zig/pull/22907 is merged
-
-const PackageName = enum { termre };
-
-const DependencyType = struct {
-    url: []const u8,
-    hash: []const u8,
-};
-
-const PathDependencyType = struct {
-    path: []const u8,
-};
-
-const DependenciesType = struct {
-    vaxis: DependencyType,
-    fzwatch: PathDependencyType,
-    yaml: PathDependencyType,
-    translate_c: DependencyType,
-};
-
-const MetadataType = struct {
-    name: PackageName,
-    fingerprint: u64,
-    version: []const u8,
-    minimum_zig_version: []const u8,
-    dependencies: DependenciesType,
-    paths: []const []const u8,
-};
-
-const metadata: MetadataType = @import("metadata");
+const metadata = @import("metadata");
 
 fn shortenHome(path: []const u8, home: ?[]const u8) []const u8 {
     const h = home orelse return path;
@@ -120,6 +91,20 @@ fn promptPick(init: std.process.Init, recents: []const Positions.RecentEntry, ho
 }
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |err| {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writer(init.io, &buf);
+        switch (err) {
+            // PdfHandler already printed MuPDF's reason.
+            error.FailedToOpenDocument => {},
+            else => w.interface.print("re: {s}\n", .{@errorName(err)}) catch {},
+        }
+        w.interface.flush() catch {};
+        std.process.exit(1);
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stdout_buffer: [1024]u8 = undefined;
@@ -163,25 +148,24 @@ pub fn main(init: std.process.Init) !void {
     var initial_page: ?u16 = null;
     if (args.len == 1) {
         const arena = init.arena.allocator();
+        var config = Config.init(init.gpa, init.io, init.environ_map);
+        defer config.deinit();
+        const paths = try Paths.init(arena, init.environ_map, &config);
         // Other devices' books appear in the picker only once their shards
         // are here; one listing fetches what's missing.
         {
-            var config = Config.init(init.gpa, init.io, init.environ_map);
-            defer config.deinit();
             const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
             defer for (backends) |*b| b.store.deinit();
-            if (Positions.booksDirFor(arena, init.environ_map)) |books| {
-                const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
-                for (backends) |*b| {
-                    if (b.manual()) continue; // acts only on `re state sync`
-                    Sync.pullAll(init.gpa, init.io, &b.store, books, device) catch |err| {
-                        try stderr.print("sync ({s}): {s}\n", .{ b.name(), @errorName(err) });
-                        try stderr.flush();
-                    };
-                }
+            const device = Positions.deviceIdFor(arena, init.io, paths);
+            for (backends) |*b| {
+                if (b.manual()) continue; // acts only on `re state sync`
+                Sync.pullAll(init.gpa, init.io, &b.store, paths.books, device) catch |err| {
+                    try stderr.print("sync ({s}): {s}\n", .{ b.name(), @errorName(err) });
+                    try stderr.flush();
+                };
             }
         }
-        const recents = Positions.listRecent(arena, init.io, init.environ_map);
+        const recents = Positions.listRecent(arena, init.io, paths);
         if (recents.len == 0) {
             try stderr.writeAll("Usage: re <path-to-pdf> <optional-page-number>\n");
             try stderr.flush();
@@ -262,6 +246,10 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
         try stdout.flush();
         return;
     }
+    const arena = init.arena.allocator();
+    var config = Config.init(init.gpa, init.io, init.environ_map);
+    defer config.deinit();
+    const paths = try Paths.init(arena, init.environ_map, &config);
     if (std.mem.eql(u8, args[0], "export")) {
         if (args.len >= 2) {
             var file = std.Io.Dir.cwd().createFile(init.io, args[1], .{}) catch |err| {
@@ -272,19 +260,17 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
             defer file.close(init.io);
             var buf: [8192]u8 = undefined;
             var fw = file.writer(init.io, &buf);
-            const stats = try Positions.exportAll(init.gpa, init.io, init.environ_map, &fw.interface);
+            const stats = try Positions.exportAll(init.gpa, init.io, paths, &fw.interface);
             try fw.interface.flush();
             try stderr.print("exported {d} books ({d} device records) to {s}\n", .{ stats.books, stats.shards, args[1] });
         } else {
-            _ = try Positions.exportAll(init.gpa, init.io, init.environ_map, stdout);
+            _ = try Positions.exportAll(init.gpa, init.io, paths, stdout);
             try stdout.flush();
         }
         try stderr.flush();
         return;
     }
     if (std.mem.eql(u8, args[0], "sync")) {
-        var config = Config.init(init.gpa, init.io, init.environ_map);
-        defer config.deinit();
         const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
         defer for (backends) |*b| b.store.deinit();
         if (backends.len == 0) {
@@ -292,9 +278,8 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
             try stderr.flush();
             std.process.exit(2);
         }
-        const arena = init.arena.allocator();
-        const books = Positions.booksDirFor(arena, init.environ_map) orelse return;
-        const device = Positions.deviceIdFor(arena, init.io, init.environ_map);
+        const books = paths.books;
+        const device = Positions.deviceIdFor(arena, init.io, paths);
         var failed = false;
         for (backends) |*b| {
             Sync.pullAll(init.gpa, init.io, &b.store, books, device) catch |err| {
@@ -325,10 +310,10 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
             std.process.exit(2);
         };
         defer init.gpa.free(json);
-        const stats = Positions.importBundle(init.gpa, init.io, init.environ_map, json) catch |err| {
+        const stats = Positions.importBundle(init.gpa, init.io, paths, json) catch |err| {
             try stderr.print("import failed: {s}\n", .{@errorName(err)});
             try stderr.flush();
-            return;
+            std.process.exit(1);
         };
         try stderr.print("imported {d} books ({d} device records), merged with local state\n", .{ stats.books, stats.shards });
         try stderr.flush();
@@ -369,7 +354,7 @@ fn fetchRemote(init: std.process.Init, url_in: []const u8, stderr: *std.Io.Write
     }
     var config = Config.init(init.gpa, init.io, init.environ_map);
     defer config.deinit();
-    const dir = try config.downloadDir(a, init.environ_map);
+    const dir = (try Paths.init(a, init.environ_map, &config)).downloads;
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(init.io, dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0);
@@ -389,16 +374,7 @@ fn fetchRemote(init: std.process.Init, url_in: []const u8, stderr: *std.Io.Write
     if (res.status != .ok) return error.HttpStatus;
     const data = body.writer.buffered();
     if (!std.mem.startsWith(u8, data, "%PDF")) return error.NotAPdf;
-    const tmp = try std.fmt.allocPrint(a, "{s}.part", .{path});
-    {
-        var file = try cwd.createFile(init.io, tmp, .{});
-        defer file.close(init.io);
-        var wbuf: [8192]u8 = undefined;
-        var fw = file.writer(init.io, &wbuf);
-        try fw.interface.writeAll(data);
-        try fw.interface.flush();
-    }
-    try std.Io.Dir.renameAbsolute(tmp, path, init.io);
+    try fs.writeFileAtomic(init.io, path, data);
     try stderr.print("saved to {s}\n", .{path});
     try stderr.flush();
     return path;

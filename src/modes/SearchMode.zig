@@ -3,6 +3,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
+const CommandMode = @import("CommandMode.zig");
 
 pub const occupies_bottom_row = true;
 const TextInput = vaxis.widgets.TextInput;
@@ -18,9 +19,7 @@ pub fn init(context: *Context) Self {
 }
 
 pub fn deinit(self: *Self) void {
-    const win = self.context.vx.window();
-    win.hideCursor();
-    self.text_input.deinit();
+    CommandMode.closeTextInput(self.context, &self.text_input);
 }
 
 pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
@@ -53,7 +52,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
 pub fn drawSearchBar(self: *Self, win: vaxis.Window) void {
     const search_bar = win.child(.{
         .x_off = 0,
-        .y_off = win.height - 1,
+        .y_off = win.height -| 1,
         .width = win.width,
         .height = 1,
     });
