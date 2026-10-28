@@ -40,7 +40,7 @@ fn listInto(self: *Self, a: std.mem.Allocator, out: *std.ArrayList(Entry), prefi
 pub fn get(self: *Self, a: std.mem.Allocator, key: []const u8) !?[]u8 {
     const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ self.root, key });
     defer a.free(path);
-    return std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+    return std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(2 * 1024 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };
@@ -50,4 +50,13 @@ pub fn put(self: *Self, key: []const u8, data: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.root, key });
     try fs.writeFileAtomic(self.io, path, data);
+}
+
+pub fn delete(self: *Self, key: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.root, key });
+    std.Io.Dir.cwd().deleteFile(self.io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }

@@ -35,6 +35,13 @@ pub const Store = union(enum) {
         }
     }
 
+    // A missing key is not an error.
+    pub fn delete(self: *Store, key: []const u8) !void {
+        switch (self.*) {
+            inline else => |*s| return s.delete(key),
+        }
+    }
+
     // Commit/upload anything buffered by `put`; a no-op for stores that
     // write through.
     pub fn flush(self: *Store) !void {

@@ -48,6 +48,12 @@ pub fn put(self: *Self, key: []const u8, data: []const u8) !void {
     self.dirty = true;
 }
 
+pub fn delete(self: *Self, key: []const u8) !void {
+    try self.ensureRepo();
+    try self.files.delete(key);
+    self.dirty = true;
+}
+
 // Commit everything written since the last flush (only under our folder)
 // and push if the repo has a remote.
 pub fn flush(self: *Self) !void {

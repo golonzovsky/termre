@@ -393,6 +393,10 @@ pub fn getPageBound(self: *Self, page_number: u16) PageBound {
     return self.doc.getPageBound(page_number);
 }
 
+pub fn coverPng(self: *Self, allocator: std.mem.Allocator, max_w: u32, max_h: u32) ![]u8 {
+    return self.doc.coverPng(allocator, max_w, max_h);
+}
+
 pub fn setMarginCrop(self: *Self, left: f32, right: f32, top: f32, bottom: f32) void {
     self.crop_left = left;
     self.crop_right = right;

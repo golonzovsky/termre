@@ -128,6 +128,7 @@ fn buildKeyLines(self: *Self, a: std.mem.Allocator) []const Line {
     add(a, &lines, .{ .keys = fmtKey(a, km.marks_mode), .label = "marks list" });
     add(a, &lines, .{ .keys = fmtKey(a, km.toc_mode), .label = "table of contents" });
     add(a, &lines, .{ .keys = fmtKey(a, km.grid_mode), .label = "page grid" });
+    add(a, &lines, .{ .keys = fmtKey(a, km.library_mode), .label = "library (all books)" });
 
     add(a, &lines, .{ .header = true, .label = "Lists (TOC, marks, search, highlights)" });
     add(a, &lines, .{ .keys = two(a, fmtKey(a, km.scroll_up), fmtKey(a, km.scroll_down)), .label = "move cursor (or arrows)" });

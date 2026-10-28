@@ -147,6 +147,8 @@ pub const commands = .{
     .{ handleOverride, ":override", "bake crop into this file" },
     .{ handleMarkdown, ":markdown [path]", "whole book as markdown" },
     .{ handleSync, ":sync", "push/pull reading state now" },
+    .{ handleLibrary, ":library", "all books: covers, progress" },
+    .{ handleUpload, ":upload", "put this book's PDF in the sync store" },
     .{ handleHelp, ":help", "this help" },
     .{ handleQuit, ":q", "quit" },
 };
@@ -258,6 +260,18 @@ fn handleMarkdown(self: *Self, cmd: []const u8) bool {
     if (!std.mem.startsWith(u8, cmd, "markdown")) return false;
     const rest = std.mem.trim(u8, cmd["markdown".len..], &std.ascii.whitespace);
     Export.exportMarkdown(self.context, rest);
+    return true;
+}
+
+fn handleLibrary(self: *Self, cmd: []const u8) bool {
+    if (!std.mem.eql(u8, cmd, "library")) return false;
+    self.context.changeMode(.library);
+    return true;
+}
+
+fn handleUpload(self: *Self, cmd: []const u8) bool {
+    if (!std.mem.eql(u8, cmd, "upload")) return false;
+    self.context.uploadCurrentBook();
     return true;
 }
 

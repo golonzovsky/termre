@@ -31,6 +31,8 @@ same table that dispatches these commands.)
 - `:help` — help popup
 - `:q` — quit
 - `:sync` — push this device's reading state and pull other devices' now (see `Sync` in [config.md](./config.md#sync)).
+- `:library` — the library popup: every book with a reading record as a grid of covers with title, progress bar and when it was last read; also bound to `b`
+- `:upload` — put this book's PDF (and cover) in every `s3`/`dir` sync backend (never git), so the library opens it on other devices; the library's `u` does the same for the selected book
 - `:markdown [path]` — export the whole book to markdown: chapter headings from the outline, an invisible `<!-- page N -->` marker before each page (maps back to `:N`), diagrams as PNGs beside the file. Default `<book>-md/<book>.md` next to the PDF; a path ending in `.md` is the file, anything else a directory (relative paths are relative to the book).
 
 ## Key-driven features (not commands)
@@ -60,6 +62,22 @@ non-obvious ones:
   smooth scrolling, wheel pans the grid (selection and page stay put), `i`/`o`
   resize thumbnails, `z` invert, `t` auto-crop, `Enter` or click jumps,
   `g`/`Esc` closes
+- `b` library: all books with their covers, a progress bar and the last read
+  time, newest first; `h`/`j`/`k`/`l` move, `Enter` or click opens the book in
+  this window, `/` filters titles as you type (every word must match; `Enter`
+  keeps the filter, `Esc` clears it), `i`/`o` make the cards bigger or
+  smaller (remembered), `?` lists the keys. Each card says where
+  the PDF is: `local`, `uploaded` (also in the sync store), `in store` (only
+  there) or `not here`. `u` uploads the selected book's PDF and cover to every
+  `s3`/`dir` backend, `D` removes them from the store again (reading records
+  stay), `x` marks the book done (full bar, sorted after the unfinished
+  ones), `r` resets its progress to page 1, `d` forgets it on this device
+  (records, cover and a copy termre downloaded; other devices' records bring
+  it back as a remote book). `d` and `D` ask for `y`. A book last read on
+  another device (dimmed, "on <device>") is downloaded first from an
+  `s3`/`dir` sync backend into `downloadDir`; `b`/`Esc` closes. While a
+  PDF uploads the card says `uploading…` and the status line keeps the
+  message until it finishes or fails
 - `t` auto-crop, `d` spread, `T` table of contents, `M` marks, `;` link hints,
   `m<a-z>`/`'<a-z>` set/jump mark, `Ctrl+O`/`Tab` jump back/forward,
   `e`/`E` page/chapter in `$EDITOR`

@@ -37,6 +37,8 @@ pub const Position = struct {
     path: []const u8 = "",
     last_opened: i64 = 0,
     device: []const u8 = "",
+    // Page count of the document, for progress display.
+    pages: u16 = 0,
 };
 
 pub const Mark = struct {
@@ -78,8 +80,13 @@ pub const OpenEntry = struct {
 };
 
 pub const RecentEntry = struct {
+    // Directory/object name of the book's shards.
+    key: []const u8,
     path: []const u8,
     page: u16,
+    // 0 when no record knows the page count yet.
+    pages: u16,
+    done: bool,
     last_opened: i64,
     // Empty when the book has a path on this device; otherwise the device
     // whose path is shown.
@@ -136,6 +143,12 @@ pub const Shard = struct {
     device: []const u8 = "",
     path: []const u8 = "",
     updated_at: i64 = 0,
+    pages: u16 = 0,
+    // Library flags, newest wins: done when done_at beats undone_at and
+    // reset_at; a reset also outranks every older record's view.
+    done_at: i64 = 0,
+    undone_at: i64 = 0,
+    reset_at: i64 = 0,
     view: View = .{},
     marks: []const MarkRec = &.{},
     highlights: []const Highlight = &.{},
@@ -204,6 +217,16 @@ pub fn deviceIdFor(a: std.mem.Allocator, io: std.Io, paths: Paths) []const u8 {
 // Directory/object name of this document's shards.
 pub fn bookName(self: *Self) []const u8 {
     return self.name;
+}
+
+// `<books>/<book>/<name>`: a file kept beside the shards (cover.png).
+pub fn bookFile(self: *Self, a: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (self.books_dir.len == 0) return error.NoStateDir;
+    return std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.books_dir, self.name, name });
+}
+
+pub fn coverFile(a: std.mem.Allocator, paths: Paths, key: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}/cover.png", .{ paths.books, key });
 }
 
 // Re-merges the shards on disk (after a sync pulled other devices' files).
@@ -282,6 +305,7 @@ pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const
         .device = self.device,
         .path = pos.path,
         .updated_at = now,
+        .pages = pos.pages,
         .view = toView(pos),
         .marks = try marksToRecs(a, marks),
         .highlights = try withHighlightIds(a, highlights),
@@ -301,6 +325,10 @@ pub fn save(self: *Self, pos: Position, marks: []const Mark, highlights: []const
         mine.marks = try marksToRecs(a, merged.marks);
         mine.highlights = try withHighlightIds(a, merged.highlights);
         mine.tombstones = try tombsToRecs(a, merged.tombstones);
+        if (mine.pages == 0) mine.pages = on_disk.pages;
+        mine.done_at = on_disk.done_at;
+        mine.undone_at = on_disk.undone_at;
+        mine.reset_at = on_disk.reset_at;
     }
 
     const cwd = std.Io.Dir.cwd();
@@ -415,10 +443,17 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []Rece
 
         var newest: usize = 0;
         var chosen: ?usize = null;
+        var pages: u16 = readPagesFile(a, io, book_dir);
+        var done_at: i64 = 0;
+        var undone_at: i64 = 0;
         for (shards, 0..) |s, i| {
             if (s.updated_at > shards[newest].updated_at) newest = i;
             if (std.mem.eql(u8, s.device, device) and s.path.len > 0) chosen = i;
+            pages = @max(pages, s.pages);
+            done_at = @max(done_at, s.done_at);
+            undone_at = @max(undone_at, @max(s.undone_at, s.reset_at));
         }
+        const merged = mergeShards(a, shards) catch continue;
         if (chosen == null) {
             for (shards, 0..) |s, i| {
                 if (s.path.len == 0) continue;
@@ -431,19 +466,111 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []Rece
         const src = shards[chosen orelse newest];
         if (src.path.len == 0) continue;
         out.append(allocator, .{
+            .key = allocator.dupe(u8, entry.name) catch break,
             .path = allocator.dupe(u8, src.path) catch break,
-            .page = shards[newest].view.page,
+            .page = if (merged.view) |v| v.page else 0,
+            .pages = pages,
+            .done = done_at > undone_at,
             .last_opened = shards[newest].updated_at,
             .device = if (local) "" else allocator.dupe(u8, src.device) catch "",
         }) catch break;
     }
 
+    // Unfinished books first, each group newest first.
     std.sort.pdq(RecentEntry, out.items, {}, struct {
-        fn newerFirst(_: void, x: RecentEntry, y: RecentEntry) bool {
+        fn order(_: void, x: RecentEntry, y: RecentEntry) bool {
+            if (x.done != y.done) return !x.done;
             return x.last_opened > y.last_opened;
         }
-    }.newerFirst);
+    }.order);
     return out.toOwnedSlice(allocator) catch &.{};
+}
+
+// This device's record of a book, loaded or started from `path`.
+const Own = struct { shard: Shard, file: []const u8 };
+
+fn ownShard(a: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8, path: []const u8) !Own {
+    const device = deviceId(a, io, paths.state);
+    const file = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ paths.books, key, device });
+    const shard = readShard(a, io, file) orelse Shard{ .device = device, .path = path };
+    return .{ .shard = shard, .file = file };
+}
+
+fn writeOwn(a: std.mem.Allocator, io: std.Io, own: Own) !void {
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(own.file).?);
+    const json_str = try std.json.Stringify.valueAlloc(a, own.shard, .{ .whitespace = .indent_2 });
+    try fs.writeFileAtomic(io, own.file, json_str);
+}
+
+pub fn markDone(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8, path: []const u8, done: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var own = try ownShard(a, io, paths, key, path);
+    const now = time.nowRealSeconds();
+    if (done) own.shard.done_at = now else own.shard.undone_at = now;
+    try writeOwn(a, io, own);
+}
+
+// Back to page 1 and not done; marks and highlights stay.
+pub fn resetProgress(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8, path: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var own = try ownShard(a, io, paths, key, path);
+    const now = time.nowRealSeconds();
+    own.shard.view.page = 0;
+    own.shard.view.scroll_x = 0;
+    own.shard.view.scroll_y = 0;
+    own.shard.view.touched = false;
+    own.shard.reset_at = now;
+    own.shard.updated_at = now;
+    try writeOwn(a, io, own);
+}
+
+// Every local record, the cover and the page count.
+pub fn deleteBook(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8) !void {
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.books, key });
+    defer allocator.free(dir);
+    try std.Io.Dir.cwd().deleteTree(io, dir);
+}
+
+// The page count found by rendering a book's cover: into this device's record
+// when it has one (so it syncs), else a local `pages` file beside the cover.
+pub fn recordPages(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8, pages: u16) !void {
+    if (pages == 0) return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const book_dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ paths.books, key });
+    const device = deviceId(a, io, paths.state);
+    const shard_path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ book_dir, device });
+    if (readShard(a, io, shard_path)) |on_disk| {
+        if (on_disk.pages == pages) return;
+        var mine = on_disk;
+        mine.pages = pages;
+        const json_str = try std.json.Stringify.valueAlloc(a, mine, .{ .whitespace = .indent_2 });
+        try fs.writeFileAtomic(io, shard_path, json_str);
+        return;
+    }
+    try std.Io.Dir.cwd().createDirPath(io, book_dir);
+    const text = try std.fmt.allocPrint(a, "{d}\n", .{pages});
+    try fs.writeFileAtomic(io, try std.fmt.allocPrint(a, "{s}/pages", .{book_dir}), text);
+}
+
+fn readPagesFile(a: std.mem.Allocator, io: std.Io, book_dir: []const u8) u16 {
+    const path = std.fmt.allocPrint(a, "{s}/pages", .{book_dir}) catch return 0;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16)) catch return 0;
+    return std.fmt.parseInt(u16, std.mem.trim(u8, text, &std.ascii.whitespace), 10) catch 0;
+}
+
+pub fn freeRecent(allocator: std.mem.Allocator, entries: []RecentEntry) void {
+    for (entries) |e| {
+        allocator.free(e.key);
+        allocator.free(e.path);
+        if (e.device.len > 0) allocator.free(e.device);
+    }
+    allocator.free(entries);
 }
 
 // ---- export / import (manual transfer without a store) -------------------
@@ -544,11 +671,14 @@ fn mergeShards(a: std.mem.Allocator, shards: []const Shard) !Merged {
     if (shards.len == 0) return out;
 
     // Newest view wins, but an untouched record (a book opened and never
-    // moved) never outranks real progress from another record.
+    // moved) never outranks real progress from another record; a reset
+    // demotes every older record to untouched.
+    var reset_at: i64 = 0;
+    for (shards) |s| reset_at = @max(reset_at, s.reset_at);
     var best: usize = 0;
-    var best_progress = hasProgress(shards[0].view);
+    var best_progress = hasProgress(shards[0].view) and shards[0].updated_at >= reset_at;
     for (shards[1..], 1..) |s, i| {
-        const progress = hasProgress(s.view);
+        const progress = hasProgress(s.view) and s.updated_at >= reset_at;
         if ((progress and !best_progress) or (progress == best_progress and s.updated_at > shards[best].updated_at)) {
             best = i;
             best_progress = progress;
@@ -558,6 +688,7 @@ fn mergeShards(a: std.mem.Allocator, shards: []const Shard) !Merged {
     pos.path = shards[best].path;
     pos.last_opened = shards[best].updated_at;
     pos.device = shards[best].device;
+    for (shards) |s| pos.pages = @max(pos.pages, s.pages);
     out.view = pos;
 
     var tombs: std.ArrayList(Tombstone) = .empty;
@@ -808,6 +939,65 @@ test "mergeShards: progress beats a newer untouched record, else newest wins" {
     try testing.expectEqual(@as(u16, 9), (try mergeShards(a, &both_moved)).view.?.page);
 }
 
+test "mergeShards: a reset outranks older progress from any device" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var reset = testShard("desk", 30, .{});
+    reset.reset_at = 30;
+    const shards = [_]Shard{ testShard("laptop", 10, .{ .page = 5, .touched = true }), reset };
+    try testing.expectEqual(@as(u16, 0), (try mergeShards(a, &shards)).view.?.page);
+    const read_after = [_]Shard{ reset, testShard("laptop", 40, .{ .page = 7, .touched = true }) };
+    try testing.expectEqual(@as(u16, 7), (try mergeShards(a, &read_after)).view.?.page);
+}
+
+test "markDone, resetProgress and deleteBook through the library" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const paths = try testPaths(ta, root);
+    defer paths.deinit(ta);
+    {
+        var p = init(ta, io, paths, "pdf-id:a");
+        defer p.deinit();
+        _ = try p.save(.{ .page = 3, .touched = true, .path = "/books/a.pdf", .pages = 10 }, &.{}, &.{}, &.{});
+    }
+    {
+        var p = init(ta, io, paths, "pdf-id:b");
+        defer p.deinit();
+        _ = try p.save(.{ .page = 1, .touched = true, .path = "/books/b.pdf", .pages = 10 }, &.{}, &.{}, &.{});
+    }
+    try markDone(ta, io, paths, "pdf-id_b", "/books/b.pdf", true);
+    {
+        const recents = listRecent(ta, io, paths);
+        defer freeRecent(ta, recents);
+        try testing.expectEqual(@as(usize, 2), recents.len);
+        try testing.expectEqualStrings("pdf-id_a", recents[0].key);
+        try testing.expect(!recents[0].done);
+        try testing.expect(recents[1].done);
+    }
+    try markDone(ta, io, paths, "pdf-id_b", "/books/b.pdf", false);
+    try resetProgress(ta, io, paths, "pdf-id_a", "/books/a.pdf");
+    {
+        const recents = listRecent(ta, io, paths);
+        defer freeRecent(ta, recents);
+        try testing.expectEqualStrings("pdf-id_a", recents[0].key);
+        try testing.expectEqual(@as(u16, 0), recents[0].page);
+        try testing.expect(!recents[1].done);
+        var p = init(ta, io, paths, "pdf-id:a");
+        defer p.deinit();
+        try testing.expectEqual(@as(u16, 0), p.getSavedPosition().?.page);
+        try testing.expectEqual(@as(u16, 10), p.getSavedPosition().?.pages);
+    }
+    try deleteBook(ta, io, paths, "pdf-id_b");
+    const recents = listRecent(ta, io, paths);
+    defer freeRecent(ta, recents);
+    try testing.expectEqual(@as(usize, 1), recents.len);
+}
+
 test "mergeShards: marks and highlights union; a newer tombstone removes, an older one does not" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -870,13 +1060,19 @@ test "save, load, export and import round-trip through the state dir" {
         var p = init(ta, io, p1, "pdf-id:test");
         defer p.deinit();
         try testing.expect(p.getSavedPosition() == null);
-        _ = try p.save(.{ .page = 3, .touched = true, .path = "/books/x.pdf" }, &marks, &.{}, &.{});
+        _ = try p.save(.{ .page = 3, .touched = true, .path = "/books/x.pdf", .pages = 120 }, &marks, &.{}, &.{});
     }
     {
         var p = init(ta, io, p1, "pdf-id:test");
         defer p.deinit();
         try testing.expectEqual(@as(u16, 3), p.getSavedPosition().?.page);
+        try testing.expectEqual(@as(u16, 120), p.getSavedPosition().?.pages);
         try testing.expectEqualStrings("/books/x.pdf", p.getSavedPosition().?.path);
+        const recents = listRecent(ta, io, p1);
+        defer freeRecent(ta, recents);
+        try testing.expectEqual(@as(usize, 1), recents.len);
+        try testing.expectEqualStrings("pdf-id_test", recents[0].key);
+        try testing.expectEqual(@as(u16, 120), recents[0].pages);
         var ml = p.loadMarks(ta);
         defer {
             for (ml.items) |m| ta.free(m.comment);

@@ -97,10 +97,14 @@ pub fn discard(self: *Self, image: CachedImage) !void {
     try self.evicted.append(self.allocator, image);
 }
 
-// The slice is valid until the next cache mutation.
-pub fn drainEvicted(self: *Self) []const CachedImage {
-    defer self.evicted.clearRetainingCapacity();
+// Images displaced since the last clearEvicted(); valid until the next
+// cache mutation.
+pub fn evictedImages(self: *Self) []const CachedImage {
     return self.evicted.items;
+}
+
+pub fn clearEvicted(self: *Self) void {
+    self.evicted.clearRetainingCapacity();
 }
 
 pub fn contains(self: *Self, key: Key) bool {

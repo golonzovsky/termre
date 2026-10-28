@@ -408,6 +408,31 @@ pub fn renderOnce(self: *Self, page_number: u16, params: RenderParams) !types.En
     return self.exporter.encode(self.ctx, pix, width, height, rb.ox, rb.oy);
 }
 
+// The first page as a PNG fitting `max_w` x `max_h` pixels (the library
+// cover), allocated with `allocator`.
+pub fn coverPng(self: *Self, allocator: std.mem.Allocator, max_w: u32, max_h: u32) ![]u8 {
+    self.lock();
+    defer self.unlock();
+    if (self.doc == null or self.total_pages == 0) return types.DocumentError.PageLoadFailed;
+    const page = c.fz_load_page_z(self.ctx, self.doc, 0) orelse return types.DocumentError.PageLoadFailed;
+    defer c.fz_drop_page(self.ctx, page);
+    const rb = self.renderBoundLocked(page, .{});
+    const w_pdf = @max(1.0, rb.bound.x1 - rb.bound.x0);
+    const h_pdf = @max(1.0, rb.bound.y1 - rb.bound.y0);
+    const zoom = @min(@as(f32, @floatFromInt(max_w)) / w_pdf, @as(f32, @floatFromInt(max_h)) / h_pdf);
+    const bbox = c.fz_make_irect(0, 0, @intFromFloat(@max(1.0, zoom * w_pdf)), @intFromFloat(@max(1.0, zoom * h_pdf)));
+    const pix = c.fz_new_pixmap_rgb_z(self.ctx, bbox);
+    if (pix == null) return types.DocumentError.FailedToRenderPage;
+    defer c.fz_drop_pixmap(self.ctx, pix);
+    c.fz_clear_pixmap_with_value(self.ctx, pix, 0xFF);
+    const ctm = c.fz_pre_translate(c.fz_scale(zoom, zoom), -rb.ox, -rb.oy);
+    if (c.fz_run_page_into_z(self.ctx, page, ctm, pix) == 0) return types.DocumentError.FailedToRenderPage;
+    var len: usize = 0;
+    const png = c.fz_pixmap_png_z(self.ctx, pix, &len) orelse return types.DocumentError.FailedToRenderPage;
+    defer std.c.free(png);
+    return allocator.dupe(u8, png[0..len]);
+}
+
 // Writes a copy of the document with the crop + oddx baked into the page
 // boxes (lossless; for printing without margins).
 pub fn exportCropped(self: *Self, out_path: [:0]const u8, keep_id: bool, crop: Crop) !void {

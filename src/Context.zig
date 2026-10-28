@@ -11,6 +11,7 @@ const SearchListMode = @import("modes/SearchListMode.zig");
 const HighlightsMode = @import("modes/HighlightsMode.zig");
 const CropMode = @import("modes/CropMode.zig");
 const GridMode = @import("modes/GridMode.zig");
+const LibraryMode = @import("modes/LibraryMode.zig");
 const fzwatch = @import("fzwatch");
 const Config = @import("config/Config.zig");
 const PdfHandler = @import("handlers/PdfHandler.zig");
@@ -24,6 +25,7 @@ const Prerenderer = @import("services/Prerenderer.zig");
 const StatusBar = @import("StatusBar.zig");
 const Selection = @import("Selection.zig");
 const time = @import("utilities/time.zig");
+const fs = @import("utilities/fs.zig");
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -32,6 +34,8 @@ pub const Event = union(enum) {
     file_changed,
     reload_done,
     prerender_ready,
+    // The cover worker wrote another cover.png.
+    covers_ready,
     sync: Sync.Result,
     // From the command inbox (an agent's goto_page); owned, freed by the handler.
     control: []u8,
@@ -39,8 +43,11 @@ pub const Event = union(enum) {
 
 const progress_ttl_ns: i64 = 3 * std.time.ns_per_s;
 
-pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid };
-pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode, grid: GridMode };
+// A book picked in the library; main reopens the reader on it.
+pub const NextBook = struct { key: []const u8, path: []const u8 };
+
+pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid, library };
+pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode, grid: GridMode, library: LibraryMode };
 pub const ReloadIndicatorState = enum { idle, reload, watching };
 
 pub const VisiblePage = struct {
@@ -96,6 +103,12 @@ pub const Context = struct {
     current_mode: Mode,
     next_mode: ?ModeType = null,
     pending_command_text: ?[]u8 = null,
+    next_book: ?NextBook = null,
+    // Library card width in cells; kept in <state>/library_zoom.
+    library_card_w: u16 = 26,
+    cover_thread: ?std.Thread = null,
+    cover_quit: std.atomic.Value(bool) = .init(false),
+    cover_done: std.atomic.Value(bool) = .init(false),
     history: History,
     positions: Positions,
     doc_key: []u8,
@@ -141,6 +154,8 @@ pub const Context = struct {
     progress_text: ?[]const u8,
     progress_buf: [128]u8,
     progress_since_ns: i64 = 0,
+    // Stays until the next key or message instead of expiring.
+    progress_sticky: bool = false,
     search_hits: std.ArrayList(PdfHandler.SearchHit),
     search_needle: []u8,
     search_index: usize,
@@ -173,6 +188,7 @@ pub const Context = struct {
         errdefer paths.deinit(allocator);
         var positions = Positions.init(allocator, io, paths, doc_key);
         errdefer positions.deinit();
+        ensureCover(allocator, io, &positions, &document_handler);
         // An explicit page argument overrides only the position; view settings
         // (zoom/crop/spread/...) are always restored, otherwise the next
         // auto-save would overwrite them with defaults.
@@ -317,6 +333,7 @@ pub const Context = struct {
             .touched = self.view_touched,
             .path = self.doc_abs_path,
             .last_opened = time.nowRealSeconds(),
+            .pages = self.document_handler.getTotalPages(),
         };
         // Most event batches change nothing persistent; skip the file
         // read-merge-write when the saved state would be identical.
@@ -416,8 +433,11 @@ pub const Context = struct {
                 self.sync_manual = false;
             },
             .pushed => {},
+            .uploaded => |m| self.setProgress(std.fmt.bufPrint(&self.progress_buf, " uploaded to {s} ", .{m.text()}) catch null),
+            .deleted => self.setProgress(" PDF removed from the sync store "),
+            .indexed => if (self.current_mode == .library) self.current_mode.library.refresh(),
             .err => |m| {
-                self.setProgress(std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m.text()}) catch null);
+                self.setStickyProgress(std.fmt.bufPrint(&self.progress_buf, " sync: {s} ", .{m.text()}) catch null);
             },
         }
     }
@@ -458,6 +478,186 @@ pub const Context = struct {
         }
     }
 
+    pub fn requestLibraryIndex(self: *Self) void {
+        if (self.sync) |s| s.requestIndex();
+    }
+
+    // Puts a book's PDF (and cover) into every backend that keeps books.
+    pub fn uploadBook(self: *Self, key: []const u8, path: []const u8) void {
+        const s = self.sync orelse {
+            self.setProgress(" sync: not configured (see docs/config.md#sync) ");
+            return;
+        };
+        if (!s.keepsBooks()) {
+            self.setProgress(" sync: only git backends configured; PDFs need s3 or dir ");
+            return;
+        }
+        s.requestUpload(key, path) catch return;
+        self.setStickyProgress(std.fmt.bufPrint(&self.progress_buf, " uploading {s}… ", .{std.fs.path.basename(path)}) catch null);
+    }
+
+    pub fn setLibraryCardWidth(self: *Self, w: u16) void {
+        self.library_card_w = w;
+        var buf: [16]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}\n", .{w}) catch return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/library_zoom", .{self.paths.state}) catch return;
+        defer self.allocator.free(path);
+        fs.writeFileAtomic(self.io, path, text) catch {};
+    }
+
+    fn loadLibraryCardWidth(self: *Self) void {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/library_zoom", .{self.paths.state}) catch return;
+        defer self.allocator.free(path);
+        var buf: [16]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(self.io, path, &buf) catch return;
+        const w = std.fmt.parseInt(u16, std.mem.trim(u8, text, &std.ascii.whitespace), 10) catch return;
+        if (w >= 16 and w <= 64) self.library_card_w = w;
+    }
+
+    pub fn uploadPending(self: *Self, key: []const u8) bool {
+        const s = self.sync orelse return false;
+        return s.uploading(key);
+    }
+
+    pub fn uploadCurrentBook(self: *Self) void {
+        self.uploadBook(self.positions.bookName(), self.doc_abs_path);
+    }
+
+    // This device only: records, cover and a PDF termre downloaded itself.
+    // Other devices' records bring it back as a remote book.
+    pub fn forgetBook(self: *Self, key: []const u8, path: []const u8) void {
+        Positions.deleteBook(self.allocator, self.io, self.paths, key) catch |e| {
+            self.setProgress(std.fmt.bufPrint(&self.progress_buf, " delete failed: {s} ", .{@errorName(e)}) catch null);
+            return;
+        };
+        if (std.mem.startsWith(u8, path, self.paths.downloads)) std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        self.setProgress(" forgotten on this device ");
+    }
+
+    // The uploaded PDF and cover; reading records keep syncing.
+    pub fn deleteFromStore(self: *Self, key: []const u8) void {
+        const s = self.sync orelse {
+            self.setProgress(" sync: not configured (see docs/config.md#sync) ");
+            return;
+        };
+        s.requestDelete(key) catch return;
+        self.setProgress(" removing the PDF from the sync store… ");
+    }
+
+    pub fn bookInStore(self: *Self, key: []const u8) bool {
+        const s = self.sync orelse return false;
+        return s.inStore(key);
+    }
+
+    // Ends the loop; main reopens the reader on the chosen book.
+    pub fn openBook(self: *Self, key: []const u8, path: []const u8) void {
+        const k = self.allocator.dupe(u8, key) catch return;
+        const p = self.allocator.dupe(u8, path) catch {
+            self.allocator.free(k);
+            return;
+        };
+        self.freeNextBook();
+        self.next_book = .{ .key = k, .path = p };
+        self.should_quit = true;
+    }
+
+    // `cover` is empty when only the page count is missing.
+    const CoverJob = struct { key: []u8, path: [:0]u8, cover: []u8 };
+
+    // Renders the missing covers of the local books off-thread (books read
+    // before covers existed); the library reloads each as it lands.
+    pub fn ensureCovers(self: *Self, books: []const Positions.RecentEntry) void {
+        if (self.cover_thread != null) {
+            if (!self.cover_done.load(.acquire)) return;
+            self.stopCoverWorker();
+        }
+        const cwd = std.Io.Dir.cwd();
+        var jobs: std.ArrayList(CoverJob) = .empty;
+        for (books) |b| {
+            if (b.device.len > 0) continue;
+            if (std.mem.eql(u8, b.key, self.positions.bookName())) continue;
+            if (cwd.access(self.io, b.path, .{})) |_| {} else |_| continue;
+            var cover = Positions.coverFile(self.allocator, self.paths, b.key) catch continue;
+            if (cwd.access(self.io, cover, .{})) |_| {
+                self.allocator.free(cover);
+                if (b.pages > 0) continue;
+                cover = self.allocator.dupe(u8, "") catch continue;
+            } else |_| {}
+            const key = self.allocator.dupe(u8, b.key) catch {
+                self.allocator.free(cover);
+                continue;
+            };
+            const path = self.allocator.dupeSentinel(u8, b.path, 0) catch {
+                self.allocator.free(key);
+                self.allocator.free(cover);
+                continue;
+            };
+            jobs.append(self.allocator, .{ .key = key, .path = path, .cover = cover }) catch {
+                self.allocator.free(key);
+                self.allocator.free(path);
+                self.allocator.free(cover);
+                continue;
+            };
+        }
+        if (jobs.items.len == 0) {
+            jobs.deinit(self.allocator);
+            return;
+        }
+        const owned = jobs.toOwnedSlice(self.allocator) catch {
+            self.freeCoverJobs(jobs.items);
+            jobs.deinit(self.allocator);
+            return;
+        };
+        self.cover_quit.store(false, .release);
+        self.cover_done.store(false, .release);
+        self.cover_thread = std.Thread.spawn(.{}, coverWorker, .{ self, owned }) catch {
+            self.freeCoverJobs(owned);
+            self.allocator.free(owned);
+            return;
+        };
+    }
+
+    fn freeCoverJobs(self: *Self, jobs: []CoverJob) void {
+        for (jobs) |j| {
+            self.allocator.free(j.key);
+            self.allocator.free(j.path);
+            self.allocator.free(j.cover);
+        }
+    }
+
+    fn stopCoverWorker(self: *Self) void {
+        const t = self.cover_thread orelse return;
+        self.cover_quit.store(true, .release);
+        t.join();
+        self.cover_thread = null;
+    }
+
+    fn coverWorker(self: *Self, jobs: []CoverJob) void {
+        defer self.cover_done.store(true, .release);
+        defer self.allocator.free(jobs);
+        defer self.freeCoverJobs(jobs);
+        for (jobs) |j| {
+            if (self.cover_quit.load(.acquire)) return;
+            var doc = PdfHandler.Document.init(self.allocator, self.io, j.path, self.config) catch continue;
+            defer doc.deinit();
+            Positions.recordPages(self.allocator, self.io, self.paths, j.key, doc.total_pages) catch {};
+            if (j.cover.len > 0) {
+                const png = doc.coverPng(self.allocator, 400, 600) catch continue;
+                defer self.allocator.free(png);
+                fs.writeFileAtomic(self.io, j.cover, png) catch continue;
+            }
+            if (self.loop) |loop| loop.postEvent(.covers_ready) catch {};
+        }
+    }
+
+    fn freeNextBook(self: *Self) void {
+        if (self.next_book) |nb| {
+            self.allocator.free(nb.key);
+            self.allocator.free(nb.path);
+        }
+        self.next_book = null;
+    }
+
     fn freeAnnotations(self: *Self) void {
         for (self.marks.items) |m| {
             if (m.comment.len > 0) self.allocator.free(m.comment);
@@ -486,6 +686,7 @@ pub const Context = struct {
         self.selection_hits.deinit(self.allocator);
         if (self.selection_text.len > 0) self.allocator.free(self.selection_text);
         if (self.presence.sel_text.len > 0) self.allocator.free(self.presence.sel_text);
+        self.freeNextBook();
         self.allocator.free(self.doc_key);
         self.allocator.free(self.doc_abs_path);
         self.allocator.free(self.status_path);
@@ -503,6 +704,13 @@ pub const Context = struct {
         self.prerenderer.deinit();
         self.cache.deinit();
         self.document_handler.deinit();
+        // Free every image this instance left in the terminal's store: the
+        // library may start another reader in the same terminal right away.
+        if (self.vx.caps.kitty_graphics) {
+            const w = self.tty.writer();
+            w.writeAll("\x1b_Ga=d,d=A\x1b\\") catch {};
+            w.flush() catch {};
+        }
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
         self.config.deinit();
@@ -526,6 +734,7 @@ pub const Context = struct {
 
     pub fn run(self: *Self) !void {
         self.current_mode = .{ .view = ViewMode.init(self) };
+        self.loadLibraryCardWidth();
 
         var loop: vaxis.Loop(Event) = .init(self.io, &self.tty, &self.vx);
         self.loop = &loop;
@@ -545,6 +754,7 @@ pub const Context = struct {
         // Declared after the loop defers so it runs first: the worker must be
         // joined while `loop` is still alive (it posts events to it).
         defer self.prerenderer.stop();
+        defer self.stopCoverWorker();
         if (self.sync) |s| s.start(syncNotify, @ptrCast(&loop)) catch {};
         self.control_thread = std.Thread.spawn(.{}, controlWorker, .{ self, &loop }) catch null;
         defer if (self.control_thread) |t| {
@@ -579,7 +789,7 @@ pub const Context = struct {
             // A status message expires on its own, so while one is showing
             // the wait for events is a short poll instead of a blocking one.
             var first: ?Event = null;
-            if (self.progress_text != null) {
+            if (self.progress_text != null and !self.progress_sticky) {
                 const deadline = self.progress_since_ns + progress_ttl_ns;
                 while (first == null and time.nowNs() < deadline) {
                     first = try loop.tryEvent();
@@ -599,7 +809,7 @@ pub const Context = struct {
                 try self.update(event);
                 had_event = true;
             }
-            if (self.progress_text != null and time.nowNs() >= self.progress_since_ns + progress_ttl_ns) self.progress_text = null;
+            if (self.progress_text != null and !self.progress_sticky and time.nowNs() >= self.progress_since_ns + progress_ttl_ns) self.progress_text = null;
 
             try self.draw();
 
@@ -609,9 +819,10 @@ pub const Context = struct {
 
             // The new frame no longer places these; delete them terminal-side
             // so big renders don't accumulate in the terminal's image store.
-            const evicted = self.cache.drainEvicted();
+            const evicted = self.cache.evictedImages();
             if (evicted.len > 0) {
                 for (evicted) |img| self.vx.freeImage(buffered, img.image.id);
+                self.cache.clearEvicted();
                 try buffered.flush();
             }
 
@@ -777,6 +988,7 @@ pub const Context = struct {
                 self.integratePrerendered();
                 self.integrateThumbs();
             },
+            .covers_ready => if (self.current_mode == .library) self.current_mode.library.coversChanged(),
         }
     }
 
@@ -1304,6 +1516,13 @@ pub const Context = struct {
     pub fn setProgress(self: *Self, text: ?[]const u8) void {
         self.progress_text = text;
         self.progress_since_ns = time.nowNs();
+        self.progress_sticky = false;
+    }
+
+    // For states that outlast 3 s (an upload) and errors worth reading.
+    pub fn setStickyProgress(self: *Self, text: ?[]const u8) void {
+        self.setProgress(text);
+        self.progress_sticky = true;
     }
 
     pub fn flashProgress(self: *Self, comptime fmt: []const u8, args: anytype) void {
@@ -1464,6 +1683,16 @@ fn makeSync(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     const backends = Sync.backendsFromConfig(allocator, io, env, config);
     if (backends.len == 0) return null;
     return Sync.create(allocator, io, backends, positions.booksDir(), positions.bookName(), positions.deviceName()) catch null;
+}
+
+// The library shows each book's first page; rendered once per book.
+fn ensureCover(allocator: std.mem.Allocator, io: std.Io, positions: *Positions, dh: *PdfHandler) void {
+    const path = positions.bookFile(allocator, Sync.cover_object) catch return;
+    defer allocator.free(path);
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+    const png = dh.coverPng(allocator, 400, 600) catch return;
+    defer allocator.free(png);
+    fs.writeFileAtomic(io, path, png) catch {};
 }
 
 fn marginsBits(dh: *PdfHandler) u64 {

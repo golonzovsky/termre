@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("Context.zig").Context;
+const NextBook = @import("Context.zig").NextBook;
 const Positions = @import("services/Positions.zig");
 const Config = @import("config/Config.zig");
 const Sync = @import("services/Sync.zig");
@@ -137,7 +138,8 @@ fn run(init: std.process.Init) !void {
             \\       re mcp config | skill       print the server snippet / the skill for other clients
             \\       re state export [file]      all reading state as JSON (stdout by default)
             \\       re state import <file|->    merge a state export into this machine
-            \\       re state sync               pull/push reading state through the Sync backend
+            \\       re state sync               pull/push reading state through the Sync backends
+            \\       re state purge <book>       remove a book from every backend and this machine
             \\
         );
         try stderr.flush();
@@ -159,7 +161,7 @@ fn run(init: std.process.Init) !void {
             const device = Positions.deviceIdFor(arena, init.io, paths);
             for (backends) |*b| {
                 if (b.manual()) continue; // acts only on `re state sync`
-                Sync.pullAll(init.gpa, init.io, &b.store, paths.books, device) catch |err| {
+                Sync.pullAll(init.gpa, init.io, &b.store, paths.books, device, null) catch |err| {
                     try stderr.print("sync ({s}): {s}\n", .{ b.name(), @errorName(err) });
                     try stderr.flush();
                 };
@@ -177,12 +179,7 @@ fn run(init: std.process.Init) !void {
             else => return err,
         };
         const idx = picked orelse return;
-        if (recents[idx].device.len > 0) {
-            try stderr.print("{s} is not on this machine (last read on {s})\n", .{ recents[idx].path, recents[idx].device });
-            try stderr.flush();
-            return;
-        }
-        path = try arena.dupeSentinel(u8, recents[idx].path, 0);
+        path = (try resolveBook(init, .{ .key = recents[idx].key, .path = recents[idx].path }, stderr)) orelse return;
     } else {
         path = args[1];
         if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
@@ -199,22 +196,68 @@ fn run(init: std.process.Init) !void {
         };
     }
 
-    runApp(init, path, initial_page) catch |err| switch (err) {
-        error.NoKittyGraphics => {
-            try stderr.writeAll(no_graphics_msg);
-            try stderr.flush();
-            std.process.exit(1);
-        },
-        else => return err,
-    };
+    // The library hands back the next book to open; the reader restarts on it.
+    var page = initial_page;
+    while (true) {
+        const next = runApp(init, path, page) catch |err| switch (err) {
+            error.NoKittyGraphics => {
+                try stderr.writeAll(no_graphics_msg);
+                try stderr.flush();
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        const nb = next orelse break;
+        defer {
+            init.gpa.free(nb.key);
+            init.gpa.free(nb.path);
+        }
+        page = null;
+        path = (try resolveBook(init, nb, stderr)) orelse break;
+    }
 }
 
 // Deinit (which leaves the alt screen) must run before the message prints,
 // or the terminal swallows it.
-fn runApp(init: std.process.Init, path: [:0]const u8, initial_page: ?u16) !void {
+fn runApp(init: std.process.Init, path: [:0]const u8, initial_page: ?u16) !?NextBook {
     var app = try Context.init(init.gpa, init.io, init.environ_map, path, initial_page);
     defer app.deinit();
     try app.run();
+    defer app.next_book = null;
+    return app.next_book;
+}
+
+// A library pick: the local file when it exists, else the PDF downloaded
+// from the first sync store that keeps books (into `downloadDir`).
+fn resolveBook(init: std.process.Init, book: NextBook, stderr: *std.Io.Writer) !?[:0]const u8 {
+    const a = init.arena.allocator();
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.access(io, book.path, .{})) |_| return try a.dupeSentinel(u8, book.path, 0) else |_| {}
+
+    var config = Config.init(init.gpa, io, init.environ_map);
+    defer config.deinit();
+    const paths = try Paths.init(a, init.environ_map, &config);
+    const base = std.fs.path.basename(book.path);
+    const name = if (base.len > 0) base else try std.fmt.allocPrint(a, "{s}.pdf", .{book.key});
+    const dest = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ paths.downloads, name }, 0);
+    if (cwd.access(io, dest, .{})) |_| return dest else |_| {}
+
+    const backends = Sync.backendsFromConfig(init.gpa, io, init.environ_map, &config);
+    defer for (backends) |*b| b.store.deinit();
+    for (backends) |*b| {
+        if (!b.keepsBooks()) continue;
+        try stderr.print("downloading {s} from {s}…\n", .{ name, b.name() });
+        try stderr.flush();
+        const found = Sync.fetchBook(init.gpa, io, &b.store, book.key, dest) catch |err| {
+            try stderr.print("{s}: {s}\n", .{ b.name(), @errorName(err) });
+            continue;
+        };
+        if (found) return dest;
+    }
+    try stderr.print("{s} is not on this machine and no sync store has it\n", .{book.path});
+    try stderr.flush();
+    return null;
 }
 
 const no_graphics_msg =
@@ -234,7 +277,8 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     const usage =
         \\usage: re state export [file]     write all reading state as JSON (stdout by default)
         \\       re state import <file|->   merge a state export into this machine (`-` = stdin)
-        \\       re state sync              pull other devices' records and push this device's (Sync backend)
+        \\       re state sync              pull other devices' records, push this device's
+        \\       re state purge <book>      delete a book's records, PDF and cover from every backend and this machine
         \\
     ;
     var wants_help = args.len == 0;
@@ -270,6 +314,26 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
         try stderr.flush();
         return;
     }
+    if (std.mem.eql(u8, args[0], "purge") and args.len >= 2) {
+        const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
+        defer for (backends) |*b| b.store.deinit();
+        var failed = false;
+        for (backends) |*b| {
+            const n = Sync.purge(init.gpa, &b.store, args[1]) catch |err| {
+                try stderr.print("{s}: purge failed ({s})\n", .{ b.name(), @errorName(err) });
+                failed = true;
+                continue;
+            };
+            try stderr.print("{s}: removed {d} object{s}\n", .{ b.name(), n, if (n == 1) "" else "s" });
+        }
+        Positions.deleteBook(init.gpa, init.io, paths, args[1]) catch |err| {
+            try stderr.print("local records: {s}\n", .{@errorName(err)});
+            failed = true;
+        };
+        try stderr.flush();
+        if (failed) std.process.exit(1);
+        return;
+    }
     if (std.mem.eql(u8, args[0], "sync")) {
         const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
         defer for (backends) |*b| b.store.deinit();
@@ -282,12 +346,12 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
         const device = Positions.deviceIdFor(arena, init.io, paths);
         var failed = false;
         for (backends) |*b| {
-            Sync.pullAll(init.gpa, init.io, &b.store, books, device) catch |err| {
+            Sync.pullAll(init.gpa, init.io, &b.store, books, device, null) catch |err| {
                 try stderr.print("{s}: pull failed ({s})\n", .{ b.name(), @errorName(err) });
                 failed = true;
                 continue;
             };
-            const pushed = Sync.pushAll(init.gpa, init.io, &b.store, books, device) catch |err| {
+            const pushed = Sync.pushAll(init.gpa, init.io, b, books, device) catch |err| {
                 try stderr.print("{s}: push failed ({s})\n", .{ b.name(), @errorName(err) });
                 failed = true;
                 continue;

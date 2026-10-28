@@ -444,7 +444,9 @@ sync:
 | `dir` | String | `git`: a folder inside a repository, e.g. `~/dotfiles/termre` — only that folder is ever staged and committed (`git add -A -- .`, `git commit -- .`), pulls are `--rebase --autostash`, pushes go to the repo's remote. A missing folder is created when its parent is already a work tree |
 | `remote` | String | `git`: used only when `dir` does not exist and is not inside a repo — the repo is cloned *as* `dir` (records at its root). For a folder inside a shared repo, clone the repo yourself. All devices must use the same layout |
 
-`:sync` forces a pull and push through every backend; `re state sync` does the same outside the reader for all books. The `re` picker pulls the index from automatic backends at startup so books read elsewhere show up. A git entry gets one "termre: reading state" commit per sync, not per page.
+`:sync` forces a pull and push through every backend; `re state sync` does the same outside the reader for all books (records only, never PDFs). A PDF goes up only on request, `u` in the library or `:upload`, as `books/<book>/book.pdf` plus its `cover.png`, to every `s3` and `dir` backend (never git); the library (`b`) then opens that book on another device by downloading it into `downloadDir`. The `re` picker and the library (`b`) pull the index (records and covers) from automatic backends so books read elsewhere show up. A git entry gets one "termre: reading state" commit per sync, not per page.
+
+`re state purge <book>` removes one book everywhere: its records, PDF and cover from every backend, and its records from this machine (the `<book>` key is the folder name under `~/.local/state/termre/books/`).
 
 Without a store, move state by hand: `re state export [file]` writes every record as one JSON document (stdout by default), and `re state import <file|->` merges it into the local records with the same rules sync uses — safe to re-run, never loses local work.
 

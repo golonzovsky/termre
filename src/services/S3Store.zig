@@ -112,6 +112,15 @@ pub fn put(self: *Self, key: []const u8, data: []const u8) !void {
     if (resp.status != 200) return statusError(resp.status);
 }
 
+pub fn delete(self: *Self, key: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const ta = arena.allocator();
+    const path = try self.objectPath(ta, key);
+    const resp = try self.request(ta, "DELETE", path, "", "");
+    if (resp.status != 204 and resp.status != 200 and resp.status != 404) return statusError(resp.status);
+}
+
 fn statusError(status: u16) anyerror {
     return switch (status) {
         401, 403 => error.Forbidden,
@@ -169,7 +178,7 @@ fn request(self: *Self, a: std.mem.Allocator, method: []const u8, path: []const 
     var aw: std.Io.Writer.Allocating = .init(a);
     const result = try self.client.fetch(.{
         .location = .{ .url = url },
-        .method = if (std.mem.eql(u8, method, "PUT")) .PUT else .GET,
+        .method = if (std.mem.eql(u8, method, "PUT")) .PUT else if (std.mem.eql(u8, method, "DELETE")) .DELETE else .GET,
         .payload = if (std.mem.eql(u8, method, "PUT")) payload else null,
         .extra_headers = extra[0..n],
         .response_writer = &aw.writer,
