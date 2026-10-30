@@ -190,6 +190,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         self.ensureVisible(true);
         return;
     }
+    if (key.matches(km.library_mode.codepoint, km.library_mode.mods)) return self.context.changeMode(.library);
     if (key.matches(km.zoom_in.codepoint, km.zoom_in.mods)) return self.zoomGrid(4);
     if (key.matches(km.zoom_out.codepoint, km.zoom_out.mods)) return self.zoomGrid(-4);
     if (key.matches(km.colorize.codepoint, km.colorize.mods)) {

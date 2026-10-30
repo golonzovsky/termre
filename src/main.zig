@@ -198,8 +198,9 @@ fn run(init: std.process.Init) !void {
 
     // The library hands back the next book to open; the reader restarts on it.
     var page = initial_page;
+    var grid = false;
     while (true) {
-        const next = runApp(init, path, page) catch |err| switch (err) {
+        const next = runApp(init, path, page, grid) catch |err| switch (err) {
             error.NoKittyGraphics => {
                 try stderr.writeAll(no_graphics_msg);
                 try stderr.flush();
@@ -213,14 +214,16 @@ fn run(init: std.process.Init) !void {
             init.gpa.free(nb.path);
         }
         page = null;
+        grid = nb.grid;
         path = (try resolveBook(init, nb, stderr)) orelse break;
     }
 }
 
 // Deinit (which leaves the alt screen) must run before the message prints,
 // or the terminal swallows it.
-fn runApp(init: std.process.Init, path: [:0]const u8, initial_page: ?u16) !?NextBook {
+fn runApp(init: std.process.Init, path: [:0]const u8, initial_page: ?u16, grid: bool) !?NextBook {
     var app = try Context.init(init.gpa, init.io, init.environ_map, path, initial_page);
+    if (grid) app.start_mode = .grid;
     defer app.deinit();
     try app.run();
     defer app.next_book = null;

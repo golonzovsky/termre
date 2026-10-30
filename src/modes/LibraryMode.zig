@@ -211,7 +211,17 @@ fn open(self: *Self) void {
         self.context.changeMode(.view);
         return;
     }
-    self.context.openBook(b.key, b.path);
+    self.context.openBook(b.key, b.path, false);
+}
+
+// The page grid of the selected book.
+fn openGrid(self: *Self) void {
+    const b = self.selected() orelse return;
+    if (std.mem.eql(u8, b.key, self.context.positions.bookName())) {
+        self.context.changeMode(.grid);
+        return;
+    }
+    self.context.openBook(b.key, b.path, true);
 }
 
 fn upload(self: *Self) void {
@@ -339,6 +349,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         }
         if (key.matches(km.zoom_in.codepoint, km.zoom_in.mods)) return self.zoom(4);
         if (key.matches(km.zoom_out.codepoint, km.zoom_out.mods)) return self.zoom(-4);
+        if (key.matches(km.grid_mode.codepoint, km.grid_mode.mods)) return self.openGrid();
         if (key.matches('u', .{})) return self.upload();
         if (key.matches('x', .{})) return self.toggleDone();
         if (key.matches('r', .{})) return self.resetProgress();
@@ -356,8 +367,8 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     if (key.matches(vaxis.Key.right, .{}) or key.matches(km.scroll_right.codepoint, km.scroll_right.mods)) return self.moveCursor(1);
     if (key.matches(km.scroll_half_down.codepoint, km.scroll_half_down.mods)) return self.moveCursor(cols * @as(i32, self.rows_visible));
     if (key.matches(km.scroll_half_up.codepoint, km.scroll_half_up.mods)) return self.moveCursor(-cols * @as(i32, self.rows_visible));
-    if (key.matches(km.list_top.codepoint, km.list_top.mods)) return self.moveCursor(-@as(i32, @intCast(self.cursor)));
-    if (key.matches(km.list_bottom.codepoint, km.list_bottom.mods)) return self.moveCursor(@intCast(self.shown.items.len));
+    if (key.matches(vaxis.Key.home, .{})) return self.moveCursor(-@as(i32, @intCast(self.cursor)));
+    if (key.matches(vaxis.Key.end, .{}) or key.matches(km.list_bottom.codepoint, km.list_bottom.mods)) return self.moveCursor(@intCast(self.shown.items.len));
     if (key.matches(km.list_select.codepoint, km.list_select.mods)) self.open();
 }
 
@@ -446,7 +457,8 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
 
 const help_lines = [_][]const u8{
     " Enter / click   open the book (downloads it when it is only in the store) ",
-    " h j k l         move          Ctrl-d / Ctrl-u  page          g / G  first / last ",
+    " g               open the book's page grid ",
+    " h j k l         move          Ctrl-d / Ctrl-u  page          Home / End (G)  first / last ",
     " i / o           bigger / smaller cards ",
     " /               filter titles as you type; Enter keeps the filter, Esc clears it ",
     " u               upload the PDF and cover to the sync store ",

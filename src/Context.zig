@@ -44,7 +44,7 @@ pub const Event = union(enum) {
 const progress_ttl_ns: i64 = 3 * std.time.ns_per_s;
 
 // A book picked in the library; main reopens the reader on it.
-pub const NextBook = struct { key: []const u8, path: []const u8 };
+pub const NextBook = struct { key: []const u8, path: []const u8, grid: bool = false };
 
 pub const ModeType = enum { view, command, hint, marks, toc, help, search, search_list, highlights, crop, grid, library };
 pub const Mode = union(ModeType) { view: ViewMode, command: CommandMode, hint: HintMode, marks: MarksMode, toc: TocMode, help: HelpMode, search: SearchMode, search_list: SearchListMode, highlights: HighlightsMode, crop: CropMode, grid: GridMode, library: LibraryMode };
@@ -104,6 +104,8 @@ pub const Context = struct {
     next_mode: ?ModeType = null,
     pending_command_text: ?[]u8 = null,
     next_book: ?NextBook = null,
+    // Mode to enter before the first frame (the library's `g` on another book).
+    start_mode: ?ModeType = null,
     // Library card width in cells; kept in <state>/library_zoom.
     library_card_w: u16 = 26,
     cover_thread: ?std.Thread = null,
@@ -550,14 +552,14 @@ pub const Context = struct {
     }
 
     // Ends the loop; main reopens the reader on the chosen book.
-    pub fn openBook(self: *Self, key: []const u8, path: []const u8) void {
+    pub fn openBook(self: *Self, key: []const u8, path: []const u8, grid: bool) void {
         const k = self.allocator.dupe(u8, key) catch return;
         const p = self.allocator.dupe(u8, path) catch {
             self.allocator.free(k);
             return;
         };
         self.freeNextBook();
-        self.next_book = .{ .key = k, .path = p };
+        self.next_book = .{ .key = k, .path = p, .grid = grid };
         self.should_quit = true;
     }
 
@@ -735,6 +737,10 @@ pub const Context = struct {
     pub fn run(self: *Self) !void {
         self.current_mode = .{ .view = ViewMode.init(self) };
         self.loadLibraryCardWidth();
+        if (self.start_mode) |m| {
+            self.changeMode(m);
+            self.applyModeChange();
+        }
 
         var loop: vaxis.Loop(Event) = .init(self.io, &self.tty, &self.vx);
         self.loop = &loop;

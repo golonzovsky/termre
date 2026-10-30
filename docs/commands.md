@@ -61,10 +61,10 @@ non-obvious ones:
 - `g` page grid (thumbnail overview): `h`/`j`/`k`/`l` move the selection with
   smooth scrolling, wheel pans the grid (selection and page stay put), `i`/`o`
   resize thumbnails, `z` invert, `t` auto-crop, `Enter` or click jumps,
-  `g`/`Esc` closes
+  `b` switches to the library, `g`/`Esc` closes
 - `b` library: all books with their covers, a progress bar and the last read
   time, newest first; `h`/`j`/`k`/`l` move, `Enter` or click opens the book in
-  this window, `/` filters titles as you type (every word must match; `Enter`
+  this window, `g` opens it straight into the page grid, `/` filters titles as you type (every word must match; `Enter`
   keeps the filter, `Esc` clears it), `i`/`o` make the cards bigger or
   smaller (remembered), `?` lists the keys. Each card says where
   the PDF is: `local`, `uploaded` (also in the sync store), `in store` (only

@@ -175,15 +175,42 @@ fn request(self: *Self, a: std.mem.Allocator, method: []const u8, path: []const 
     else
         try std.fmt.allocPrint(a, "https://{s}{s}", .{ self.endpoint, path });
 
+    const uri = try std.Uri.parse(url);
+    const m: std.http.Method = if (std.mem.eql(u8, method, "PUT")) .PUT else if (std.mem.eql(u8, method, "DELETE")) .DELETE else .GET;
+    var req = try self.client.request(m, uri, .{ .extra_headers = extra[0..n], .redirect_behavior = .unhandled });
+    defer req.deinit();
+    if (m == .PUT) {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+    var response = try req.receiveHead(&.{});
+    const status: u16 = @backingInt(response.head.status);
+    // 204/304 carry no body; `fetch` would wait for a close that a keep-alive
+    // connection never sends (R2 answers DELETE with 204).
+    if (response.head.status == .no_content or response.head.status == .not_modified or response.head.content_length == 0) {
+        req.response_content_length = 0;
+        return .{ .status = status, .body = "" };
+    }
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try a.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try a.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
     var aw: std.Io.Writer.Allocating = .init(a);
-    const result = try self.client.fetch(.{
-        .location = .{ .url = url },
-        .method = if (std.mem.eql(u8, method, "PUT")) .PUT else if (std.mem.eql(u8, method, "DELETE")) .DELETE else .GET,
-        .payload = if (std.mem.eql(u8, method, "PUT")) payload else null,
-        .extra_headers = extra[0..n],
-        .response_writer = &aw.writer,
-    });
-    return .{ .status = @backingInt(result.status), .body = aw.writer.buffered() };
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+    return .{ .status = status, .body = aw.writer.buffered() };
 }
 
 fn objectKey(self: *Self, a: std.mem.Allocator, key: []const u8) ![]u8 {
