@@ -43,7 +43,10 @@ non-obvious ones:
 - `/` search, then `N`/`P` for next/prev match; `S` opens the search finder with
   the full match list; Esc clears highlights
 - mouse drag selects text and copies it on release (OSC 52); `H` persists the
-  selection as a highlight; `V` opens the highlights navigator
+  selection as a highlight; `V` opens the highlights navigator; in every list
+  popup (contents, marks, highlights, search results) a click on a row does
+  what `Enter` does, the wheel scrolls; in the contents a right click, or a
+  left click on the `▸`/`▾` marker, folds or unfolds the entry
 - `j`/`k` scroll a step and wheel/trackpad scrolls; `Ctrl+D`/`Ctrl+U` scroll
   half a page with a short smooth animation (in the TOC and the marks / search /
   highlights popups they jump the list half a screen)

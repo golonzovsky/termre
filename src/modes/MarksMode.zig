@@ -11,6 +11,7 @@ pub const hides_page = true;
 
 context: *Context,
 list: ListView,
+geo: ListView.Geometry = .{},
 outline: []const PdfHandler.OutlineEntry,
 
 pub fn init(context: *Context) Self {
@@ -52,12 +53,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
             return;
         },
         .moved => return,
-        .confirm => {
-            const m = marks[self.list.cursor];
-            ctx.changeMode(.view);
-            ctx.jumpToMark(m.letter);
-            return;
-        },
+        .confirm => return self.activate(),
         .none => {},
     }
     if (key.matches(km.list_delete.codepoint, km.list_delete.mods)) {
@@ -84,13 +80,22 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     }
 }
 
+fn activate(self: *Self) void {
+    const ctx = self.context;
+    const m = ctx.marks.items[self.list.cursor];
+    ctx.changeMode(.view);
+    ctx.jumpToMark(m.letter);
+}
+
 pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
+    if (self.list.clicked(mouse, self.geo, self.context.marks.items.len)) |_| return self.activate();
     self.list.handleWheel(mouse, self.context.marks.items.len);
 }
 
 pub fn draw(self: *Self, win: vaxis.Window) void {
     const marks = self.context.marks.items;
     const popup = ListView.layout(win, marks.len, 120);
+    self.geo = popup.geometry();
     const w = popup.win.width;
     popup.title(" Marks (Enter: jump, r: rename, d: delete, Esc: close) ", theme.bg);
 

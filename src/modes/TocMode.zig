@@ -14,6 +14,7 @@ entries: []const PdfHandler.OutlineEntry,
 visible: std.ArrayList(usize),
 expanded: std.AutoHashMap(usize, void),
 list: ListView,
+geo: ListView.Geometry = .{},
 manual_top: bool = false,
 
 pub fn init(context: *Context) Self {
@@ -105,12 +106,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
             return;
         },
         .moved => return,
-        .confirm => {
-            const e = self.entries[self.visible.items[self.list.cursor]];
-            ctx.changeMode(.view);
-            ctx.followLink(.{ .page = .{ .num = e.page, .y = e.y } });
-            return;
-        },
+        .confirm => return self.activate(),
         .none => {},
     }
     if (key.matches('L', .{})) {
@@ -139,9 +135,32 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     }
 }
 
+fn activate(self: *Self) void {
+    const ctx = self.context;
+    const e = self.entries[self.visible.items[self.list.cursor]];
+    ctx.changeMode(.view);
+    ctx.followLink(.{ .page = .{ .num = e.page, .y = e.y } });
+}
+
 pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
     if (mouse.type != .press) return;
     if (self.visible.items.len == 0) return;
+    // Right click folds/unfolds; a left click on the ▸/▾ marker does too,
+    // elsewhere on the row it jumps.
+    if (mouse.button == .right or mouse.button == .left) {
+        const row = self.list.rowAt(mouse, self.geo, self.visible.items.len) orelse return;
+        self.list.cursor = row;
+        self.manual_top = false;
+        const entry = self.entries[self.visible.items[row]];
+        const marker_x: i32 = self.geo.x + 1 + @as(i32, entry.depth) * 2;
+        const on_marker = mouse.col >= marker_x and mouse.col < marker_x + 2;
+        if (mouse.button == .right or on_marker) {
+            if (self.hasChildren(self.visible.items[row])) self.toggleCurrent() else self.collapseCurrent();
+        } else {
+            self.activate();
+        }
+        return;
+    }
     const step: usize = 3;
     switch (mouse.button) {
         .wheel_up => {
@@ -303,6 +322,7 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
     const a = self.context.frameAlloc();
 
     var it = self.list.rows(self.visible.items.len, list_h, 2);
+    self.geo = .{ .x = x_off, .y = y_off, .w = w, .first_row = 2, .list_h = list_h };
     while (it.next()) |r| {
         const entry_idx = self.visible.items[r.idx];
         const e = self.entries[entry_idx];

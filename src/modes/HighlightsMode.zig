@@ -11,6 +11,7 @@ pub const hides_page = true;
 
 context: *Context,
 list: ListView,
+geo: ListView.Geometry = .{},
 
 pub fn init(context: *Context) Self {
     return .{
@@ -34,12 +35,7 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
             return;
         },
         .moved => return,
-        .confirm => {
-            const idx = self.list.cursor;
-            ctx.changeMode(.view);
-            Selection.jumpToHighlight(ctx, idx);
-            return;
-        },
+        .confirm => return self.activate(),
         .none => {},
     }
     if (key.matches(km.list_delete.codepoint, km.list_delete.mods)) {
@@ -49,13 +45,22 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     }
 }
 
+fn activate(self: *Self) void {
+    const ctx = self.context;
+    const idx = self.list.cursor;
+    ctx.changeMode(.view);
+    Selection.jumpToHighlight(ctx, idx);
+}
+
 pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
+    if (self.list.clicked(mouse, self.geo, self.context.highlights.items.len)) |_| return self.activate();
     self.list.handleWheel(mouse, self.context.highlights.items.len);
 }
 
 pub fn draw(self: *Self, win: vaxis.Window) void {
     const items = self.context.highlights.items;
     const popup = ListView.layout(win, items.len, 120);
+    self.geo = popup.geometry();
     const w = popup.win.width;
     popup.title(" Highlights (Enter: jump, d: delete, Esc: close) ", theme.bg);
 

@@ -66,6 +66,26 @@ pub fn handleKey(self: *Self, ctx: *Context, key: vaxis.Key, km: Config.KeyMap, 
     return .none;
 }
 
+// Where the rows were drawn last frame, for clicks.
+pub const Geometry = struct { x: i32 = 0, y: i32 = 0, w: u16 = 0, first_row: u16 = 1, list_h: usize = 0 };
+
+// The row under the pointer, if any.
+pub fn rowAt(self: *const Self, mouse: vaxis.Mouse, g: Geometry, len: usize) ?usize {
+    const x = @as(i32, mouse.col) - g.x;
+    const y = @as(i32, mouse.row) - g.y - g.first_row;
+    if (x < 0 or x >= g.w or y < 0 or y >= g.list_h) return null;
+    const idx = self.top + @as(usize, @intCast(y));
+    return if (idx < len) idx else null;
+}
+
+// The row under a left click, if any; the cursor moves there.
+pub fn clicked(self: *Self, mouse: vaxis.Mouse, g: Geometry, len: usize) ?usize {
+    if (mouse.type != .press or mouse.button != .left) return null;
+    const idx = self.rowAt(mouse, g, len) orelse return null;
+    self.cursor = idx;
+    return idx;
+}
+
 pub fn handleWheel(self: *Self, mouse: vaxis.Mouse, len: usize) void {
     if (mouse.type != .press or len == 0) return;
     switch (mouse.button) {
@@ -120,6 +140,10 @@ pub const Popup = struct {
 
     pub fn title(p: Popup, text: []const u8, style: vaxis.Cell.Style) void {
         _ = p.win.print(&.{.{ .text = text, .style = style }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+    }
+
+    pub fn geometry(p: Popup) Geometry {
+        return .{ .x = p.win.x_off, .y = p.win.y_off, .w = p.win.width, .first_row = 1, .list_h = p.list_h };
     }
 
     pub fn rows(p: Popup, view: *Self, len: usize) Rows {

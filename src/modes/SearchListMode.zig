@@ -11,6 +11,7 @@ pub const hides_page = true;
 
 context: *Context,
 list: ListView,
+geo: ListView.Geometry = .{},
 // Non-null while the finder is collecting a query (no active search yet).
 input: ?vaxis.widgets.TextInput,
 no_matches: bool,
@@ -91,17 +92,21 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
     }
     switch (self.list.handleKey(ctx, key, km, hits.len)) {
         .close => ctx.changeMode(.view),
-        .confirm => {
-            const idx = self.list.cursor;
-            ctx.search_index = idx;
-            ctx.changeMode(.view);
-            ctx.gotoHit(idx);
-        },
+        .confirm => return self.activate(),
         .moved, .none => {},
     }
 }
 
+fn activate(self: *Self) void {
+    const ctx = self.context;
+    const idx = self.list.cursor;
+    ctx.search_index = idx;
+    ctx.changeMode(.view);
+    ctx.gotoHit(idx);
+}
+
 pub fn handleMouse(self: *Self, mouse: vaxis.Mouse) void {
+    if (self.list.clicked(mouse, self.geo, self.context.search_hits.items.len)) |_| return self.activate();
     self.list.handleWheel(mouse, self.context.search_hits.items.len);
 }
 
@@ -127,6 +132,7 @@ pub fn draw(self: *Self, win: vaxis.Window) void {
     const needle = self.context.search_needle;
 
     const popup = ListView.layout(win, hits.len, 120);
+    self.geo = popup.geometry();
     const w = popup.win.width;
 
     const a = self.context.frameAlloc();
