@@ -1,5 +1,5 @@
 // Per-book reading state, one record ("shard") per device:
-//   <state>/termre/books/<key>/<device>.json
+//   <state>/books/<key>/<device>.json
 // A device only ever writes its own shard; loading merges every shard for
 // the book: view state is last-writer-wins by `updated_at`, marks and
 // highlights are a union with tombstones, so two devices annotating the same
@@ -420,9 +420,9 @@ pub fn listOpen(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []OpenEn
     return out.toOwnedSlice(allocator) catch &.{};
 }
 
-// Every book with a shard, newest first. Prefers this device's path, then any
-// shard whose path exists here, else the newest shard's path tagged with its
-// device (the book is not on this machine).
+// Every book with a shard, newest first. Prefers this device's path when the
+// file is there, then any shard whose path exists here, else the newest
+// shard's path tagged with its device (the book is not on this machine).
 pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []RecentEntry {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -442,18 +442,26 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []Rece
         if (shards.len == 0) continue;
 
         var newest: usize = 0;
-        var chosen: ?usize = null;
+        var own: ?usize = null;
+        var remote: ?usize = null;
         var pages: u16 = readPagesFile(a, io, book_dir);
         var done_at: i64 = 0;
         var undone_at: i64 = 0;
         for (shards, 0..) |s, i| {
             if (s.updated_at > shards[newest].updated_at) newest = i;
-            if (std.mem.eql(u8, s.device, device) and s.path.len > 0) chosen = i;
+            if (s.path.len > 0) {
+                if (std.mem.eql(u8, s.device, device)) own = i;
+                if (remote == null or s.updated_at > shards[remote.?].updated_at) remote = i;
+            }
             pages = @max(pages, s.pages);
             done_at = @max(done_at, s.done_at);
             undone_at = @max(undone_at, @max(s.undone_at, s.reset_at));
         }
         const merged = mergeShards(a, shards) catch continue;
+        var chosen: ?usize = null;
+        if (own) |i| {
+            if (cwd.access(io, shards[i].path, .{})) |_| chosen = i else |_| {}
+        }
         if (chosen == null) {
             for (shards, 0..) |s, i| {
                 if (s.path.len == 0) continue;
@@ -463,8 +471,7 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []Rece
             }
         }
         const local = chosen != null;
-        const src = shards[chosen orelse newest];
-        if (src.path.len == 0) continue;
+        const src = shards[chosen orelse remote orelse continue];
         out.append(allocator, .{
             .key = allocator.dupe(u8, entry.name) catch break,
             .path = allocator.dupe(u8, src.path) catch break,
@@ -492,8 +499,10 @@ const Own = struct { shard: Shard, file: []const u8 };
 fn ownShard(a: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8, path: []const u8) !Own {
     const device = deviceId(a, io, paths.state);
     const file = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ paths.books, key, device });
-    const shard = readShard(a, io, file) orelse Shard{ .device = device, .path = path };
-    return .{ .shard = shard, .file = file };
+    if (readShard(a, io, file)) |shard| return .{ .shard = shard, .file = file };
+    // A book that is not on this machine keeps the other device's path out of this record.
+    const here = if (std.Io.Dir.cwd().access(io, path, .{})) |_| path else |_| "";
+    return .{ .shard = .{ .device = device, .path = here }, .file = file };
 }
 
 fn writeOwn(a: std.mem.Allocator, io: std.Io, own: Own) !void {
@@ -530,6 +539,7 @@ pub fn resetProgress(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key
 
 // Every local record, the cover and the page count.
 pub fn deleteBook(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: []const u8) !void {
+    if (!fs.isPathComponent(key)) return error.InvalidBookKey;
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.books, key });
     defer allocator.free(dir);
     try std.Io.Dir.cwd().deleteTree(io, dir);
@@ -647,10 +657,15 @@ pub fn importBundle(allocator: std.mem.Allocator, io: std.Io, paths: Paths, json
             const view = merged.view orelse continue;
             // Keep the path this machine knows the book by.
             const path = if (n == 2 and pair[1].path.len > 0) pair[1].path else view.path;
+            const local = pair[n - 1];
             const out = Shard{
                 .device = imported.device,
                 .path = path,
                 .updated_at = view.last_opened,
+                .pages = view.pages,
+                .done_at = @max(imported.done_at, local.done_at),
+                .undone_at = @max(imported.undone_at, local.undone_at),
+                .reset_at = @max(imported.reset_at, local.reset_at),
                 .view = toView(view),
                 .marks = try marksToRecs(a, merged.marks),
                 .highlights = try withHighlightIds(a, merged.highlights),
@@ -1091,4 +1106,67 @@ test "save, load, export and import round-trip through the state dir" {
     var q = init(ta, io, p2, "pdf-id:test");
     defer q.deinit();
     try testing.expectEqual(@as(u16, 3), q.getSavedPosition().?.page);
+}
+
+test "a book only on another device stays remote through markDone and resetProgress" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const paths = try testPaths(ta, root);
+    defer paths.deinit(ta);
+
+    try tmp.dir.createDirPath(io, "books/pdf-id_r");
+    const other = Shard{ .device = "other", .path = "/nowhere/r.pdf", .updated_at = 100, .pages = 50, .view = .{ .page = 7, .touched = true } };
+    const json = try std.json.Stringify.valueAlloc(ta, other, .{});
+    defer ta.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "books/pdf-id_r/other.json", .data = json });
+
+    try markDone(ta, io, paths, "pdf-id_r", "/nowhere/r.pdf", true);
+    {
+        const recents = listRecent(ta, io, paths);
+        defer freeRecent(ta, recents);
+        try testing.expectEqual(@as(usize, 1), recents.len);
+        try testing.expectEqualStrings("other", recents[0].device);
+        try testing.expectEqualStrings("/nowhere/r.pdf", recents[0].path);
+        try testing.expect(recents[0].done);
+    }
+    try resetProgress(ta, io, paths, "pdf-id_r", "/nowhere/r.pdf");
+    const recents = listRecent(ta, io, paths);
+    defer freeRecent(ta, recents);
+    try testing.expectEqual(@as(usize, 1), recents.len);
+    try testing.expectEqualStrings("other", recents[0].device);
+    try testing.expectEqual(@as(u16, 0), recents[0].page);
+    try testing.expect(!recents[0].done);
+}
+
+test "importBundle keeps the page count and the library flags" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const paths = try testPaths(ta, root);
+    defer paths.deinit(ta);
+
+    const shard = Shard{ .device = "other", .path = "/nowhere/r.pdf", .updated_at = 100, .pages = 50, .done_at = 90, .undone_at = 40, .reset_at = 30, .view = .{ .page = 7, .touched = true } };
+    const bundle = Bundle{ .exported_at = 1, .exported_by = "other", .books = &.{.{ .book = "pdf-id_r", .shards = &.{shard} }} };
+    const json = try std.json.Stringify.valueAlloc(ta, bundle, .{});
+    defer ta.free(json);
+    _ = try importBundle(ta, io, paths, json);
+
+    var arena = std.heap.ArenaAllocator.init(ta);
+    defer arena.deinit();
+    const file = try std.fmt.allocPrint(arena.allocator(), "{s}/pdf-id_r/other.json", .{paths.books});
+    const got = readShard(arena.allocator(), io, file).?;
+    try testing.expectEqual(@as(u16, 50), got.pages);
+    try testing.expectEqual(@as(i64, 90), got.done_at);
+    try testing.expectEqual(@as(i64, 40), got.undone_at);
+    try testing.expectEqual(@as(i64, 30), got.reset_at);
+    const recents = listRecent(ta, io, paths);
+    defer freeRecent(ta, recents);
+    try testing.expect(recents[0].done);
 }

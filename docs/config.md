@@ -14,9 +14,9 @@ $XDG_CONFIG_HOME/termre/config.yaml
 $HOME/.config/termre/config.yaml
 ```
 
-If no configuration file is found in any of these locations, termre creates an empty configuration file in the primary or fallback location.
+If no configuration file is found in any of these locations, termre writes a commented template listing every section there (everything in it is commented out, so the defaults apply).
 
-The file is YAML; keys are lowerCamelCase. On first run termre writes a commented template listing every section.
+The file is YAML; keys are lowerCamelCase.
 
 | Key | Type | Description |
 | --- | --- | --- |
@@ -41,12 +41,40 @@ keyMap:
     key: h
   scrollRight:
     key: l
+  scrollHalfDown:
+    key: d
+    modifiers: [ctrl]
+  scrollHalfUp:
+    key: u
+    modifiers: [ctrl]
   zoomIn:
     key: i
   zoomOut:
     key: o
   widthMode:
     key: w
+  fitWidth:
+    key: W
+  cropToContent:
+    key: t
+  cropMode:
+    key: c
+  toggleSpread:
+    key: d
+  hintMode:
+    key: ";"
+  setMark:
+    key: m
+  jumpMark:
+    key: "'"
+  tocMode:
+    key: T
+  marksMode:
+    key: M
+  gridMode:
+    key: g
+  libraryMode:
+    key: b
   colorize:
     key: z
   quit:
@@ -60,10 +88,35 @@ keyMap:
     key: escape
   executeCommand:
     key: enter
+  completeCommand:
+    key: tab
   historyBack:
     key: up
   historyForward:
     key: down
+  jumpBack:
+    key: o
+    modifiers: [ctrl]
+  jumpForward:
+    key: tab
+  openInEditor:
+    key: e
+  openChapterInEditor:
+    key: E
+  showHelp:
+    key: "?"
+  search:
+    key: /
+  searchNext:
+    key: N
+  searchPrev:
+    key: P
+  searchList:
+    key: S
+  addHighlight:
+    key: H
+  highlightsMode:
+    key: V
   listTop:
     key: g
   listBottom:
@@ -83,7 +136,7 @@ general:
   white: "#000000"
   black: "#ffffff"
   size: 1.0
-  zoomStep: 1.25
+  zoomStep: 1.1
   zoomMin: 1.0
   scrollStep: 100.0
   retryDelay: 0.2
@@ -110,10 +163,10 @@ statusBar:
         text: "*"
       watching:
         text: " "
-    - "<separator><page>:<total_pages> "
+    - " <chapter><separator><search><crop><oddx><fit><hlock><page>:<total_pages> · <percent>% "
 cache:
   enabled: true
-  lruSize: 10
+  lruSize: 14
   budgetMb: 200
 sync: []
 ```
@@ -155,17 +208,37 @@ The `keyMap` section defines keybindings for various actions.
 | `scrollDown` | Move the viewport down |
 | `scrollLeft` | Move the viewport left |
 | `scrollRight` | Move the viewport right |
+| `scrollHalfDown` / `scrollHalfUp` | Scroll half a page (in the page grid and the library: one screen) |
 | `zoomIn` | Increase the zoom level |
 | `zoomOut` | Decrease the zoom level |
 | `widthMode` | Toggle between full-height or full-width mode |
+| `fitWidth` | Toggle the fit-width lock (`:fit`) |
+| `cropToContent` | Toggle auto-crop to the page content |
+| `cropMode` | Interactive crop |
+| `toggleSpread` | Toggle the continuous spread (a digit after it sets the column count) |
+| `hintMode` | Link hints |
+| `setMark` / `jumpMark` | Set / jump to a mark (followed by a letter) |
+| `tocMode` | Table of contents popup |
+| `marksMode` | Marks popup |
+| `gridMode` | Page grid |
+| `libraryMode` | Library |
 | `colorize` | Toggle color replacement |
 | `quit` | Exit the program |
 | `fullScreen` | Toggle full screen (i.e. hide status bar) |
 | `enterCommandMode` | Enter command mode |
 | `exitCommandMode` | Exit command mode |
 | `executeCommand` | Execute the entered command |
+| `completeCommand` | Complete the command name |
 | `historyBack` | Go back one command in history |
 | `historyForward` | Go forward one command in history |
+| `jumpBack` / `jumpForward` | Step back / forward through the jump list |
+| `openInEditor` / `openChapterInEditor` | Open the current page / chapter as markdown in `$EDITOR` |
+| `showHelp` | Help popup |
+| `search` | Search the document |
+| `searchNext` / `searchPrev` | Next / previous match |
+| `searchList` | Search finder with the full match list |
+| `addHighlight` | Save the current selection as a highlight |
+| `highlightsMode` | Highlights popup |
 | `listTop` / `listBottom` | Jump to the first / last entry in a list popup (TOC, marks, search, highlights) |
 | `listSelect` | Jump to the selected list entry |
 | `listDelete` | Delete the selected mark / highlight |
@@ -178,7 +251,7 @@ Each keybinding is an object named after the action it performs. This object inc
 | Property | Type | Description |
 | :--- | :--- | :--- |
 | `key` | [Key](#keys) | The key that triggers the action |
-| `modifiers` (optional) | [Modifiers](#modifiers) | Other keys that must be held down to trigger the action |
+| `modifiers` (optional) | [Modifiers](#modifiers) | Other keys that must be held down to trigger the action; a binding without it has none, whatever the default binding uses |
 
 #### Keys
 
@@ -250,7 +323,7 @@ The `general` section includes various display and timing settings.
 | `scrollStep` | Float (pixels) | Distance the viewport moves per scroll keystroke |
 | `detectDpi` | Boolean | Enables pixel-density detection so that 100% zoom = actual size |
 | `shmTransfer` | Boolean | Raw-RGB page transfer via POSIX shared memory (kitty `t=s`); disable to fall back to PNG temp files for terminals without shm support (done automatically inside zellij; Rex streams the bytes directly) |
-| `dpi` | Float | Pixel density to use if `detect_dpi` is false, or fallback if detection fails |
+| `dpi` | Float | Pixel density to use if `detectDpi` is false, or fallback if detection fails |
 | `retryDelay` | Float (seconds) | Delay before retrying to load a document or render a page |
 | `timeout` | Float (seconds) | Maximum time to keep retrying before giving up on loading a document or rendering a page |
 | `history` | Integer | Maximum number of entries in command history |
@@ -313,7 +386,7 @@ A `style` object can include the following properties:
 
 #### Underline
 
-The `ul_style` property can be set to one of the following styles:
+The `ulStyle` property can be set to one of the following styles:
 
 | Style | Description |
 | :--- | :--- |
@@ -342,6 +415,13 @@ Plain items are just strings that may include placeholders (e.g., `<page>:<total
 | `<page>` | The current page number |
 | `<total_pages>` | The total number of pages |
 | `<separator>` | Inserts a space to separate the left and right sides of the status bar |
+| `<chapter>` | Title of the current chapter (from the outline) |
+| `<percent>` | Progress through the book, as a number |
+| `<search>` | Current match, match count and the search text while a search is active |
+| `<crop>` | The crop in effect (`CROP T R B L`, `*` when automatic) |
+| `<oddx>` | The odd-page shift when set |
+| `<fit>` | `FIT` while the fit-width lock is on |
+| `<hlock>` | `HLOCK` while horizontal scroll is locked |
 
 #### Styled Items
 

@@ -6,10 +6,17 @@ const Context = @import("Context.zig").Context;
 pub fn exportCropped(ctx: *Context, arg: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     const out: [:0]const u8 = blk: {
-        if (arg.len > 0) break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}", .{arg}, 0) catch {
-            ctx.setProgress(" export: path too long ");
-            return;
-        };
+        if (arg.len > 0) {
+            const home = if (std.mem.startsWith(u8, arg, "~/")) ctx.env.get("HOME") else null;
+            const res = if (home) |h|
+                std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ h, arg[2..] }, 0)
+            else
+                std.fmt.bufPrintSentinel(&path_buf, "{s}", .{arg}, 0);
+            break :blk res catch {
+                ctx.setProgress(" export: path too long ");
+                return;
+            };
+        }
         const dir = std.fs.path.dirname(ctx.doc_abs_path) orelse ".";
         const stem = std.fs.path.stem(ctx.doc_abs_path);
         break :blk std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}-cropped.pdf", .{ dir, stem }, 0) catch {

@@ -53,7 +53,7 @@ non-obvious ones:
 - list popups (TOC, marks, search, highlights) share one key set: `j`/`k` or
   arrows move, `g`/`G` first/last, `Enter` jumps, `d` deletes a mark/highlight,
   `r` renames a mark, Esc closes (`keyMap.list*` to rebind)
-- `i`/`o` zoom in/out (default step 10% per press; set `general.zoom_step` to
+- `i`/`o` zoom in/out (default step 10% per press; set `general.zoomStep` to
   change, e.g. `1.25` for the old coarser feel)
 - `c` interactive crop: drag the four crop lines with the mouse (cropped parts
   dimmed, each visible page shows its own lines), wheel scrolls, `Enter` (or

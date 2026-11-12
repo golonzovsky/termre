@@ -29,7 +29,10 @@ pub fn deinit(self: *Self) void {
 
 pub fn setTransfer(self: *Self, transfer: types.Transfer, tmp_dir: ?[]const u8) void {
     self.transfer = transfer;
-    if (tmp_dir) |dir| self.png_dir = self.allocator.dupe(u8, dir) catch null;
+    if (tmp_dir) |dir| {
+        if (self.png_dir) |old| self.allocator.free(old);
+        self.png_dir = self.allocator.dupe(u8, dir) catch null;
+    }
 }
 
 pub fn encode(self: *Self, ctx: [*c]c.fz_context, pix: [*c]c.fz_pixmap, width: usize, height: usize, ox: f32, oy: f32) !types.EncodedImage {

@@ -1,6 +1,7 @@
 // `re mcp`: a Model Context Protocol server over stdio, so an agent can read
 // a book alongside you — outline, page ranges as markdown, full-text search,
-// and your reading state (position, marks, highlights). Read-only.
+// and your reading state (position, marks, highlights). Read-only, except
+// goto_page and select_text, which drive an open reader.
 const std = @import("std");
 const Config = @import("config/Config.zig");
 const PdfHandler = @import("handlers/PdfHandler.zig");
@@ -109,7 +110,7 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
         else {
             try stderr.writeAll("re mcp install: expected `claude` or `codex`\n");
             try stderr.flush();
-            return;
+            std.process.exit(2);
         };
         // Both clients discover skills at ~/.<client>/skills/<name>/SKILL.md.
         if (init.environ_map.get("HOME")) |home| {
@@ -148,6 +149,7 @@ pub fn cli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.W
     }
     try stderr.writeAll("usage: re mcp [install claude|codex | config | skill]\n");
     try stderr.flush();
+    std.process.exit(2);
 }
 
 pub fn run(init: std.process.Init) !void {
@@ -330,7 +332,7 @@ fn argInt(args: std.json.ObjectMap, name: []const u8) ?i64 {
     const v = args.get(name) orelse return null;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (std.math.isFinite(f) and @abs(f) < 1e15) @intFromFloat(f) else null,
         .string => |str| std.fmt.parseInt(i64, str, 10) catch null,
         else => null,
     };
@@ -557,11 +559,9 @@ fn outlineText(_: *Server, a: std.mem.Allocator, book: *Book, _: std.json.Object
     return w.buffered();
 }
 
-const HookCtx = struct { book: *Book, heading: ?[]const u8 };
-
 fn pageHook(ctx: *anyopaque, page: u16, w: *std.Io.Writer) anyerror!void {
-    const h: *HookCtx = @ptrCast(@alignCast(ctx));
-    for (h.book.outline) |e| {
+    const book: *Book = @ptrCast(@alignCast(ctx));
+    for (book.outline) |e| {
         if (e.page != page) continue;
         try w.splatByteAll('#', @min(@as(usize, e.depth) + 2, 6));
         try w.print(" {s}\n\n", .{e.title});
@@ -575,8 +575,7 @@ fn pagesMarkdown(self: *Server, a: std.mem.Allocator, book: *Book, start: u16, e
     const dir = try std.fmt.allocPrint(a, "{s}/{d}", .{ self.tmp_dir, self.req_seq });
     try std.Io.Dir.cwd().createDirPath(self.io, dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/pages-{d}-{d}.md", .{ dir, start + 1, end }, 0);
-    var hook = HookCtx{ .book = book, .heading = heading };
-    try book.handler.writePagesText(start, end, path, null, null, pageHook, &hook);
+    try book.handler.writePagesText(start, end, path, null, null, pageHook, book);
     const md = try std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_result_bytes));
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;

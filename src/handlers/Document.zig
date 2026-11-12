@@ -89,7 +89,7 @@ pub const RenderParams = struct {
 pub const RenderBound = struct { bound: c.fz_rect, ox: f32, oy: f32 };
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, config: *Config) !Self {
-    if (!std.mem.endsWith(u8, path, ".pdf")) {
+    if (!std.ascii.endsWithIgnoreCase(path, ".pdf")) {
         return types.DocumentError.UnsupportedFileFormat;
     }
 
@@ -118,7 +118,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, config
         .io = io,
         .ctx = ctx,
         .doc = doc,
-        .total_pages = @as(u16, @intCast(page_count)),
+        .total_pages = @intCast(@min(page_count, std.math.maxInt(u16))),
         .path = path,
         .exporter = Exporter.init(allocator),
         .stable_box = null,
@@ -157,9 +157,9 @@ fn reloadAttempt(self: *Self) !void {
     self.doc = doc;
 
     const page_count = c.fz_count_pages_z(self.ctx, self.doc);
-    if (page_count == 0) return types.DocumentError.PageLoadFailed;
+    if (page_count <= 0) return types.DocumentError.PageLoadFailed;
 
-    self.total_pages = @as(u16, @intCast(page_count));
+    self.total_pages = @intCast(@min(page_count, std.math.maxInt(u16)));
     self.stable_box = null;
     self.stable_box_done = false;
 }

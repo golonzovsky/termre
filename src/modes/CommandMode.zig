@@ -316,6 +316,7 @@ fn handleCrop(self: *Self, cmd: []const u8) bool {
     while (it.next()) |tok| {
         if (n >= vals.len) return false;
         vals[n] = std.fmt.parseFloat(f32, tok) catch return false;
+        if (!std.math.isFinite(vals[n])) return false;
         n += 1;
     }
 
@@ -380,6 +381,7 @@ fn handleZoom(self: *Self, cmd: []const u8) bool {
 
     const number_str = cmd[0 .. cmd.len - 1];
     if (std.fmt.parseFloat(f32, number_str)) |percent| {
+        if (!std.math.isFinite(percent)) return false;
         self.context.document_handler.setZoom(percent);
         return true;
     } else |_| {
@@ -395,7 +397,9 @@ fn handleScroll(self: *Self, cmd: []const u8) bool {
 
     const number_str = cmd[2..];
 
-    if (std.fmt.parseFloat(f32, number_str)) |amount| {
+    if (std.fmt.parseFloat(f32, number_str)) |parsed| {
+        if (!std.math.isFinite(parsed)) return false;
+        const amount = std.math.clamp(parsed, -1e6, 1e6);
         const delta = if (sign == '+') amount else -amount;
         const dx: f32 = if (axis == 'x') delta else 0.0;
         const dy: f32 = if (axis == 'y') delta else 0.0;

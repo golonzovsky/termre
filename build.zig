@@ -35,7 +35,7 @@ fn addMupdfDynamic(mod: *std.Build.Module, target: std.Target) void {
     mod.link_libc = true;
 }
 
-// Zig 0.16's Aro translate-c rejects the `++*refs` / `drop = --*refs == 0`
+// Zig's Aro translate-c rejects the `++*refs` / `drop = --*refs == 0`
 // forms in mupdf's ref-count inlines ("invalid left-hand side to assignment"
 // in the cImport). Rewrite them to equivalents it accepts. Idempotent, and
 // only writes when something changed so mupdf isn't rebuilt every run.

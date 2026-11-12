@@ -129,8 +129,10 @@ fn run(init: std.process.Init) !void {
         return @import("mcp.zig").cli(init, args[2..], stdout, stderr);
     }
 
-    if (args.len > 3 or (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))) {
-        try stderr.writeAll(
+    const wants_help = args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"));
+    if (wants_help or args.len > 3) {
+        const out = if (wants_help) stdout else stderr;
+        try out.writeAll(
             \\Usage: re <path-to-pdf | url> [page]   urls (incl. arxiv abs/html) are downloaded once
             \\       re                          pick from recently opened
             \\       re mcp                      MCP server over stdio for agents
@@ -142,7 +144,8 @@ fn run(init: std.process.Init) !void {
             \\       re state purge <book>       remove a book from every backend and this machine
             \\
         );
-        try stderr.flush();
+        try out.flush();
+        if (!wants_help) std.process.exit(2);
         return;
     }
 
@@ -161,7 +164,7 @@ fn run(init: std.process.Init) !void {
             const device = Positions.deviceIdFor(arena, init.io, paths);
             for (backends) |*b| {
                 if (b.manual()) continue; // acts only on `re state sync`
-                Sync.pullAll(init.gpa, init.io, &b.store, paths.books, device, null) catch |err| {
+                Sync.pullAll(init.gpa, init.io, &b.store, paths.books, device, .{}) catch |err| {
                     try stderr.print("sync ({s}): {s}\n", .{ b.name(), @errorName(err) });
                     try stderr.flush();
                 };
@@ -318,6 +321,11 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
         return;
     }
     if (std.mem.eql(u8, args[0], "purge") and args.len >= 2) {
+        if (!fs.isPathComponent(args[1])) {
+            try stderr.print("re state purge: `{s}` is not a book key (a folder name under {s})\n", .{ args[1], paths.books });
+            try stderr.flush();
+            std.process.exit(2);
+        }
         const backends = Sync.backendsFromConfig(init.gpa, init.io, init.environ_map, &config);
         defer for (backends) |*b| b.store.deinit();
         var failed = false;
@@ -349,7 +357,7 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
         const device = Positions.deviceIdFor(arena, init.io, paths);
         var failed = false;
         for (backends) |*b| {
-            Sync.pullAll(init.gpa, init.io, &b.store, books, device, null) catch |err| {
+            Sync.pullAll(init.gpa, init.io, &b.store, books, device, .{ .refresh = true }) catch |err| {
                 try stderr.print("{s}: pull failed ({s})\n", .{ b.name(), @errorName(err) });
                 failed = true;
                 continue;
@@ -388,6 +396,7 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     }
     try stderr.writeAll(usage);
     try stderr.flush();
+    std.process.exit(2);
 }
 
 // Downloads a PDF once into the library dir (`downloadDir`, default
@@ -406,7 +415,9 @@ fn fetchRemote(init: std.process.Init, url_in: []const u8, stderr: *std.Io.Write
                 id = std.mem.trimEnd(u8, id, "/");
                 if (std.mem.endsWith(u8, id, ".pdf")) id = id[0 .. id.len - 4];
                 url = try std.fmt.allocPrint(a, "https://arxiv.org/pdf/{s}", .{id});
-                name = try std.fmt.allocPrint(a, "arxiv-{s}.pdf", .{id});
+                const flat = try a.dupe(u8, id);
+                std.mem.replaceScalar(u8, flat, '/', '-');
+                name = try std.fmt.allocPrint(a, "arxiv-{s}.pdf", .{flat});
                 break;
             }
         }

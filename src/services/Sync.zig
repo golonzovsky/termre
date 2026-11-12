@@ -16,6 +16,7 @@ pub const book_object = "book.pdf";
 pub const cover_object = "cover.png";
 const max_book_bytes = 2 * 1024 * 1024 * 1024;
 const max_cover_bytes = 16 * 1024 * 1024;
+const max_shard_bytes = 4 * 1024 * 1024;
 
 // By value: the worker thread owns no buffer the main thread could read later.
 pub const ErrText = struct {
@@ -180,11 +181,20 @@ fn storeFor(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     return null;
 }
 
+pub const PullOptions = struct {
+    // Also re-fetch shards that are already here (one GET each), so other
+    // devices' progress shows; off, only missing ones come down.
+    refresh: bool = false,
+    // Left to the per-book pull, which tells the reader what changed.
+    skip_book: []const u8 = "",
+    // Collects the books whose PDF the store holds.
+    stored: ?*std.ArrayList([]u8) = null,
+};
+
 // Fetches every other device's shard and every missing cover for every book
 // (one listing), so a fresh device's library shows the whole collection.
-// Synchronous; the PDFs themselves come down on demand (fetchBook). `stored`
-// collects the books whose PDF the store holds.
-pub fn pullAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_dir: []const u8, device: []const u8, stored: ?*std.ArrayList([]u8)) !void {
+// Synchronous; the PDFs themselves come down on demand (fetchBook).
+pub fn pullAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_dir: []const u8, device: []const u8, opts: PullOptions) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -196,19 +206,23 @@ pub fn pullAll(allocator: std.mem.Allocator, io: std.Io, store: *Store, books_di
         const slash = std.mem.indexOfScalar(u8, rel, '/') orelse continue;
         const book = rel[0..slash];
         const name = rel[slash + 1 ..];
-        if (std.mem.indexOfScalar(u8, name, '/') != null) continue;
+        if (!fs.isPathComponent(book) or !fs.isPathComponent(name)) continue;
         if (std.mem.eql(u8, name, book_object)) {
-            if (stored) |list| try list.append(allocator, try allocator.dupe(u8, book));
+            if (opts.stored) |list| try list.append(allocator, try allocator.dupe(u8, book));
             continue;
         }
-        if (!std.mem.eql(u8, name, cover_object)) {
+        const is_cover = std.mem.eql(u8, name, cover_object);
+        if (!is_cover) {
             if (!std.mem.endsWith(u8, name, ".json")) continue;
             if (std.mem.eql(u8, name[0 .. name.len - 5], device)) continue;
+            if (std.mem.eql(u8, book, opts.skip_book)) continue;
         }
         const local_path = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ books_dir, book, name });
-        if (cwd.access(io, local_path, .{})) |_| continue else |_| {}
+        const existing: ?[]u8 = if (opts.refresh and !is_cover)
+            cwd.readFileAlloc(io, local_path, a, .limited(max_shard_bytes)) catch null
+        else if (cwd.access(io, local_path, .{})) |_| continue else |_| null;
         const data = (try store.get(a, e.key)) orelse continue;
-        try cwd.createDirPath(io, std.fs.path.dirname(local_path).?);
+        if (existing) |old| if (std.mem.eql(u8, old, data)) continue;
         try fs.writeFileAtomic(io, local_path, data);
     }
 }
@@ -405,7 +419,11 @@ fn indexBackends(self: *Self) void {
     }
     for (self.backends) |*b| {
         if (b.manual()) continue;
-        pullAll(self.allocator, self.io, &b.store, self.books_dir, self.device, if (b.keepsBooks()) &stored else null) catch |e| self.reportBackendError(b, e);
+        pullAll(self.allocator, self.io, &b.store, self.books_dir, self.device, .{
+            .refresh = true,
+            .skip_book = self.book,
+            .stored = if (b.keepsBooks()) &stored else null,
+        }) catch |e| self.reportBackendError(b, e);
     }
     for (stored.items) |k| self.markStored(k);
     self.report(.indexed);
@@ -445,7 +463,6 @@ fn deleteRequested(self: *Self) void {
         self.mu.unlock(self.io);
         const key = next orelse return;
         defer self.allocator.free(key);
-        self.unmarkStored(key);
         var ok = true;
         for (self.backends) |*b| {
             deleteBook(b, key) catch |e| {
@@ -453,7 +470,10 @@ fn deleteRequested(self: *Self) void {
                 self.reportBackendError(b, e);
             };
         }
-        if (ok) self.report(.deleted);
+        if (ok) {
+            self.unmarkStored(key);
+            self.report(.deleted);
+        }
     }
 }
 
@@ -496,7 +516,7 @@ fn pull(self: *Self, b: *Backend) !bool {
         if (std.mem.eql(u8, name[0 .. name.len - 5], self.device)) continue;
         const data = (try b.store.get(a, e.key)) orelse continue;
         const local_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ local_dir, name });
-        if (cwd.readFileAlloc(self.io, local_path, a, .limited(4 * 1024 * 1024)) catch null) |existing| {
+        if (cwd.readFileAlloc(self.io, local_path, a, .limited(max_shard_bytes)) catch null) |existing| {
             if (std.mem.eql(u8, existing, data)) continue;
         }
         try cwd.createDirPath(self.io, local_dir);
@@ -511,7 +531,7 @@ fn pushBackend(self: *Self, b: *Backend) !void {
     defer arena.deinit();
     const a = arena.allocator();
     const local_path = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ self.books_dir, self.book, self.device });
-    const data = std.Io.Dir.cwd().readFileAlloc(self.io, local_path, a, .limited(4 * 1024 * 1024)) catch return;
+    const data = std.Io.Dir.cwd().readFileAlloc(self.io, local_path, a, .limited(max_shard_bytes)) catch return;
     const key = try std.fmt.allocPrint(a, "books/{s}/{s}.json", .{ self.book, self.device });
     try b.store.put(key, data);
     try b.store.flush();
@@ -531,7 +551,7 @@ pub fn pushAll(allocator: std.mem.Allocator, io: std.Io, b: *Backend, books_dir:
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         const local_path = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ books_dir, entry.name, device });
-        const data = cwd.readFileAlloc(io, local_path, a, .limited(4 * 1024 * 1024)) catch continue;
+        const data = cwd.readFileAlloc(io, local_path, a, .limited(max_shard_bytes)) catch continue;
         const key = try std.fmt.allocPrint(a, "books/{s}/{s}.json", .{ entry.name, device });
         try b.store.put(key, data);
         count += 1;
@@ -545,9 +565,62 @@ pub fn purge(allocator: std.mem.Allocator, store: *Store, key: []const u8) !usiz
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    if (!fs.isPathComponent(key)) return error.InvalidBookKey;
     const prefix = try std.fmt.allocPrint(a, "books/{s}/", .{key});
     const entries = try store.list(a, prefix);
     for (entries) |e| try store.delete(e.key);
     try store.flush();
     return entries.len;
+}
+
+test "pullAll: fetches missing shards, refreshes changed ones on request, skips this device and bad keys" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const remote = try std.fmt.allocPrint(ta, "{s}/remote", .{root});
+    defer ta.free(remote);
+    const books = try std.fmt.allocPrint(ta, "{s}/local/books", .{root});
+    defer ta.free(books);
+
+    var store = Store{ .dir = StoreMod.DirStore.init(io, remote) };
+    try store.put("books/a/other.json", "v1");
+    try store.put("books/a/me.json", "remote-me");
+    try store.put("books/a/cover.png", "png1");
+    try store.put("books/a/book.pdf", "%PDF");
+    try store.put("books/open/other.json", "v1");
+
+    var stored: std.ArrayList([]u8) = .empty;
+    defer {
+        for (stored.items) |k| ta.free(k);
+        stored.deinit(ta);
+    }
+    try pullAll(ta, io, &store, books, "me", .{ .stored = &stored });
+    try testing.expectEqual(@as(usize, 1), stored.items.len);
+    try testing.expectEqualStrings("a", stored.items[0]);
+
+    const cwd = std.Io.Dir.cwd();
+    const shard = try std.fmt.allocPrint(ta, "{s}/a/other.json", .{books});
+    defer ta.free(shard);
+    const open_shard = try std.fmt.allocPrint(ta, "{s}/open/other.json", .{books});
+    defer ta.free(open_shard);
+    const mine = try std.fmt.allocPrint(ta, "{s}/a/me.json", .{books});
+    defer ta.free(mine);
+    const pdf = try std.fmt.allocPrint(ta, "{s}/a/book.pdf", .{books});
+    defer ta.free(pdf);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("v1", try cwd.readFile(io, shard, &buf));
+    try testing.expectError(error.FileNotFound, cwd.access(io, mine, .{}));
+    try testing.expectError(error.FileNotFound, cwd.access(io, pdf, .{}));
+
+    try store.put("books/a/other.json", "v2");
+    try store.put("books/open/other.json", "v2");
+    try pullAll(ta, io, &store, books, "me", .{});
+    try testing.expectEqualStrings("v1", try cwd.readFile(io, shard, &buf));
+    try pullAll(ta, io, &store, books, "me", .{ .refresh = true, .skip_book = "open" });
+    try testing.expectEqualStrings("v2", try cwd.readFile(io, shard, &buf));
+    try testing.expectEqualStrings("v1", try cwd.readFile(io, open_shard, &buf));
 }

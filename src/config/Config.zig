@@ -303,7 +303,6 @@ sync: []const SyncEntry = &.{},
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) Self {
     var self = Self{ .arena = std.heap.ArenaAllocator.init(allocator) };
-    const arena_allocator = self.arena.allocator();
 
     const home = env.get("HOME") orelse return self;
 
@@ -315,18 +314,22 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     const cwd = std.Io.Dir.cwd();
     const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
     defer allocator.free(cfg_path);
-    const content: ?[]u8 = cwd.readFileAlloc(io, cfg_path, allocator, .limited(1024 * 1024)) catch null;
-    if (content == null) {
-        fs.writeFileAtomic(io, cfg_path, template) catch {};
+    const content = cwd.readFileAlloc(io, cfg_path, allocator, .limited(1024 * 1024)) catch |err| {
+        if (err == error.FileNotFound) fs.writeFileAtomic(io, cfg_path, template) catch {};
         return self;
-    }
-    defer allocator.free(content.?);
+    };
+    defer allocator.free(content);
+    self.load(content);
+    return self;
+}
 
-    if (content.?.len == 0) return self;
+fn load(self: *Self, content: []const u8) void {
+    const arena_allocator = self.arena.allocator();
+    if (content.len == 0) return;
 
-    var root: std.json.Value = parseYaml(arena_allocator, content.?) catch return self;
-    if (root != .object) return self;
-    normalizeKeys(arena_allocator, &root.object) catch return self;
+    var root: std.json.Value = parseYaml(arena_allocator, content) catch return;
+    if (root != .object) return;
+    normalizeKeys(arena_allocator, &root.object) catch return;
 
     if (root.object.get("key_map")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
     if (root.object.get("file_monitor")) |file_monitor| self.file_monitor = FileMonitor.parse(file_monitor, arena_allocator);
@@ -340,7 +343,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     if (root.object.get("state_dir")) |sd| {
         if (sd == .string) self.state_dir = arena_allocator.dupe(u8, sd.string) catch "";
     }
-    return self;
 }
 
 pub fn deinit(self: *Self) void {
@@ -355,22 +357,26 @@ fn parseKeyBinding(obj: std.json.ObjectMap, name: []const u8, allocator: std.mem
     if (key_str.len == 0) return fallback;
 
     var binding = fallback;
-    binding.codepoint = vaxis.Key.name_map.get(key_str) orelse @as(u21, key_str[0]);
+    const key_name = if (key_str.len > 1) toSnake(allocator, key_str) catch key_str else key_str;
+    binding.codepoint = vaxis.Key.name_map.get(key_name) orelse cp: {
+        const view = std.unicode.Utf8View.init(key_str) catch return fallback;
+        var it = view.iterator();
+        const first = it.nextCodepoint() orelse return fallback;
+        if (it.nextCodepoint() != null) return fallback;
+        break :cp first;
+    };
 
     var mods = vaxis.Key.Modifiers{};
+    binding.mods = mods;
     const modifiers = val.object.get("modifiers") orelse return binding;
     if (modifiers != .array) return binding;
 
     for (modifiers.array.items) |mod| {
         if (mod != .string) continue;
-        if (std.mem.eql(u8, mod.string, "shift")) mods.shift = true;
-        if (std.mem.eql(u8, mod.string, "alt")) mods.alt = true;
-        if (std.mem.eql(u8, mod.string, "ctrl")) mods.ctrl = true;
-        if (std.mem.eql(u8, mod.string, "super")) mods.super = true;
-        if (std.mem.eql(u8, mod.string, "hyper")) mods.hyper = true;
-        if (std.mem.eql(u8, mod.string, "meta")) mods.meta = true;
-        if (std.mem.eql(u8, mod.string, "caps_lock")) mods.caps_lock = true;
-        if (std.mem.eql(u8, mod.string, "num_lock")) mods.num_lock = true;
+        const mod_name = toSnake(allocator, mod.string) catch mod.string;
+        inline for (comptime meta.fields(vaxis.Key.Modifiers)) |f| {
+            if (f.type == bool and std.mem.eql(u8, mod_name, f.name)) @field(mods, f.name) = true;
+        }
     }
 
     binding.mods = mods;
@@ -409,7 +415,8 @@ fn stripTrailingComments(arena: std.mem.Allocator, source: []const u8) ![]const 
     return out.items;
 }
 
-// zig-yaml gives scalars as text; the config code expects JSON-typed values.
+// zig-yaml gives scalars as text. Numbers stay strings: the typed parse reads
+// them, and a string field keeps a numeric-looking value (`bucket: 2024`).
 fn parseYaml(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
     const source = try stripTrailingComments(arena, raw);
     var y = yaml.Yaml{ .source = source };
@@ -427,10 +434,6 @@ fn yamlToJson(arena: std.mem.Allocator, v: yaml.Yaml.Value) !std.json.Value {
             if (std.mem.eql(u8, s, "null") or std.mem.eql(u8, s, "~")) return .null;
             if (std.mem.eql(u8, s, "true")) return .{ .bool = true };
             if (std.mem.eql(u8, s, "false")) return .{ .bool = false };
-            if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .integer = i } else |_| {}
-            if (s.len > 0 and (std.ascii.isDigit(s[0]) or s[0] == '-' or s[0] == '.')) {
-                if (std.fmt.parseFloat(f64, s)) |f| return .{ .float = f } else |_| {}
-            }
             return .{ .string = try arena.dupe(u8, s) };
         },
         .list => |items| {
@@ -633,4 +636,73 @@ fn parseStyledItem(val: ?std.json.Value, allocator: std.mem.Allocator, fallback:
         },
         else => return styled_item,
     }
+}
+
+fn loadForTest(content: []const u8) Self {
+    var self = Self{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    self.load(content);
+    return self;
+}
+
+test "keyMap: documented key names, digits, UTF-8 keys and modifiers" {
+    const testing = std.testing;
+    var cfg = loadForTest(
+        \\keyMap:
+        \\  next:
+        \\    key: pageDown
+        \\  prev:
+        \\    key: 1
+        \\  zoomIn:
+        \\    key: é
+        \\  zoomOut:
+        \\    key: x
+        \\    modifiers: [ctrl, capsLock]
+        \\  quit:
+        \\    key: escape
+        \\
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(vaxis.Key.page_down, cfg.key_map.next.codepoint);
+    try testing.expectEqual(@as(u21, '1'), cfg.key_map.prev.codepoint);
+    try testing.expectEqual(@as(u21, 0xe9), cfg.key_map.zoom_in.codepoint);
+    try testing.expectEqual(@as(u21, 'x'), cfg.key_map.zoom_out.codepoint);
+    try testing.expect(cfg.key_map.zoom_out.mods.ctrl and cfg.key_map.zoom_out.mods.caps_lock);
+    try testing.expectEqual(vaxis.Key.escape, cfg.key_map.quit.codepoint);
+    try testing.expect(!cfg.key_map.quit.mods.ctrl);
+    try testing.expectEqual(@as(u21, 'k'), cfg.key_map.scroll_up.codepoint);
+}
+
+test "general, cache and sync sections parse with typed values" {
+    const testing = std.testing;
+    var cfg = loadForTest(
+        \\stateDir: ~/state   # trailing comment
+        \\general:
+        \\  colorize: true
+        \\  zoomStep: 1.25
+        \\  white: "#102030"
+        \\  black:
+        \\    rgb: [16, 32, 48]
+        \\  history: 50
+        \\cache:
+        \\  lruSize: 6
+        \\sync:
+        \\  - type: s3
+        \\    bucket: 2024
+        \\    enabled: false
+        \\  - type: dir
+        \\    path: ~/Sync/termre
+        \\
+    );
+    defer cfg.deinit();
+    try testing.expectEqualStrings("~/state", cfg.state_dir);
+    try testing.expect(cfg.general.colorize);
+    try testing.expectEqual(@as(f32, 1.25), cfg.general.zoom_step);
+    try testing.expectEqual(@as(i32, 0x102030), cfg.general.white);
+    try testing.expectEqual(@as(i32, 0x102030), cfg.general.black);
+    try testing.expectEqual(@as(u32, 50), cfg.general.history);
+    try testing.expectEqual(@as(u16, 6), cfg.cache.lru_size);
+    try testing.expectEqual(@as(usize, 2), cfg.sync.len);
+    try testing.expectEqualStrings("2024", cfg.sync[0].bucket);
+    try testing.expect(!cfg.sync[0].enabled);
+    try testing.expectEqualStrings("~/Sync/termre", cfg.sync[1].path);
 }

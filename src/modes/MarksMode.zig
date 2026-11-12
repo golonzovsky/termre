@@ -3,7 +3,6 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Context = @import("../Context.zig").Context;
 const Config = @import("../config/Config.zig");
-const PdfHandler = @import("../handlers/PdfHandler.zig");
 const ListView = @import("ListView.zig");
 const theme = ListView.theme;
 
@@ -12,28 +11,16 @@ pub const hides_page = true;
 context: *Context,
 list: ListView,
 geo: ListView.Geometry = .{},
-outline: []const PdfHandler.OutlineEntry,
 
 pub fn init(context: *Context) Self {
-    const outline: []const PdfHandler.OutlineEntry =
-        context.document_handler.loadOutline(context.allocator) catch &.{};
-    return .{
-        .context = context,
-        .list = .{},
-        .outline = outline,
-    };
+    return .{ .context = context, .list = .{} };
 }
 
-pub fn deinit(self: *Self) void {
-    if (self.outline.len > 0) {
-        for (self.outline) |e| self.context.allocator.free(e.title);
-        self.context.allocator.free(self.outline);
-    }
-}
+pub fn deinit(_: *Self) void {}
 
 fn sectionFor(self: *const Self, page: u16) []const u8 {
     var title: []const u8 = "";
-    for (self.outline) |e| {
+    for (self.context.outline) |e| {
         if (e.page > page) break;
         title = e.title;
     }

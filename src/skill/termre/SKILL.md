@@ -5,7 +5,7 @@ description: Read and discuss the PDF book the user is reading in termre (`re`) 
 
 # termre — reading alongside the user
 
-The user reads PDFs in termre (`re`), a terminal reader. Its MCP server (`termre`) exposes the book and the user's reading state. Everything is read-only.
+The user reads PDFs in termre (`re`), a terminal reader. Its MCP server (`termre`) exposes the book and the user's reading state. Everything is read-only except `goto_page` and `select_text`, which move the user's reader.
 
 ## Re-check the live state on every turn — without losing the thread
 

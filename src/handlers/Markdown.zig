@@ -382,6 +382,16 @@ fn asSuperscript(cp: u32) ?u32 {
 
 fn writeRune(w: *std.Io.Writer, rune: u32) !void {
     var buf: [4]u8 = undefined;
-    const len = try std.unicode.utf8Encode(@intCast(rune), &buf);
+    const len = std.unicode.utf8Encode(std.math.cast(u21, rune) orelse 0xFFFD, &buf) catch
+        std.unicode.utf8Encode(0xFFFD, &buf) catch unreachable;
     try w.writeAll(buf[0..len]);
+}
+
+test "writeRune: an invalid codepoint becomes U+FFFD instead of failing the export" {
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRune(&w, 'a');
+    try writeRune(&w, 0xD800);
+    try writeRune(&w, 0x7FFFFFFF);
+    try std.testing.expectEqualStrings("a\u{FFFD}\u{FFFD}", w.buffered());
 }

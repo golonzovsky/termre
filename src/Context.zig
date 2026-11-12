@@ -532,7 +532,8 @@ pub const Context = struct {
             self.setProgress(std.fmt.bufPrint(&self.progress_buf, " delete failed: {s} ", .{@errorName(e)}) catch null);
             return;
         };
-        if (std.mem.startsWith(u8, path, self.paths.downloads)) std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        const dl = self.paths.downloads;
+        if (path.len > dl.len and path[dl.len] == '/' and std.mem.startsWith(u8, path, dl)) std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
         self.setProgress(" forgotten on this device ");
     }
 
@@ -1161,10 +1162,8 @@ pub const Context = struct {
     // `next_page` is where the walk stopped. Prefetches a render-ahead window of
     // up to ±3 pages (forward-biased, since reading is mostly forward) so fast
     // flipping stays cache-warm. Uncached targets only.
-    fn requestPrerender(self: *Self, top_page: u16, next_page: u16, w: u32, h: u32) void {
-        // Neighbors render at the current zoom, not refitted to the viewport.
-        _ = w;
-        _ = h;
+    // Neighbors render at the current zoom, not refitted to the viewport.
+    fn requestPrerender(self: *Self, top_page: u16, next_page: u16) void {
         if (!self.config.cache.enabled) return;
         const zoom = self.document_handler.getActiveZoom();
         if (zoom <= 0) return;
@@ -1358,7 +1357,7 @@ pub const Context = struct {
             }
         }
 
-        self.requestPrerender(page_num, draw_page, render_w_pix, viewport_h_pix);
+        self.requestPrerender(page_num, draw_page);
     }
 
     // Maps a mouse cell position to the page and raw PDF coordinates under it.
