@@ -300,6 +300,8 @@ general: General = .{},
 status_bar: StatusBar = .{},
 cache: Cache = .{},
 sync: []const SyncEntry = &.{},
+// Why the file, or a part of it, was ignored; empty when it loaded clean.
+problem: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) Self {
     var self = Self{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -315,7 +317,11 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.yaml", .{dir}) catch return self;
     defer allocator.free(cfg_path);
     const content = cwd.readFileAlloc(io, cfg_path, allocator, .limited(1024 * 1024)) catch |err| {
-        if (err == error.FileNotFound) fs.writeFileAtomic(io, cfg_path, template) catch {};
+        if (err == error.FileNotFound) {
+            fs.writeFileAtomic(io, cfg_path, template) catch {};
+        } else {
+            self.problem = std.fmt.allocPrint(self.arena.allocator(), "config.yaml unreadable ({s}): using defaults", .{@errorName(err)}) catch "";
+        }
         return self;
     };
     defer allocator.free(content);
@@ -327,8 +333,24 @@ fn load(self: *Self, content: []const u8) void {
     const arena_allocator = self.arena.allocator();
     if (content.len == 0) return;
 
-    var root: std.json.Value = parseYaml(arena_allocator, content) catch return;
-    if (root != .object) return;
+    if (unclosedQuoteLine(content)) |line| {
+        self.problem = std.fmt.allocPrint(arena_allocator, "config.yaml line {d}: quote is never closed: using defaults", .{line}) catch "config.yaml: a quote is never closed: using defaults";
+        return;
+    }
+    var root: std.json.Value = parseYaml(arena_allocator, content, &self.problem) catch |err| {
+        if (self.problem.len == 0) self.problem = std.fmt.allocPrint(arena_allocator, "config.yaml: {s}: using defaults", .{@errorName(err)}) catch "config.yaml is not valid YAML: using defaults";
+        return;
+    };
+    if (root == .null) return;
+    if (root != .object) {
+        self.problem = "config.yaml: the top level must be a map: using defaults";
+        return;
+    }
+    for (root.object.keys()) |key| {
+        if (isSection(toSnake(arena_allocator, key) catch continue)) continue;
+        self.problem = std.fmt.allocPrint(arena_allocator, "config.yaml: `{s}` is not a top-level key (indentation?): ignored", .{key}) catch "";
+        break;
+    }
     normalizeKeys(arena_allocator, &root.object) catch return;
 
     if (root.object.get("key_map")) |key_map| self.key_map = KeyMap.parse(key_map, arena_allocator);
@@ -343,6 +365,13 @@ fn load(self: *Self, content: []const u8) void {
     if (root.object.get("state_dir")) |sd| {
         if (sd == .string) self.state_dir = arena_allocator.dupe(u8, sd.string) catch "";
     }
+}
+
+fn isSection(key: []const u8) bool {
+    inline for (.{ "key_map", "file_monitor", "general", "status_bar", "cache", "sync", "download_dir", "state_dir" }) |name| {
+        if (std.mem.eql(u8, key, name)) return true;
+    }
+    return false;
 }
 
 pub fn deinit(self: *Self) void {
@@ -397,31 +426,58 @@ fn stripTrailingComments(arena: std.mem.Allocator, source: []const u8) ![]const 
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
-        var quote: u8 = 0;
-        var cut: usize = line.len;
-        for (line, 0..) |ch, i| {
-            if (quote != 0) {
-                if (ch == quote) quote = 0;
-            } else if (ch == '"' or ch == '\'') {
-                quote = ch;
-            } else if (ch == '#' and i > 0 and (line[i - 1] == ' ' or line[i - 1] == '\t')) {
-                cut = i;
-                break;
-            }
-        }
-        try out.appendSlice(arena, std.mem.trimEnd(u8, line[0..cut], " \t"));
+        try out.appendSlice(arena, std.mem.trimEnd(u8, line[0..scanLine(line).cut], " \t"));
         try out.append(arena, '\n');
     }
     return out.items;
 }
 
+// zig-yaml drops everything after a quote that never closes, without an error.
+fn unclosedQuoteLine(source: []const u8) ?usize {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var line_no: usize = 1;
+    while (lines.next()) |line| : (line_no += 1) {
+        if (scanLine(line).open_quote) return line_no;
+    }
+    return null;
+}
+
+// A quote opens a scalar only where a value can start; `don't` is plain text.
+fn scanLine(line: []const u8) struct { cut: usize, open_quote: bool } {
+    var quote: u8 = 0;
+    var before: u8 = ':';
+    for (line, 0..) |ch, i| {
+        if (quote != 0) {
+            if (ch == quote) quote = 0;
+        } else if ((ch == '"' or ch == '\'') and std.mem.indexOfScalar(u8, ":-[{,", before) != null) {
+            quote = ch;
+        } else if (ch == '#' and (i == 0 or line[i - 1] == ' ' or line[i - 1] == '\t')) {
+            return .{ .cut = i, .open_quote = false };
+        }
+        if (ch != ' ' and ch != '\t') before = ch;
+    }
+    return .{ .cut = line.len, .open_quote = quote != 0 };
+}
+
 // zig-yaml gives scalars as text. Numbers stay strings: the typed parse reads
 // them, and a string field keeps a numeric-looking value (`bucket: 2024`).
-fn parseYaml(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
+fn parseYaml(arena: std.mem.Allocator, raw: []const u8, problem: *[]const u8) !std.json.Value {
     const source = try stripTrailingComments(arena, raw);
     var y = yaml.Yaml{ .source = source };
     defer y.deinit(arena);
-    try y.load(arena);
+    y.load(arena) catch |err| {
+        const eb = y.parse_errors;
+        if (err == error.ParseFailure and eb.errorMessageCount() > 0) {
+            const msg = eb.getErrorMessage(eb.getMessages()[0]);
+            const full = eb.nullTerminatedString(msg.msg);
+            const text = full[0 .. std.mem.indexOf(u8, full, ": .{") orelse full.len];
+            problem.* = if (msg.src_loc == .none)
+                try std.fmt.allocPrint(arena, "config.yaml: {s}: using defaults", .{text})
+            else
+                try std.fmt.allocPrint(arena, "config.yaml line {d}: {s}: using defaults", .{ eb.getSourceLocation(msg.src_loc).line + 1, text });
+        }
+        return err;
+    };
     if (y.docs.items.len == 0) return .null;
     return yamlToJson(arena, y.docs.items[0]);
 }
@@ -705,4 +761,54 @@ test "general, cache and sync sections parse with typed values" {
     try testing.expectEqualStrings("2024", cfg.sync[0].bucket);
     try testing.expect(!cfg.sync[0].enabled);
     try testing.expectEqualStrings("~/Sync/termre", cfg.sync[1].path);
+}
+
+test "a config that cannot be used says why" {
+    const testing = std.testing;
+    var clean = loadForTest("# only comments\n");
+    defer clean.deinit();
+    try testing.expectEqualStrings("", clean.problem);
+
+    var template_cfg = loadForTest(template);
+    defer template_cfg.deinit();
+    try testing.expectEqualStrings("", template_cfg.problem);
+
+    var broken = loadForTest(
+        \\general:
+        \\  colorize: true
+        \\ zoomStep: 1.25
+        \\
+    );
+    defer broken.deinit();
+    try testing.expectEqualStrings("config.yaml: `zoomStep` is not a top-level key (indentation?): ignored", broken.problem);
+    try testing.expect(broken.general.colorize);
+
+    var no_colon = loadForTest("general:\n  colorize: true\n  zoomStep 1.25\n");
+    defer no_colon.deinit();
+    try testing.expectEqualStrings("config.yaml line 3: expected map separator ':': using defaults", no_colon.problem);
+    try testing.expect(!no_colon.general.colorize);
+
+    var open_quote = loadForTest("general:\n  white: \"#102030\ncache:\n  lruSize: 6\n");
+    defer open_quote.deinit();
+    try testing.expectEqualStrings("config.yaml line 2: quote is never closed: using defaults", open_quote.problem);
+
+    var apostrophe = loadForTest("general:\n  colorize: true # don't\ncache:\n  lruSize: 6 # it's\n");
+    defer apostrophe.deinit();
+    try testing.expectEqualStrings("", apostrophe.problem);
+    try testing.expectEqual(@as(u16, 6), apostrophe.cache.lru_size);
+
+    // This used to index past the token list in the parser.
+    var empty_value = loadForTest("general:\n  colorize: true\n  history:\n");
+    defer empty_value.deinit();
+    try testing.expectEqualStrings("", empty_value.problem);
+    try testing.expect(empty_value.general.colorize);
+
+    var scalar = loadForTest("colorize\n");
+    defer scalar.deinit();
+    try testing.expect(std.mem.indexOf(u8, scalar.problem, "top level") != null);
+
+    var typo = loadForTest("genral:\n  colorize: true\ncache:\n  lruSize: 6\n");
+    defer typo.deinit();
+    try testing.expectEqualStrings("config.yaml: `genral` is not a top-level key (indentation?): ignored", typo.problem);
+    try testing.expectEqual(@as(u16, 6), typo.cache.lru_size);
 }

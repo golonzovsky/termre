@@ -8,6 +8,7 @@ const types = @import("./types.zig");
 const Markdown = @import("./Markdown.zig");
 const Exporter = @import("./Exporter.zig");
 const time = @import("../utilities/time.zig");
+const fs = @import("../utilities/fs.zig");
 
 const c = @import("c");
 
@@ -148,16 +149,15 @@ fn reloadAttempt(self: *Self) !void {
     self.lock();
     defer self.unlock();
 
-    if (self.doc) |doc| {
-        c.fz_drop_document(self.ctx, doc);
-        self.doc = null;
-    }
-
+    // The old document stays until the new one opens, so a failed reload leaves the reader usable.
     const doc = c.fz_open_document_z(self.ctx, self.path.ptr) orelse return types.DocumentError.PageLoadFailed;
+    const page_count = c.fz_count_pages_z(self.ctx, doc);
+    if (page_count <= 0) {
+        c.fz_drop_document(self.ctx, doc);
+        return types.DocumentError.PageLoadFailed;
+    }
+    if (self.doc) |old| c.fz_drop_document(self.ctx, old);
     self.doc = doc;
-
-    const page_count = c.fz_count_pages_z(self.ctx, self.doc);
-    if (page_count <= 0) return types.DocumentError.PageLoadFailed;
 
     self.total_pages = @intCast(@min(page_count, std.math.maxInt(u16)));
     self.stable_box = null;
@@ -176,10 +176,7 @@ pub fn retry(self: *Self, comptime attempt: anytype, args: anytype, comptime tim
     const start_time = time.milliTimestamp();
 
     while (true) {
-        if (time.milliTimestamp() - start_time > timeout) {
-            std.debug.print("Gave up after {d}s: {t}\n", .{ self.config.general.timeout, timeout_err });
-            return timeout_err;
-        }
+        if (time.milliTimestamp() - start_time > timeout) return timeout_err;
         if (@call(.auto, attempt, args)) |result| {
             return result;
         } else |err| {
@@ -551,24 +548,31 @@ pub fn loadLinks(self: *Self, allocator: std.mem.Allocator, page_number: u16) ![
 pub fn getDocumentKey(self: *Self, allocator: std.mem.Allocator) ![]u8 {
     self.lock();
     defer self.unlock();
+    return documentKey(allocator, self.io, self.ctx, self.doc, self.path);
+}
 
+// The key of the PDF at `path`, for callers that only need to know which book it is.
+pub fn keyOfFile(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8) ![]u8 {
+    const ctx = c.fz_new_context(null, null, c.FZ_STORE_DEFAULT) orelse return types.DocumentError.FailedToCreateContext;
+    defer c.fz_drop_context(ctx);
+    c.fz_register_document_handlers(ctx);
+    c.fz_set_error_callback(ctx, null, null);
+    c.fz_set_warning_callback(ctx, null, null);
+    const doc = c.fz_open_document_z(ctx, path.ptr) orelse return types.DocumentError.FailedToOpenDocument;
+    defer c.fz_drop_document(ctx, doc);
+    return documentKey(allocator, io, ctx, doc, path);
+}
+
+fn documentKey(allocator: std.mem.Allocator, io: std.Io, ctx: [*c]c.fz_context, doc: [*c]c.fz_document, path: []const u8) ![]u8 {
     var id_buf: [256]u8 = undefined;
-    const id_len = c.fz_pdf_id_hex_z(self.ctx, self.doc, &id_buf, id_buf.len);
+    const id_len = c.fz_pdf_id_hex_z(ctx, doc, &id_buf, id_buf.len);
     if (id_len > 0) {
         return std.fmt.allocPrint(allocator, "pdf-id:{s}", .{id_buf[0..@as(usize, @intCast(id_len))]});
     }
-
-    if (std.Io.Dir.cwd().readFileAlloc(self.io, self.path, allocator, .limited(1024 * 1024))) |buf| {
-        defer allocator.free(buf);
-        if (buf.len > 0) {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(buf[0..@min(buf.len, 1024 * 1024)], &digest, .{});
-            const hex = std.fmt.bytesToHex(digest, .lower);
-            return std.fmt.allocPrint(allocator, "sha256-1mb:{s}", .{hex});
-        }
-    } else |_| {}
-
-    return std.fmt.allocPrint(allocator, "path:{s}", .{self.path});
+    if (fs.headDigest(allocator, io, path, 1024 * 1024)) |hex| {
+        return std.fmt.allocPrint(allocator, "sha256-1mb:{s}", .{hex});
+    }
+    return std.fmt.allocPrint(allocator, "path:{s}", .{path});
 }
 
 pub fn findLinkAtPoint(

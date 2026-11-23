@@ -3,7 +3,10 @@
 Press `:` to enter command mode. `Tab` completes command names (longest common
 prefix; a unique match that takes arguments gets a trailing space). (The in-app
 help — `?` or `:help` — always shows the current list; it is generated from the
-same table that dispatches these commands.)
+same table that dispatches these commands.) A command that does not run says
+why in the status bar: an unknown word (`:foo`, also `:exportfoo`) names itself
+and points at `:help`, a bad argument shows the command's usage, and a page
+past the end shows the page count.
 
 - `:<number>` — go to page number
 - `:<number>%` — set zoom level

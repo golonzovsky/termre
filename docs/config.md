@@ -16,7 +16,7 @@ $HOME/.config/termre/config.yaml
 
 If no configuration file is found in any of these locations, termre writes a commented template listing every section there (everything in it is commented out, so the defaults apply).
 
-The file is YAML; keys are lowerCamelCase.
+The file is YAML; keys are lowerCamelCase. A file that cannot be used is not silent: the reader shows the reason in the status bar at startup (`config.yaml line 3: expected map separator ':': using defaults`), and `re state …` and `re mcp` print it to stderr. That covers a file that does not parse, an unclosed quote, and a key at the top level that is not a section, which is usually a lost indent. An unknown key inside a section is still ignored.
 
 | Key | Type | Description |
 | --- | --- | --- |
@@ -298,7 +298,7 @@ The `modifiers` property can be set to an array that includes any combination of
 
 ## File Monitor
 
-The `fileMonitor` section controls the automatic reloading feature, useful for live previews.
+The `fileMonitor` section controls the automatic reloading feature, useful for live previews. When the changed file cannot be opened (half-written, or not a PDF for a moment), the reader keeps showing the last readable version and says so in the status bar; the next change is picked up as usual.
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
@@ -496,6 +496,8 @@ The `cache` section controls the page rendering cache, which speeds up navigatio
 
 Reading state (position, zoom, crop, marks, highlights) lives in one small JSON record per book **and per device** under `~/.local/state/termre/books/<book>/<device>.json`. `sync` is a list of backends; any number can be active at once, each with its own mode. Records merge without conflicts: the newest view wins, marks and highlights are a union (deletions carry tombstones). The device name is minted once into `~/.local/state/termre/device`.
 
+`<book>` is the document's identity, not its file name, so a renamed or moved PDF keeps its state: the PDF's own `/ID` when it has one (`pdf-id_…`), otherwise the SHA-256 of its first MiB (`sha256-1mb_…`). Earlier versions keyed a PDF of 1 MiB or more without an `/ID` by its path (`path_…`); the first open of such a book moves its records and cover under the new name, here and, on the next pull, in every sync backend.
+
 ```yaml
 sync:
   - type: s3
@@ -524,7 +526,7 @@ sync:
 | `dir` | String | `git`: a folder inside a repository, e.g. `~/dotfiles/termre` — only that folder is ever staged and committed (`git add -A -- .`, `git commit -- .`), pulls are `--rebase --autostash`, pushes go to the repo's remote. A missing folder is created when its parent is already a work tree |
 | `remote` | String | `git`: used only when `dir` does not exist and is not inside a repo — the repo is cloned *as* `dir` (records at its root). For a folder inside a shared repo, clone the repo yourself. All devices must use the same layout |
 
-`:sync` forces a pull and push through every backend; `re state sync` does the same outside the reader for all books (records only, never PDFs). A PDF goes up only on request, `u` in the library or `:upload`, as `books/<book>/book.pdf` plus its `cover.png`, to every `s3` and `dir` backend (never git); the library (`b`) then opens that book on another device by downloading it into `downloadDir`. The `re` picker and the library (`b`) pull the index (records and covers) from automatic backends so books read elsewhere show up. A git entry gets one "termre: reading state" commit per sync, not per page.
+`:sync` forces a pull and push through every backend; `re state sync` does the same outside the reader for all books (records only, never PDFs). A PDF goes up only on request, `u` in the library or `:upload`, as `books/<book>/book.pdf` plus its `cover.png`, to every `s3` and `dir` backend (never git); the library (`b`) then opens that book on another device by downloading it into `downloadDir` under its file name, or as `<name>-<end of the book key>.pdf` when a different book already has that name there. The `re` picker and the library (`b`) pull the index (records and covers) from automatic backends so books read elsewhere show up. A git entry gets one "termre: reading state" commit per sync, not per page.
 
 `re state purge <book>` removes one book everywhere: its records, PDF and cover from every backend, and its records from this machine (the `<book>` key is the folder name under `~/.local/state/termre/books/`).
 

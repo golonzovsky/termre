@@ -287,6 +287,8 @@ fn map(self: *Parser, gpa: Allocator) ParseError!Node.OptionalIndex {
 
         // Parse value
         const value_index = try self.value(gpa);
+        // An empty value on the last line took the eof token; the checks below index by position.
+        if (value_index == .none and @intFromEnum(self.token_it.pos) >= self.tokens.len) self.token_it.seekBy(-1);
 
         if (value_index.unwrap()) |v| {
             const value_start = self.nodes.items(.scope)[@intFromEnum(v)].start;

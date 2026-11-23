@@ -156,6 +156,7 @@ pub fn run(init: std.process.Init) !void {
     const gpa = init.gpa;
     var config = Config.init(gpa, init.io, init.environ_map);
     defer config.deinit();
+    if (config.problem.len > 0) std.debug.print("re mcp: {s}\n", .{config.problem});
     config.general.colorize = false; // agents want plain text and light diagrams
 
     const tmp_dir = try std.fmt.allocPrint(gpa, "{s}/termre-mcp-{d}", .{

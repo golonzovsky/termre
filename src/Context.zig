@@ -188,6 +188,7 @@ pub const Context = struct {
 
         const paths = try Paths.init(allocator, env, config);
         errdefer paths.deinit(allocator);
+        if (std.mem.startsWith(u8, doc_key, "sha256-1mb:")) Positions.adoptPathKeyed(allocator, io, paths, doc_key, doc_abs_path);
         var positions = Positions.init(allocator, io, paths, doc_key);
         errdefer positions.deinit();
         ensureCover(allocator, io, &positions, &document_handler);
@@ -738,6 +739,10 @@ pub const Context = struct {
     pub fn run(self: *Self) !void {
         self.current_mode = .{ .view = ViewMode.init(self) };
         self.loadLibraryCardWidth();
+        if (self.config.problem.len > 0) {
+            const shown = self.config.problem[0..@min(self.config.problem.len, self.progress_buf.len - 2)];
+            self.setStickyProgress(std.fmt.bufPrint(&self.progress_buf, " {s} ", .{shown}) catch null);
+        }
         if (self.start_mode) |m| {
             self.changeMode(m);
             self.applyModeChange();
@@ -979,7 +984,10 @@ pub const Context = struct {
                 self.handleControl(cmd);
             },
             .file_changed => {
-                try self.document_handler.reloadDocument();
+                self.document_handler.reloadDocument() catch {
+                    self.setStickyProgress(" reload failed: showing the last readable version ");
+                    return;
+                };
                 self.freeOutline();
                 self.outline = self.document_handler.loadOutline(self.allocator) catch &.{};
                 self.clearCache();

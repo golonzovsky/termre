@@ -487,7 +487,8 @@ pub fn listRecent(allocator: std.mem.Allocator, io: std.Io, paths: Paths) []Rece
     std.sort.pdq(RecentEntry, out.items, {}, struct {
         fn order(_: void, x: RecentEntry, y: RecentEntry) bool {
             if (x.done != y.done) return !x.done;
-            return x.last_opened > y.last_opened;
+            if (x.last_opened != y.last_opened) return x.last_opened > y.last_opened;
+            return std.mem.order(u8, x.key, y.key) == .lt;
         }
     }.order);
     return out.toOwnedSlice(allocator) catch &.{};
@@ -543,6 +544,72 @@ pub fn deleteBook(allocator: std.mem.Allocator, io: std.Io, paths: Paths, key: [
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.books, key });
     defer allocator.free(dir);
     try std.Io.Dir.cwd().deleteTree(io, dir);
+}
+
+// Old directory names, one per line, that the sync stores still hold for this book.
+pub const moved_from_file = "moved-from";
+
+// Moves state kept under the old path-derived key (PDFs of 1 MiB+ without an /ID) to `doc_key`.
+pub fn adoptPathKeyed(allocator: std.mem.Allocator, io: std.Io, paths: Paths, doc_key: []const u8, abs_path: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    adopt(arena.allocator(), io, paths, doc_key, abs_path) catch {};
+}
+
+fn adopt(a: std.mem.Allocator, io: std.Io, paths: Paths, doc_key: []const u8, abs_path: []const u8) !void {
+    if (paths.books.len == 0 or abs_path.len == 0) return;
+    var root = std.Io.Dir.cwd().openDir(io, paths.books, .{ .iterate = true }) catch return;
+    defer root.close(io);
+    var olds: std.ArrayList([]const u8) = .empty;
+    var it = root.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "path_")) continue;
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ paths.books, entry.name });
+        for (try readAllShards(a, io, dir)) |s| {
+            if (!std.mem.eql(u8, s.path, abs_path)) continue;
+            try olds.append(a, try a.dupe(u8, entry.name));
+            break;
+        }
+    }
+    if (olds.items.len == 0) return;
+
+    const name = try safeKey(a, doc_key);
+    const marker = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ paths.books, name, moved_from_file });
+    var note: std.ArrayList(u8) = .empty;
+    if (std.Io.Dir.cwd().readFileAlloc(io, marker, a, .limited(64 * 1024)) catch null) |prev| try note.appendSlice(a, prev);
+    for (olds.items) |old| {
+        try moveBookDir(a, io, root, paths.books, old, name);
+        try note.appendSlice(a, old);
+        try note.append(a, '\n');
+    }
+    try fs.writeFileAtomic(io, marker, note.items);
+}
+
+// Into an existing directory the newer record of a device wins and other files stay.
+fn moveBookDir(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, books: []const u8, old: []const u8, new: []const u8) !void {
+    root.access(io, new, .{}) catch return root.rename(old, root, new, io);
+    var names: std.ArrayList([]const u8) = .empty;
+    {
+        var src = try root.openDir(io, old, .{ .iterate = true });
+        defer src.close(io);
+        var it = src.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind == .file) try names.append(a, try a.dupe(u8, e.name));
+        }
+    }
+    for (names.items) |file| {
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ old, file });
+        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ new, file });
+        if (root.access(io, to, .{})) |_| {
+            if (!std.mem.endsWith(u8, file, ".json")) continue;
+            const theirs = readShard(a, io, try std.fmt.allocPrint(a, "{s}/{s}", .{ books, from })) orelse continue;
+            if (readShard(a, io, try std.fmt.allocPrint(a, "{s}/{s}", .{ books, to }))) |ours| {
+                if (ours.updated_at >= theirs.updated_at) continue;
+            }
+        } else |_| {}
+        try root.rename(from, root, to, io);
+    }
+    try root.deleteTree(io, old);
 }
 
 // The page count found by rendering a book's cover: into this device's record
@@ -846,7 +913,7 @@ fn bookDir(self: *Self, a: std.mem.Allocator, key: []const u8) ![]u8 {
 
 // Directory/object name for a document key: `pdf-id:<hex>` -> `pdf-id_<hex>`;
 // keys that are paths get hashed.
-fn safeKey(a: std.mem.Allocator, key: []const u8) ![]u8 {
+pub fn safeKey(a: std.mem.Allocator, key: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, key, '/') != null) {
         return std.fmt.allocPrint(a, "path_{x}", .{std.hash.Wyhash.hash(0, key)});
     }
@@ -1169,4 +1236,53 @@ test "importBundle keeps the page count and the library flags" {
     const recents = listRecent(ta, io, paths);
     defer freeRecent(ta, recents);
     try testing.expect(recents[0].done);
+}
+
+test "adoptPathKeyed: path-keyed state moves under the content key, the newer record wins" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    const paths = try testPaths(ta, root);
+    defer paths.deinit(ta);
+    var arena = std.heap.ArenaAllocator.init(ta);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const book = "/books/Big.pdf";
+    for ([_][]const u8{ "path:Big.pdf", "path:/books/Big.pdf", "path:/books/Other.pdf" }, [_]u16{ 3, 8, 5 }) |key, page| {
+        var p = init(ta, io, paths, key);
+        defer p.deinit();
+        const path = if (std.mem.endsWith(u8, key, "Other.pdf")) "/books/Other.pdf" else book;
+        _ = try p.save(.{ .page = page, .touched = true, .path = path, .pages = 10 }, &.{}, &.{}, &.{});
+    }
+    const device = deviceId(a, io, paths.state);
+    const hashed = try safeKey(a, "path:/books/Big.pdf");
+    const newer = try std.fmt.allocPrint(a, "{s}/{s}/{s}.json", .{ paths.books, hashed, device });
+    var shard = readShard(a, io, newer).?;
+    shard.updated_at += 100;
+    try fs.writeFileAtomic(io, newer, try std.json.Stringify.valueAlloc(a, shard, .{}));
+    try fs.writeFileAtomic(io, try std.fmt.allocPrint(a, "{s}/path_Big.pdf/cover.png", .{paths.books}), "png");
+
+    adoptPathKeyed(ta, io, paths, "sha256-1mb:ff", book);
+    adoptPathKeyed(ta, io, paths, "sha256-1mb:ff", book);
+
+    const recents = listRecent(ta, io, paths);
+    defer freeRecent(ta, recents);
+    try testing.expectEqual(@as(usize, 2), recents.len);
+    var p = init(ta, io, paths, "sha256-1mb:ff");
+    defer p.deinit();
+    try testing.expectEqual(@as(u16, 8), p.getSavedPosition().?.page);
+    const cover = try std.Io.Dir.cwd().readFileAlloc(io, try coverFile(a, paths, "sha256-1mb_ff"), a, .limited(16));
+    try testing.expectEqualStrings("png", cover);
+    const note = try std.Io.Dir.cwd().readFileAlloc(io, try p.bookFile(a, moved_from_file), a, .limited(1024));
+    var lines = std.mem.tokenizeScalar(u8, note, '\n');
+    var seen: usize = 0;
+    while (lines.next()) |line| {
+        seen += 1;
+        try testing.expect(std.mem.eql(u8, line, "path_Big.pdf") or std.mem.eql(u8, line, hashed));
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
 }

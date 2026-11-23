@@ -10,6 +10,7 @@ const StoreMod = @import("Store.zig");
 const Config = @import("../config/Config.zig");
 const time = @import("../utilities/time.zig");
 const parseDuration = @import("../utilities/duration.zig").parse;
+const moved_from_file = @import("Positions.zig").moved_from_file;
 
 // Objects kept beside the shards under books/<book>/.
 pub const book_object = "book.pdf";
@@ -398,7 +399,39 @@ fn reportBackendError(self: *Self, b: *Backend, e: anyerror) void {
     self.report(.{ .err = msg });
 }
 
+// The stores still hold this book under the names Positions.adoptPathKeyed moved it from.
+fn rekeyMoved(self: *Self, include_manual: bool) void {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const marker = std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.books_dir, self.book, moved_from_file }) catch return;
+    const note = cwd.readFileAlloc(self.io, marker, a, .limited(64 * 1024)) catch return;
+    var done = true;
+    for (self.backends) |*b| {
+        if (b.manual() and !include_manual) {
+            done = false;
+            continue;
+        }
+        var olds = std.mem.tokenizeScalar(u8, note, '\n');
+        while (olds.next()) |old| {
+            if (!fs.isPathComponent(old)) continue;
+            const had_pdf = rekey(self.allocator, &b.store, old, self.book) catch |e| {
+                done = false;
+                self.reportBackendError(b, e);
+                break;
+            };
+            if (had_pdf) {
+                self.unmarkStored(old);
+                self.markStored(self.book);
+            }
+        }
+    }
+    if (done) cwd.deleteFile(self.io, marker) catch {};
+}
+
 fn pullBackends(self: *Self, include_manual: bool) void {
+    self.rekeyMoved(include_manual);
     var changed = false;
     for (self.backends) |*b| {
         if (b.manual() and !include_manual) continue;
@@ -571,6 +604,74 @@ pub fn purge(allocator: std.mem.Allocator, store: *Store, key: []const u8) !usiz
     for (entries) |e| try store.delete(e.key);
     try store.flush();
     return entries.len;
+}
+
+// Moves books/<old>/ to books/<new>/, keeping the later of a record held under both; true when the PDF moved.
+pub fn rekey(allocator: std.mem.Allocator, store: *Store, old: []const u8, new: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!fs.isPathComponent(old) or !fs.isPathComponent(new)) return error.InvalidBookKey;
+    const prefix = try std.fmt.allocPrint(a, "books/{s}/", .{old});
+    const entries = try store.list(a, prefix);
+    var had_pdf = false;
+    for (entries) |e| {
+        if (!std.mem.startsWith(u8, e.key, prefix)) continue;
+        const name = e.key[prefix.len..];
+        if (!fs.isPathComponent(name)) continue;
+        const data = (try store.get(a, e.key)) orelse continue;
+        const dest = try std.fmt.allocPrint(a, "books/{s}/{s}", .{ new, name });
+        const keep = if (try store.get(a, dest)) |there|
+            std.mem.endsWith(u8, name, ".json") and updatedAt(a, data) > updatedAt(a, there)
+        else
+            true;
+        if (keep) try store.put(dest, data);
+        try store.delete(e.key);
+        if (std.mem.eql(u8, name, book_object)) had_pdf = true;
+    }
+    try store.flush();
+    return had_pdf;
+}
+
+fn updatedAt(a: std.mem.Allocator, shard: []const u8) i64 {
+    const Stamp = struct { updated_at: i64 = 0 };
+    const parsed = std.json.parseFromSliceLeaky(Stamp, a, shard, .{ .ignore_unknown_fields = true }) catch return 0;
+    return parsed.updated_at;
+}
+
+test "rekey: a book's objects move to the new name, the later record of a device stays" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const ta = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", ta);
+    defer ta.free(root);
+    var arena = std.heap.ArenaAllocator.init(ta);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var store = Store{ .dir = StoreMod.DirStore.init(io, root) };
+    try store.put("books/path_x/a.json", "{\"updated_at\":5,\"page\":1}");
+    try store.put("books/path_x/b.json", "{\"updated_at\":9}");
+    try store.put("books/path_x/c.json", "{\"updated_at\":1}");
+    try store.put("books/path_x/book.pdf", "%PDF old");
+    try store.put("books/path_x/cover.png", "png");
+    try store.put("books/new/a.json", "{\"updated_at\":7}");
+    try store.put("books/new/b.json", "{\"updated_at\":2}");
+    try store.put("books/other/a.json", "{}");
+
+    try testing.expect(try rekey(ta, &store, "path_x", "new"));
+    try testing.expectEqual(@as(usize, 0), (try store.list(a, "books/path_x/")).len);
+    try testing.expectEqual(@as(usize, 5), (try store.list(a, "books/new/")).len);
+    try testing.expectEqualStrings("{\"updated_at\":7}", (try store.get(a, "books/new/a.json")).?);
+    try testing.expectEqualStrings("{\"updated_at\":9}", (try store.get(a, "books/new/b.json")).?);
+    try testing.expectEqualStrings("{\"updated_at\":1}", (try store.get(a, "books/new/c.json")).?);
+    try testing.expectEqualStrings("%PDF old", (try store.get(a, "books/new/book.pdf")).?);
+    try testing.expectEqualStrings("{}", (try store.get(a, "books/other/a.json")).?);
+
+    try testing.expect(!try rekey(ta, &store, "path_x", "new"));
+    try testing.expectError(error.InvalidBookKey, rekey(ta, &store, "../x", "new"));
 }
 
 test "pullAll: fetches missing shards, refreshes changed ones on request, skips this device and bad keys" {

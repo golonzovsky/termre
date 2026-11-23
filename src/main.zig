@@ -7,6 +7,7 @@ const Config = @import("config/Config.zig");
 const Sync = @import("services/Sync.zig");
 const Paths = @import("services/Paths.zig");
 const fs = @import("utilities/fs.zig");
+const Document = @import("handlers/Document.zig");
 
 // Must live in the root file to take effect: restores the terminal (exits alt
 // screen, disables mouse reporting) before printing a panic trace, so crashes
@@ -245,9 +246,15 @@ fn resolveBook(init: std.process.Init, book: NextBook, stderr: *std.Io.Writer) !
     defer config.deinit();
     const paths = try Paths.init(a, init.environ_map, &config);
     const base = std.fs.path.basename(book.path);
-    const name = if (base.len > 0) base else try std.fmt.allocPrint(a, "{s}.pdf", .{book.key});
-    const dest = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ paths.downloads, name }, 0);
-    if (cwd.access(io, dest, .{})) |_| return dest else |_| {}
+    var name = if (base.len > 0) base else try std.fmt.allocPrint(a, "{s}.pdf", .{book.key});
+    var dest = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ paths.downloads, name }, 0);
+    if (cwd.access(io, dest, .{})) |_| {
+        if (isBook(a, io, dest, book.key)) return dest;
+        // Another book already has this file name.
+        name = try std.fmt.allocPrint(a, "{s}-{s}.pdf", .{ std.fs.path.stem(name), book.key[book.key.len -| 8..] });
+        dest = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ paths.downloads, name }, 0);
+        if (cwd.access(io, dest, .{})) |_| return dest else |_| {}
+    } else |_| {}
 
     const backends = Sync.backendsFromConfig(init.gpa, io, init.environ_map, &config);
     defer for (backends) |*b| b.store.deinit();
@@ -264,6 +271,14 @@ fn resolveBook(init: std.process.Init, book: NextBook, stderr: *std.Io.Writer) !
     try stderr.print("{s} is not on this machine and no sync store has it\n", .{book.path});
     try stderr.flush();
     return null;
+}
+
+// A key made from a path says nothing about the content, so the name is trusted.
+fn isBook(a: std.mem.Allocator, io: std.Io, path: [:0]const u8, key: []const u8) bool {
+    if (std.mem.startsWith(u8, key, "path_")) return true;
+    const doc_key = Document.keyOfFile(a, io, path) catch return false;
+    const name = Positions.safeKey(a, doc_key) catch return false;
+    return std.mem.eql(u8, name, key);
 }
 
 const no_graphics_msg =
@@ -299,6 +314,10 @@ fn stateCli(init: std.process.Init, args: []const [:0]const u8, stdout: *std.Io.
     const arena = init.arena.allocator();
     var config = Config.init(init.gpa, init.io, init.environ_map);
     defer config.deinit();
+    if (config.problem.len > 0) {
+        try stderr.print("re: {s}\n", .{config.problem});
+        try stderr.flush();
+    }
     const paths = try Paths.init(arena, init.environ_map, &config);
     if (std.mem.eql(u8, args[0], "export")) {
         if (args.len >= 2) {

@@ -45,8 +45,8 @@ pub fn handleKeyStroke(self: *Self, key: vaxis.Key, km: Config.KeyMap) !void {
         const cmd = std.mem.trim(u8, text_input, &std.ascii.whitespace);
 
         if (cmd.len > 0) {
-            self.executeCommand(cmd);
-            self.context.history.addToHistory(cmd);
+            // A mistyped argument is worth recalling; a mistyped name is not.
+            if (self.executeCommand(cmd) or self.reportFailure(cmd)) self.context.history.addToHistory(cmd);
         }
 
         if (self.context.next_mode == null) self.context.changeMode(.view);
@@ -153,13 +153,40 @@ pub const commands = .{
     .{ handleQuit, ":q", "quit" },
 };
 
-pub fn executeCommand(self: *Self, cmd: []const u8) void {
+pub fn executeCommand(self: *Self, cmd: []const u8) bool {
     inline for (commands) |entry| {
-        if (entry[0](self, cmd)) return;
+        if (entry[0](self, cmd)) return true;
     }
+    return false;
 }
 
-const Completion = struct { name: []const u8, takes_arg: bool };
+// Says why nothing ran; true when the name is a command and only its arguments were wrong.
+fn reportFailure(self: *Self, cmd: []const u8) bool {
+    const ctx = self.context;
+    const word = cmd[0 .. std.mem.indexOfAny(u8, cmd, &std.ascii.whitespace) orelse cmd.len];
+    for (completions) |c| {
+        if (!std.mem.eql(u8, c.name, word)) continue;
+        ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " usage: {s} ", .{c.usage}) catch null);
+        return true;
+    }
+    var end = @min(word.len, 40);
+    while (end < word.len and end > 0 and (word[end] & 0xC0) == 0x80) end -= 1;
+    ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " unknown command :{s} (:help lists them) ", .{word[0..end]}) catch null);
+    return false;
+}
+
+// The argument text after `name`; null when `cmd` is another word (`:exportfoo`).
+// `glued` also takes a number written without a space (`:spread3`).
+fn argsOf(cmd: []const u8, name: []const u8, glued: bool) ?[]const u8 {
+    if (!std.mem.startsWith(u8, cmd, name)) return null;
+    const rest = cmd[name.len..];
+    if (rest.len > 0 and !std.ascii.isWhitespace(rest[0])) {
+        if (!glued or std.ascii.isAlphabetic(rest[0])) return null;
+    }
+    return std.mem.trim(u8, rest, &std.ascii.whitespace);
+}
+
+const Completion = struct { name: []const u8, takes_arg: bool, usage: []const u8 };
 
 // Completable names derived from the usage column of `commands`: the leading
 // lowercase word after ':' (numeric/axis forms like :N or :y+N have none).
@@ -171,7 +198,7 @@ const completions: []const Completion = blk: {
         var end: usize = 1;
         while (end < usage.len and std.ascii.isLower(usage[end])) end += 1;
         if (end == 1 or (end < usage.len and usage[end] != ' ')) continue;
-        list = list ++ &[_]Completion{.{ .name = usage[1..end], .takes_arg = end < usage.len }};
+        list = list ++ &[_]Completion{.{ .name = usage[1..end], .takes_arg = end < usage.len, .usage = usage }};
     }
     break :blk list;
 };
@@ -214,8 +241,7 @@ fn handleToc(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleEdit(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.startsWith(u8, cmd, "edit")) return false;
-    const rest = std.mem.trim(u8, cmd["edit".len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "edit", false) orelse return false;
     if (rest.len == 0) {
         Editor.openCurrentPageInEditor(self.context) catch {};
         return true;
@@ -257,8 +283,7 @@ fn handleHLock(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleMarkdown(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.startsWith(u8, cmd, "markdown")) return false;
-    const rest = std.mem.trim(u8, cmd["markdown".len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "markdown", false) orelse return false;
     Export.exportMarkdown(self.context, rest);
     return true;
 }
@@ -282,8 +307,7 @@ fn handleSync(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleSpread(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.startsWith(u8, cmd, "spread")) return false;
-    const rest = std.mem.trim(u8, cmd["spread".len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "spread", true) orelse return false;
     if (rest.len == 0) {
         self.context.document_handler.toggleSpread();
     } else {
@@ -307,8 +331,7 @@ fn handleFit(self: *Self, cmd: []const u8) bool {
 // :crop T H B    top, left/right, bottom
 // :crop T R B L  clockwise
 fn handleCrop(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.startsWith(u8, cmd, "crop")) return false;
-    const rest = std.mem.trim(u8, cmd["crop".len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "crop", true) orelse return false;
 
     var vals: [4]f32 = .{ 0, 0, 0, 0 };
     var n: usize = 0;
@@ -335,9 +358,7 @@ fn handleCrop(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleAltShift(self: *Self, cmd: []const u8) bool {
-    const prefix = "oddx";
-    if (!std.mem.startsWith(u8, cmd, prefix)) return false;
-    const rest = std.mem.trim(u8, cmd[prefix.len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "oddx", true) orelse return false;
     if (rest.len == 0) return false;
     const n = std.fmt.parseInt(i32, rest, 10) catch return false;
     self.context.document_handler.setOddShiftX(n);
@@ -351,8 +372,7 @@ fn handleOverride(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleExport(self: *Self, cmd: []const u8) bool {
-    if (!std.mem.startsWith(u8, cmd, "export")) return false;
-    const rest = std.mem.trim(u8, cmd["export".len..], &std.ascii.whitespace);
+    const rest = argsOf(cmd, "export", false) orelse return false;
     Export.exportCropped(self.context, rest);
     return true;
 }
@@ -370,9 +390,14 @@ fn handleHelp(self: *Self, cmd: []const u8) bool {
 }
 
 fn handleGoToPage(self: *Self, cmd: []const u8) bool {
-    const page_num = (std.fmt.parseInt(u16, cmd, 10) catch return false);
-    if (!self.context.document_handler.goToPage(page_num)) return false;
-
+    const page_num = std.fmt.parseInt(u32, cmd, 10) catch return false;
+    const ctx = self.context;
+    const total = ctx.document_handler.getTotalPages();
+    if (page_num < 1 or page_num > total) {
+        ctx.setProgress(std.fmt.bufPrint(&ctx.progress_buf, " no page {d}: the book has {d} ", .{ page_num, total }) catch null);
+        return true;
+    }
+    _ = ctx.document_handler.goToPage(@intCast(page_num));
     return true;
 }
 
