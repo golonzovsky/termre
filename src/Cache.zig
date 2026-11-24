@@ -111,6 +111,11 @@ pub fn contains(self: *Self, key: Key) bool {
     return self.map.contains(key);
 }
 
+pub fn costOf(self: *Self, key: Key) ?usize {
+    const node = self.map.get(key) orelse return null;
+    return cost(node.value);
+}
+
 pub fn get(self: *Self, key: Key) ?CachedImage {
     const node = self.map.get(key) orelse return null;
     self.moveToFront(node);

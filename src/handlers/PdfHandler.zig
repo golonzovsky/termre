@@ -393,6 +393,11 @@ pub fn getPageBound(self: *Self, page_number: u16) PageBound {
     return self.doc.getPageBound(page_number);
 }
 
+pub fn getRenderBound(self: *Self, page_number: u16) PageBound {
+    const rb = self.doc.renderBound(page_number, self.crop()) catch return self.doc.getPageBound(page_number);
+    return .{ .x0 = rb.bound.x0, .y0 = rb.bound.y0, .x1 = rb.bound.x1, .y1 = rb.bound.y1 };
+}
+
 pub fn coverPng(self: *Self, allocator: std.mem.Allocator, max_w: u32, max_h: u32) ![]u8 {
     return self.doc.coverPng(allocator, max_w, max_h);
 }

@@ -1175,12 +1175,13 @@ pub const Context = struct {
         if (!self.config.cache.enabled) return;
         const zoom = self.document_handler.getActiveZoom();
         if (zoom <= 0) return;
-        // At very high zoom a single page approaches the cache byte budget;
-        // prerendered neighbors would evict each other in a render loop.
-        // Require room for the current page plus two neighbors.
-        const b = self.document_handler.getPageBound(top_page);
-        const est_f = (b.x1 - b.x0) * zoom * (b.y1 - b.y0) * zoom * 4.0;
-        if (est_f > 0 and @as(usize, @intFromFloat(est_f)) * 3 > self.cache.budget_bytes) return;
+        // The window has to fit the cache beside the visible pages: a neighbor
+        // that evicts another one is requested again, in a loop that never idles.
+        var room: Room = .{ .bytes = self.cache.budget_bytes, .pages = self.cache.lru_size };
+        var shown: u32 = top_page;
+        while (shown < next_page) : (shown += 1) {
+            if (!room.take(self.cache.costOf(self.cacheKeyFor(@intCast(shown))) orelse 0)) return;
+        }
 
         const window = 3;
         var jobs: [Prerenderer.slots]?Prerenderer.Job = @splat(null);
@@ -1192,7 +1193,8 @@ pub const Context = struct {
         var fwd: u32 = next_page;
         while (fwd < @min(@as(u32, next_page) + window, total) and n < jobs.len) : (fwd += 1) {
             const key = self.cacheKeyFor(@intCast(fwd));
-            if (self.cache.contains(key)) continue;
+            if (!room.take(self.cache.costOf(key) orelse self.renderCost(key.page, zoom))) break;
+            if (self.cache.get(key) != null) continue;
             const params = self.document_handler.prerenderParams(self.allocator, key.page) catch continue;
             jobs[n] = .{ .key = key, .params = params };
             n += 1;
@@ -1200,13 +1202,32 @@ pub const Context = struct {
         var back: u16 = 1;
         while (back <= window and top_page >= back and n < jobs.len) : (back += 1) {
             const key = self.cacheKeyFor(top_page - back);
-            if (self.cache.contains(key)) continue;
+            if (!room.take(self.cache.costOf(key) orelse self.renderCost(key.page, zoom))) break;
+            if (self.cache.get(key) != null) continue;
             const params = self.document_handler.prerenderParams(self.allocator, key.page) catch continue;
             jobs[n] = .{ .key = key, .params = params };
             n += 1;
         }
         if (n == 0) return;
         self.prerenderer.request(jobs);
+    }
+
+    const Room = struct {
+        bytes: usize,
+        pages: usize,
+
+        fn take(self: *Room, cost: usize) bool {
+            if (self.pages == 0 or cost > self.bytes) return false;
+            self.pages -= 1;
+            self.bytes -= cost;
+            return true;
+        }
+    };
+
+    fn renderCost(self: *Self, page: u16, zoom: f32) usize {
+        const b = self.document_handler.getRenderBound(page);
+        const bytes = @ceil((b.x1 - b.x0) * zoom) * @ceil((b.y1 - b.y0) * zoom) * 4.0;
+        return if (bytes >= 0 and bytes < 1e15) @intFromFloat(bytes) else std.math.maxInt(usize);
     }
 
     pub fn drawCurrentPage(self: *Self, win: vaxis.Window) !void {
